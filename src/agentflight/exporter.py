@@ -68,15 +68,20 @@ class AgentFlightExporter(SpanExporter):
         self._headers = headers or {}
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        payload = {"spans": [span_to_dict(s) for s in spans]}
+        # Never raise: OTel processors log exporter exceptions, but a custom processor might
+        # not, and export failures must never reach agent code.
         try:
+            payload = {"spans": [span_to_dict(s) for s in spans]}
             response = self._client.post(self._url, json=payload, headers=self._headers)
             response.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.warning("agentflight: failed to export %d spans: %s", len(spans), exc)
+        except Exception as exc:
+            logger.warning("agentflight: failed to export %d spans: %r", len(spans), exc)
             return SpanExportResult.FAILURE
         return SpanExportResult.SUCCESS
 
     def shutdown(self) -> None:
         if self._owns_client:
-            self._client.close()
+            try:
+                self._client.close()
+            except Exception:
+                logger.warning("agentflight: error closing exporter client", exc_info=True)
