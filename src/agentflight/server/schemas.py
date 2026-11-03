@@ -46,6 +46,8 @@ class EventOut(BaseModel):
     end_time_ns: int | None
     duration_ms: float | None
     attributes: dict[str, Any]
+    # attribute key -> {original_length, stored_length, reason} for truncated payloads
+    truncated: dict[str, Any]
     span_events: list[dict[str, Any]]
 
 

@@ -73,6 +73,7 @@ def _duration_ms(start: int | None, end: int | None) -> float | None:
 
 def event_out(event: Event) -> EventOut:
     attrs = {k: _loads(v) if k.endswith(_JSON_SUFFIXES) else v for k, v in event.attributes.items()}
+    truncated = attrs.get(A.TRUNCATED)
     return EventOut(
         span_id=event.span_id,
         parent_span_id=event.parent_span_id,
@@ -84,6 +85,7 @@ def event_out(event: Event) -> EventOut:
         end_time_ns=event.end_time_ns,
         duration_ms=_duration_ms(event.start_time_ns, event.end_time_ns),
         attributes=attrs,
+        truncated=truncated if isinstance(truncated, dict) else {},
         span_events=event.span_events,
     )
 
@@ -98,6 +100,7 @@ _JSON_SUFFIXES = (
     ".choice",
     ".old",
     ".new",
+    ".truncated",
 )
 
 
