@@ -29,6 +29,19 @@ def test_health(client: TestClient) -> None:
     assert client.get("/health").json()["status"] == "ok"
 
 
+def test_ready_checks_database(client: TestClient) -> None:
+    assert client.get("/ready").json() == {"status": "ready"}
+
+
+def test_not_ready_without_schema() -> None:
+    from agentflight.server import create_app
+    from agentflight.server.db import make_engine
+
+    with TestClient(create_app(make_engine("sqlite://"))) as c:
+        assert c.get("/health").status_code == 200
+        assert c.get("/ready").status_code == 503
+
+
 def test_end_to_end_run_is_stored_with_ordered_events(recorded: TestClient) -> None:
     @agentflight.tool
     def search(query: str) -> list[str]:

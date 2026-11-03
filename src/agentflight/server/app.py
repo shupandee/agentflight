@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
 from agentflight import __version__
@@ -32,6 +32,15 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
+
+    @app.get("/ready")
+    def ready(session: SessionDep) -> dict[str, str]:
+        """Readiness: the database is reachable and migrated."""
+        try:
+            session.execute(text("SELECT 1 FROM runs LIMIT 1"))
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="database not ready") from exc
+        return {"status": "ready"}
 
     @app.post("/v1/spans", response_model=IngestResponse, status_code=202)
     def ingest(body: IngestRequest, session: SessionDep) -> IngestResponse:

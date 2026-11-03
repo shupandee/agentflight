@@ -16,6 +16,9 @@ import agentflight
 
 ENDPOINT = os.environ.get("AGENTFLIGHT_ENDPOINT", "http://localhost:8000")
 
+# Made-up price for the fake model so the example exercises cost tracking.
+TOY_USD_PER_TOKEN = 0.000002
+
 WEATHER = {"paris": "18C, cloudy", "delhi": "31C, sunny"}
 
 
@@ -41,7 +44,9 @@ def chat(messages: list[dict[str, str]]) -> str:
         reply = fake_model(messages)
         # A real client would report usage; here we count words as a stand-in.
         tokens_in = sum(len(m["content"].split()) for m in messages)
-        call.record(reply, tokens_in=tokens_in, tokens_out=len(reply.split()))
+        tokens_out = len(reply.split())
+        cost = (tokens_in + tokens_out) * TOY_USD_PER_TOKEN
+        call.record(reply, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost)
     return reply
 
 

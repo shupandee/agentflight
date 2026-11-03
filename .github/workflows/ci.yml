@@ -57,3 +57,24 @@ jobs:
         env:
           AGENTFLIGHT_DATABASE_URL: ${{ env.AGENTFLIGHT_TEST_DATABASE_URL }}
       - run: pytest -q
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start stack
+        run: docker compose up --build --detach --wait --wait-timeout 180
+      - name: Show service health
+        run: docker compose ps
+      - run: pip install -e .
+      - name: Run toy agent and check persisted totals
+        run: python scripts/compose_smoke.py
+      - name: Server logs
+        if: always()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans
