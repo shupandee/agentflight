@@ -82,6 +82,51 @@ agentflight.flush()  # before exit, so batched spans are sent
   overrides the name.
 - If the server is unreachable, export fails with a logged warning; your agent keeps running.
 
+## Failure isolation
+
+AgentFlight follows one rule: **observability must never become a dependency for
+successful agent execution.** `tests/test_failure_isolation.py` checks each guarantee.
+
+Guarantees:
+
+- **Return values and exceptions pass through unchanged.** `run`, `llm_call` and `@tool`
+  return what your code returns and re-raise your exact exception object, even if
+  recording that exception fails.
+- **Recorder failures never raise into agent code.** Each of these is caught and logged as a
+  warning on the `agentflight` logger: the server being down, HTTP 4xx/5xx, redirects,
+  malformed or truncated responses, transport exceptions, timeouts, exceptions from the
+  exporter's `export` / `force_flush` / `shutdown`, exceptions from span processor hooks,
+  and a broken tracer or serializer. If a span can't be opened, your code still runs under
+  a non-recording span.
+- **Weird payloads are safe.** Payloads that JSON can't serialize fall back to `repr`.
+  If `repr` itself raises, the value is stored as `<unrepresentable Type>`. This covers
+  circular structures, `NaN`, bytes, locks, generators and objects whose `__repr__` or
+  `__str__` raise. Values are cut off at 32,000 characters.
+- **No blocking in the default mode.** With `batch=True` (the default), spans are exported
+  on a background thread, so a hanging server doesn't slow the agent down.
+- **Bounded waits.** `flush(timeout_millis=...)` and `shutdown()` never raise. They wait at
+  most about the given flush timeout plus the exporter's HTTP timeout (`configure(...,
+  timeout=5.0)`). Interpreter exit is also clean: AgentFlight replaces OpenTelemetry's
+  atexit hook with a fail-safe one.
+- **A bad configuration disables recording instead of raising.**
+
+Limitations (known, not yet handled):
+
+- **Lost spans.** If export fails, those spans are dropped. There's no retry, no disk
+  buffer and no dead-letter queue yet. If the server is unreachable, the run is simply
+  missing from the recording.
+- **The batch queue is bounded.** OpenTelemetry's default limit is 2048 spans. When the
+  queue is full, new spans are dropped rather than blocking the agent.
+- **`batch=False` blocks.** It exports inside the agent's thread, so each span can block
+  for up to the HTTP timeout. Use it only for tests or debugging.
+- **A partly broken span processor can mis-parent later spans.** If a processor fails while
+  a span is closing, the current-span context may not be restored. The agent still runs,
+  but later spans in that run may be attached to the wrong parent.
+- **Custom exporters must honor timeouts.** If you write a custom exporter
+  that blocks forever (ignoring timeouts), only `flush`/`shutdown` timeouts protect you.
+- **`BaseException`s are recorded and re-raised.** `KeyboardInterrupt` and `SystemExit` are
+  never swallowed. Only ordinary `Exception`s raised by the instrumentation are suppressed.
+
 ## HTTP API
 
 | Method | Path | Description |
@@ -89,7 +134,8 @@ agentflight.flush()  # before exit, so batched spans are sent
 | `POST` | `/v1/spans` | Ingest a batch of spans (`{"spans": [...]}`) |
 | `GET` | `/v1/runs` | List runs, newest first (`limit`, `offset`, `status`) with token/cost/error totals |
 | `GET` | `/v1/runs/{run_id}` | One run with its events ordered by start time |
-| `GET` | `/health` | Liveness |
+| `GET` | `/health` | Liveness (process is up) |
+| `GET` | `/ready` | Readiness (database reachable and migrated); 503 otherwise |
 
 Interactive docs at `/docs` when the server is running.
 
@@ -103,6 +149,18 @@ ruff check . && ruff format --check . && mypy && pytest
 
 Tests use in-memory SQLite by default. Set `AGENTFLIGHT_TEST_DATABASE_URL` to a Postgres URL
 to run the same suite against Postgres (CI does both).
+
+CI also runs a Compose smoke test. It brings up `docker compose up --wait` (Postgres plus
+the server, both health-checked), runs `examples/toy_agent.py` against it, and uses
+`scripts/compose_smoke.py` to check through the API that both runs were persisted with the
+expected token, cost and error totals. The stack is always torn down afterwards. You can
+run it locally:
+
+```bash
+docker compose up --build --wait
+python scripts/compose_smoke.py
+docker compose down --volumes
+```
 
 ## Roadmap
 
