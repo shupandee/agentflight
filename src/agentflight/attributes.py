@@ -29,6 +29,8 @@ STATE_NEW = "agentflight.state.new"
 
 ERROR_TYPE = "agentflight.error.type"
 ERROR_MESSAGE = "agentflight.error.message"
+# Same id on every event caused by one underlying exception (tool span, agent log, run).
+FAILURE_ID = "agentflight.failure.id"
 
 # Event kinds
 RUN = "run"

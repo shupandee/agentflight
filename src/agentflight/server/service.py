@@ -104,7 +104,8 @@ _JSON_SUFFIXES = (
 def summarize(run: Run) -> RunSummary:
     tokens_in = tokens_out = 0
     cost: float | None = None
-    llm = tool = errors = 0
+    llm = tool = error_events = 0
+    failures: set[str] = set()
     for e in run.events:
         if e.kind == A.LLM:
             llm += 1
@@ -114,8 +115,11 @@ def summarize(run: Run) -> RunSummary:
                 cost = (cost or 0.0) + float(e.attributes[A.LLM_COST_USD])
         elif e.kind == A.TOOL:
             tool += 1
-        if e.status == "error" and e.kind != A.RUN:
-            errors += 1
+        if e.status == "error":
+            error_events += 1
+            # Events sharing a failure id are one logical failure. Events from SDKs that
+            # don't send ids count individually.
+            failures.add(str(e.attributes.get(A.FAILURE_ID) or f"span:{e.span_id}"))
     return RunSummary(
         id=run.id,
         name=run.name,
@@ -127,7 +131,8 @@ def summarize(run: Run) -> RunSummary:
         event_count=len(run.events),
         llm_calls=llm,
         tool_calls=tool,
-        errors=errors,
+        errors=len(failures),
+        error_events=error_events,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost_usd=cost,

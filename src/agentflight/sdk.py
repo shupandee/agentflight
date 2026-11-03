@@ -12,8 +12,10 @@ import inspect
 import json
 import logging
 import time
+import uuid
+import weakref
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
@@ -75,8 +77,49 @@ def _exc_text(exc: BaseException) -> str:
         return f"<unprintable {type(exc).__name__}>"
 
 
+_FAILURE_ATTR = "__agentflight_failure_id__"
+# Fallback for exception types that reject new attributes (e.g. __slots__).
+_failure_ids: weakref.WeakKeyDictionary[BaseException, str] = weakref.WeakKeyDictionary()
+
+
+def _get_failure_id(exc: BaseException) -> str | None:
+    fid = getattr(exc, _FAILURE_ATTR, None)
+    if isinstance(fid, str):
+        return fid
+    try:
+        return _failure_ids.get(exc)
+    except TypeError:
+        return None
+
+
+def failure_id(exc: BaseException) -> str:
+    """Return the failure id for an exception, assigning one on first sight.
+
+    The id follows the exception object, so a tool exception, the agent's
+    ``agentflight.error(exc)`` of that same object and the run failing with it all share
+    one id. An exception raised while handling (or ``from``) an already-recorded failure
+    inherits that failure's id, so wrapping and re-raising counts once.
+    """
+    fid = _get_failure_id(exc)
+    if fid is None:
+        seen: set[int] = set()
+        cause = exc.__cause__ or exc.__context__
+        while cause is not None and id(cause) not in seen and fid is None:
+            seen.add(id(cause))
+            fid = _get_failure_id(cause)
+            cause = cause.__cause__ or cause.__context__
+        fid = fid or uuid.uuid4().hex
+        try:
+            setattr(exc, _FAILURE_ATTR, fid)
+        except Exception:
+            with suppress(TypeError):
+                _failure_ids[exc] = fid
+    return fid
+
+
 def _record_error(span: Span, exc: BaseException) -> None:
     message = _exc_text(exc)
+    span.set_attribute(A.FAILURE_ID, failure_id(exc))
     _safe(span.record_exception, exc)
     span.set_attribute(A.ERROR_TYPE, type(exc).__name__)
     span.set_attribute(A.ERROR_MESSAGE, message)

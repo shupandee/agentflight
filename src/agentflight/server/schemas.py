@@ -60,7 +60,8 @@ class RunSummary(BaseModel):
     event_count: int
     llm_calls: int
     tool_calls: int
-    errors: int
+    errors: int  # distinct logical failures
+    error_events: int  # every event with error status
     tokens_in: int
     tokens_out: int
     cost_usd: float | None
