@@ -51,6 +51,9 @@ def span_to_dict(span: ReadableSpan) -> dict[str, Any]:
 class AgentFlightExporter(SpanExporter):
     """POSTs batches of spans as JSON to ``{endpoint}/v1/spans``.
 
+    ``api_key`` is sent as ``Authorization: Bearer <key>``. Auth failures are logged once
+    (without the key) and never raised.
+
     An ``httpx.Client`` can be injected (useful for tests or custom auth/TLS).
     """
 
@@ -61,11 +64,18 @@ class AgentFlightExporter(SpanExporter):
         client: httpx.Client | None = None,
         timeout: float = 5.0,
         headers: dict[str, str] | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._url = endpoint.rstrip("/") + INGEST_PATH
+        self._auth_warned = False
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout)
-        self._headers = headers or {}
+        self._headers = dict(headers or {})
+        if api_key:
+            self._headers["Authorization"] = f"Bearer {api_key}"
+
+    def __repr__(self) -> str:
+        return f"AgentFlightExporter(url={self._url!r})"
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         # Never raise: OTel processors log exporter exceptions, but a custom processor might
@@ -73,6 +83,15 @@ class AgentFlightExporter(SpanExporter):
         try:
             payload = {"spans": [span_to_dict(s) for s in spans]}
             response = self._client.post(self._url, json=payload, headers=self._headers)
+            if response.status_code in (401, 403):
+                if not self._auth_warned:
+                    self._auth_warned = True
+                    logger.warning(
+                        "agentflight: server rejected credentials (HTTP %d); spans are being "
+                        "dropped. Check AGENTFLIGHT_API_KEY.",
+                        response.status_code,
+                    )
+                return SpanExportResult.FAILURE
             response.raise_for_status()
         except Exception as exc:
             logger.warning("agentflight: failed to export %d spans: %r", len(spans), exc)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from agentflight import attributes as A
@@ -161,3 +161,35 @@ def get_run(session: Session, run_id: str) -> RunDetail | None:
         return None
     ordered = sorted(run.events, key=lambda e: (e.start_time_ns, e.end_time_ns or 0))
     return RunDetail(**summarize(run).model_dump(), events=[event_out(e) for e in ordered])
+
+
+def delete_run(session: Session, run_id: str) -> bool:
+    """Delete a run and all of its events. Returns False if it didn't exist."""
+    if session.get(Run, run_id) is None:
+        return False
+    session.execute(delete(Event).where(Event.run_id == run_id))
+    session.execute(delete(Run).where(Run.id == run_id))
+    session.commit()
+    return True
+
+
+def cleanup_expired(session: Session, *, cutoff_ns: int, dry_run: bool = False) -> int:
+    """Delete runs that ended (or, if unfinished, started) before ``cutoff_ns``.
+
+    Runs with no timestamps at all are kept. Returns the number of runs affected.
+    """
+    expired = select(Run.id).where(
+        or_(
+            Run.end_time_ns < cutoff_ns,
+            (Run.end_time_ns.is_(None)) & (Run.start_time_ns < cutoff_ns),
+        )
+    )
+    ids = list(session.scalars(expired))
+    if dry_run or not ids:
+        return len(ids)
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        session.execute(delete(Event).where(Event.run_id.in_(chunk)))
+        session.execute(delete(Run).where(Run.id.in_(chunk)))
+    session.commit()
+    return len(ids)

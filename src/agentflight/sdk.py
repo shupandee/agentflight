@@ -11,6 +11,7 @@ import functools
 import inspect
 import json
 import logging
+import os
 import time
 import uuid
 import weakref
@@ -161,16 +162,19 @@ def configure(
     exporter: SpanExporter | None = None,
     batch: bool = True,
     timeout: float = 5.0,
+    api_key: str | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
+    ``api_key`` defaults to the ``AGENTFLIGHT_API_KEY`` environment variable.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
     _recorder.shutdown()
     try:
+        key = api_key if api_key is not None else os.environ.get("AGENTFLIGHT_API_KEY")
         _recorder = Recorder(
-            exporter or AgentFlightExporter(endpoint, timeout=timeout), batch=batch
+            exporter or AgentFlightExporter(endpoint, timeout=timeout, api_key=key), batch=batch
         )
     except Exception:
         logger.warning("agentflight: configure failed; recording disabled", exc_info=True)

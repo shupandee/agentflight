@@ -65,6 +65,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Generate a throwaway API key
+        run: |
+          key=$(openssl rand -hex 32)
+          echo "::add-mask::$key"
+          echo "AGENTFLIGHT_API_KEY=$key" >> "$GITHUB_ENV"
       - name: Start stack
         run: docker compose up --build --detach --wait --wait-timeout 180
       - name: Show service health
