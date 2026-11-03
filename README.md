@@ -148,7 +148,7 @@ Error events from SDKs that don't send ids count one each.
 
 ```python
 agentflight.configure(
-    max_attr_chars=32_000,                              # per payload; None disables the cap
+    max_attr_chars=32_000,  # per payload; None disables the cap
     redact=agentflight.redact_fields("api_key", "password", "authorization"),
 )
 ```
