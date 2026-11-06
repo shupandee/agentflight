@@ -11,9 +11,12 @@ import functools
 import inspect
 import json
 import logging
+import os
 import time
+import uuid
+import weakref
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
@@ -34,7 +37,10 @@ logger = logging.getLogger("agentflight")
 P = ParamSpec("P")
 R = TypeVar("R")
 
-MAX_ATTR_CHARS = 32_000
+DEFAULT_MAX_ATTR_CHARS = 32_000
+REDACTION_FAILED = "<redaction failed>"
+
+Redactor = Callable[[str, Any], Any]
 
 
 def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -54,18 +60,101 @@ def _safe_repr(value: Any) -> str:
 
 
 def _dump(value: Any) -> str:
-    """Serialize a value to a JSON string for span attributes (truncated if huge).
+    """Serialize a value to a JSON string. Never raises.
 
-    Never raises: anything json can't handle falls back to repr, and a failing repr falls
-    back to a type placeholder.
+    Anything json can't handle falls back to repr, and a failing repr falls back to a type
+    placeholder.
     """
     try:
-        text = json.dumps(value, default=_safe_repr, ensure_ascii=False)
+        return json.dumps(value, default=_safe_repr, ensure_ascii=False)
     except Exception:
-        text = json.dumps(_safe_repr(value))
-    if len(text) > MAX_ATTR_CHARS:
-        text = text[:MAX_ATTR_CHARS] + "...<truncated>"
-    return text
+        return json.dumps(_safe_repr(value))
+
+
+@dataclass(frozen=True)
+class _Payload:
+    """Marks a user-supplied value that must be redacted, serialized and size-limited."""
+
+    value: Any
+
+
+def _redact(key: str, value: Any) -> Any:
+    hook = _recorder.redact
+    if hook is None:
+        return value
+    try:
+        return hook(key, value)
+    except Exception:
+        # Fail closed: if the hook breaks, don't record the possibly-sensitive value.
+        logger.warning("agentflight: redact hook failed for %s (value dropped)", key)
+        return REDACTION_FAILED
+
+
+def _encode(key: str, value: Any) -> tuple[str, dict[str, Any] | None]:
+    """Redact, serialize and truncate one payload. Returns (text, truncation info)."""
+    text = _dump(_redact(key, value))
+    limit = _recorder.max_attr_chars
+    if limit is None or len(text) <= limit:
+        return text, None
+    info = {
+        "original_length": len(text),
+        "stored_length": limit,
+        "reason": f"exceeds max_attr_chars={limit}",
+    }
+    return text[:limit], info
+
+
+def _finalize(attrs: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    truncated: dict[str, Any] = {}
+    for key, value in attrs.items():
+        if isinstance(value, _Payload):
+            out[key], info = _encode(key, value.value)
+            if info:
+                truncated[key] = info
+        else:
+            out[key] = value
+    if truncated:
+        out[A.TRUNCATED] = json.dumps(truncated)
+    return out
+
+
+def _set_payload(span: Span, key: str, value: Any) -> None:
+    text, info = _encode(key, value)
+    span.set_attribute(key, text)
+    if info:
+        existing: dict[str, Any] = {}
+        current = getattr(span, "attributes", None) or {}
+        if A.TRUNCATED in current:
+            existing = json.loads(current[A.TRUNCATED])
+        existing[key] = info
+        span.set_attribute(A.TRUNCATED, json.dumps(existing))
+
+
+def redact_fields(*names: str, replacement: str = "[REDACTED]") -> Redactor:
+    """Build a redact hook that masks dict entries with these names, at any depth.
+
+    Matching is case-insensitive. Use it as ``configure(redact=redact_fields("api_key"))``
+    or compose it into your own hook.
+    """
+    lowered = {n.lower() for n in names}
+
+    def scrub(value: Any, depth: int = 0) -> Any:
+        if depth > 50:
+            return value
+        if isinstance(value, dict):
+            return {
+                k: replacement if str(k).lower() in lowered else scrub(v, depth + 1)
+                for k, v in value.items()
+            }
+        if isinstance(value, list | tuple):
+            return [scrub(v, depth + 1) for v in value]
+        return value
+
+    def hook(key: str, value: Any) -> Any:
+        return scrub(value)
+
+    return hook
 
 
 def _exc_text(exc: BaseException) -> str:
@@ -75,8 +164,49 @@ def _exc_text(exc: BaseException) -> str:
         return f"<unprintable {type(exc).__name__}>"
 
 
+_FAILURE_ATTR = "__agentflight_failure_id__"
+# Fallback for exception types that reject new attributes (e.g. __slots__).
+_failure_ids: weakref.WeakKeyDictionary[BaseException, str] = weakref.WeakKeyDictionary()
+
+
+def _get_failure_id(exc: BaseException) -> str | None:
+    fid = getattr(exc, _FAILURE_ATTR, None)
+    if isinstance(fid, str):
+        return fid
+    try:
+        return _failure_ids.get(exc)
+    except TypeError:
+        return None
+
+
+def failure_id(exc: BaseException) -> str:
+    """Return the failure id for an exception, assigning one on first sight.
+
+    The id follows the exception object, so a tool exception, the agent's
+    ``agentflight.error(exc)`` of that same object and the run failing with it all share
+    one id. An exception raised while handling (or ``from``) an already-recorded failure
+    inherits that failure's id, so wrapping and re-raising counts once.
+    """
+    fid = _get_failure_id(exc)
+    if fid is None:
+        seen: set[int] = set()
+        cause = exc.__cause__ or exc.__context__
+        while cause is not None and id(cause) not in seen and fid is None:
+            seen.add(id(cause))
+            fid = _get_failure_id(cause)
+            cause = cause.__cause__ or cause.__context__
+        fid = fid or uuid.uuid4().hex
+        try:
+            setattr(exc, _FAILURE_ATTR, fid)
+        except Exception:
+            with suppress(TypeError):
+                _failure_ids[exc] = fid
+    return fid
+
+
 def _record_error(span: Span, exc: BaseException) -> None:
     message = _exc_text(exc)
+    span.set_attribute(A.FAILURE_ID, failure_id(exc))
     _safe(span.record_exception, exc)
     span.set_attribute(A.ERROR_TYPE, type(exc).__name__)
     span.set_attribute(A.ERROR_MESSAGE, message)
@@ -86,7 +216,16 @@ def _record_error(span: Span, exc: BaseException) -> None:
 class Recorder:
     """Owns a private TracerProvider so AgentFlight never clobbers app-wide OTel config."""
 
-    def __init__(self, exporter: SpanExporter | None = None, *, batch: bool = True) -> None:
+    def __init__(
+        self,
+        exporter: SpanExporter | None = None,
+        *,
+        batch: bool = True,
+        max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
+        redact: Redactor | None = None,
+    ) -> None:
+        self.max_attr_chars = max_attr_chars
+        self.redact = redact
         # OTel's own atexit hook would let exporter errors escape at interpreter exit;
         # we register a fail-safe one instead.
         self.provider = TracerProvider(shutdown_on_exit=False)
@@ -118,16 +257,27 @@ def configure(
     exporter: SpanExporter | None = None,
     batch: bool = True,
     timeout: float = 5.0,
+    api_key: str | None = None,
+    max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
+    redact: Redactor | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
+    ``api_key`` defaults to the ``AGENTFLIGHT_API_KEY`` environment variable.
+    ``max_attr_chars`` caps each recorded payload (``None`` disables the cap); truncation
+    is recorded in ``agentflight.truncated``. ``redact(key, value)`` runs on every payload
+    before it is serialized; if it raises, the value is replaced with a placeholder.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
     _recorder.shutdown()
     try:
+        key = api_key if api_key is not None else os.environ.get("AGENTFLIGHT_API_KEY")
         _recorder = Recorder(
-            exporter or AgentFlightExporter(endpoint, timeout=timeout), batch=batch
+            exporter or AgentFlightExporter(endpoint, timeout=timeout, api_key=key),
+            batch=batch,
+            max_attr_chars=max_attr_chars,
+            redact=redact,
         )
     except Exception:
         logger.warning("agentflight: configure failed; recording disabled", exc_info=True)
@@ -168,7 +318,7 @@ def _span(
         cm = _recorder.tracer.start_as_current_span(
             name,
             context=context,
-            attributes=attrs(),
+            attributes=_finalize(attrs()),
             record_exception=False,
             set_status_on_exception=False,
         )
@@ -191,7 +341,7 @@ def _span(
 
 
 def _instant(name: str, attrs: Callable[[], dict[str, Any]], exc: BaseException | None) -> None:
-    span = _recorder.tracer.start_span(name, attributes=attrs())
+    span = _recorder.tracer.start_span(name, attributes=_finalize(attrs()))
     try:
         if exc is None:
             span.set_status(Status(StatusCode.OK))
@@ -219,7 +369,7 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
     """
     with _span(
         f"run:{name}",
-        lambda: {A.KIND: A.RUN, A.RUN_NAME: name, A.RUN_METADATA: _dump(metadata or {})},
+        lambda: {A.KIND: A.RUN, A.RUN_NAME: name, A.RUN_METADATA: _Payload(metadata or {})},
         new_trace=True,
     ) as span:
         yield RunHandle(span=span, name=name)
@@ -253,7 +403,7 @@ class LLMCall:
         _safe(self._set_attributes)
 
     def _set_attributes(self) -> None:
-        self.span.set_attribute(A.LLM_RESPONSE, _dump(self.response))
+        _set_payload(self.span, A.LLM_RESPONSE, self.response)
         if self.tokens_in is not None:
             self.span.set_attribute(A.LLM_TOKENS_IN, int(self.tokens_in))
         if self.tokens_out is not None:
@@ -280,9 +430,13 @@ def llm_call(
     """
 
     def attrs() -> dict[str, Any]:
-        out: dict[str, Any] = {A.KIND: A.LLM, A.LLM_MODEL: model, A.LLM_MESSAGES: _dump(messages)}
+        out: dict[str, Any] = {
+            A.KIND: A.LLM,
+            A.LLM_MODEL: model,
+            A.LLM_MESSAGES: _Payload(messages),
+        }
         if params:
-            out["agentflight.llm.params"] = _dump(params)
+            out[A.LLM_PARAMS] = _Payload(params)
         return out
 
     with _span(name or f"llm:{model}", attrs) as span:
@@ -304,13 +458,13 @@ def _tool_span(tool_name: str, fn: Callable[..., Any], args: Any, kwargs: Any) -
         lambda: {
             A.KIND: A.TOOL,
             A.TOOL_NAME: tool_name,
-            A.TOOL_ARGS: _dump(_bind_args(fn, args, kwargs)),
+            A.TOOL_ARGS: _Payload(_bind_args(fn, args, kwargs)),
         },
     )
 
 
 def _set_result(span: Span, result: Any) -> None:
-    _safe(lambda: span.set_attribute(A.TOOL_RESULT, _dump(result)))
+    _safe(_set_payload, span, A.TOOL_RESULT, result)
 
 
 @overload
@@ -363,7 +517,7 @@ def decision(name: str, choice: Any, *, reason: str | None = None) -> None:
         out: dict[str, Any] = {
             A.KIND: A.DECISION,
             A.DECISION_NAME: name,
-            A.DECISION_CHOICE: _dump(choice),
+            A.DECISION_CHOICE: _Payload(choice),
         }
         if reason is not None:
             out[A.DECISION_REASON] = str(reason)
@@ -380,8 +534,8 @@ def state_change(key: str, new: Any, *, old: Any = None) -> None:
         lambda: {
             A.KIND: A.STATE,
             A.STATE_KEY: key,
-            A.STATE_OLD: _dump(old),
-            A.STATE_NEW: _dump(new),
+            A.STATE_OLD: _Payload(old),
+            A.STATE_NEW: _Payload(new),
         },
         None,
     )

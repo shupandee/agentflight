@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from agentflight import attributes as A
@@ -73,6 +73,7 @@ def _duration_ms(start: int | None, end: int | None) -> float | None:
 
 def event_out(event: Event) -> EventOut:
     attrs = {k: _loads(v) if k.endswith(_JSON_SUFFIXES) else v for k, v in event.attributes.items()}
+    truncated = attrs.get(A.TRUNCATED)
     return EventOut(
         span_id=event.span_id,
         parent_span_id=event.parent_span_id,
@@ -84,6 +85,7 @@ def event_out(event: Event) -> EventOut:
         end_time_ns=event.end_time_ns,
         duration_ms=_duration_ms(event.start_time_ns, event.end_time_ns),
         attributes=attrs,
+        truncated=truncated if isinstance(truncated, dict) else {},
         span_events=event.span_events,
     )
 
@@ -98,13 +100,15 @@ _JSON_SUFFIXES = (
     ".choice",
     ".old",
     ".new",
+    ".truncated",
 )
 
 
 def summarize(run: Run) -> RunSummary:
     tokens_in = tokens_out = 0
     cost: float | None = None
-    llm = tool = errors = 0
+    llm = tool = error_events = 0
+    failures: set[str] = set()
     for e in run.events:
         if e.kind == A.LLM:
             llm += 1
@@ -114,8 +118,11 @@ def summarize(run: Run) -> RunSummary:
                 cost = (cost or 0.0) + float(e.attributes[A.LLM_COST_USD])
         elif e.kind == A.TOOL:
             tool += 1
-        if e.status == "error" and e.kind != A.RUN:
-            errors += 1
+        if e.status == "error":
+            error_events += 1
+            # Events sharing a failure id are one logical failure. Events from SDKs that
+            # don't send ids count individually.
+            failures.add(str(e.attributes.get(A.FAILURE_ID) or f"span:{e.span_id}"))
     return RunSummary(
         id=run.id,
         name=run.name,
@@ -127,7 +134,8 @@ def summarize(run: Run) -> RunSummary:
         event_count=len(run.events),
         llm_calls=llm,
         tool_calls=tool,
-        errors=errors,
+        errors=len(failures),
+        error_events=error_events,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost_usd=cost,
@@ -156,3 +164,35 @@ def get_run(session: Session, run_id: str) -> RunDetail | None:
         return None
     ordered = sorted(run.events, key=lambda e: (e.start_time_ns, e.end_time_ns or 0))
     return RunDetail(**summarize(run).model_dump(), events=[event_out(e) for e in ordered])
+
+
+def delete_run(session: Session, run_id: str) -> bool:
+    """Delete a run and all of its events. Returns False if it didn't exist."""
+    if session.get(Run, run_id) is None:
+        return False
+    session.execute(delete(Event).where(Event.run_id == run_id))
+    session.execute(delete(Run).where(Run.id == run_id))
+    session.commit()
+    return True
+
+
+def cleanup_expired(session: Session, *, cutoff_ns: int, dry_run: bool = False) -> int:
+    """Delete runs that ended (or, if unfinished, started) before ``cutoff_ns``.
+
+    Runs with no timestamps at all are kept. Returns the number of runs affected.
+    """
+    expired = select(Run.id).where(
+        or_(
+            Run.end_time_ns < cutoff_ns,
+            (Run.end_time_ns.is_(None)) & (Run.start_time_ns < cutoff_ns),
+        )
+    )
+    ids = list(session.scalars(expired))
+    if dry_run or not ids:
+        return len(ids)
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        session.execute(delete(Event).where(Event.run_id.in_(chunk)))
+        session.execute(delete(Run).where(Run.id.in_(chunk)))
+    session.commit()
+    return len(ids)

@@ -294,7 +294,7 @@ def test_tracer_itself_broken(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_serializer_itself_broken(monkeypatch: pytest.MonkeyPatch) -> None:
     agentflight.configure(exporter=_NullExporter(), batch=False)
 
-    def broken(value: Any) -> str:
+    def broken(*args: Any, **kwargs: Any) -> str:
         raise RuntimeError("dump bug")
 
     monkeypatch.setattr(sdk, "_dump", broken)

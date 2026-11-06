@@ -14,6 +14,7 @@ LLM_RESPONSE = "agentflight.llm.response"
 LLM_TOKENS_IN = "agentflight.llm.tokens_in"
 LLM_TOKENS_OUT = "agentflight.llm.tokens_out"
 LLM_COST_USD = "agentflight.llm.cost_usd"
+LLM_PARAMS = "agentflight.llm.params"
 
 TOOL_NAME = "agentflight.tool.name"
 TOOL_ARGS = "agentflight.tool.args"
@@ -29,6 +30,11 @@ STATE_NEW = "agentflight.state.new"
 
 ERROR_TYPE = "agentflight.error.type"
 ERROR_MESSAGE = "agentflight.error.message"
+# Same id on every event caused by one underlying exception (tool span, agent log, run).
+FAILURE_ID = "agentflight.failure.id"
+
+# JSON object: attribute key -> {original_length, stored_length, reason}
+TRUNCATED = "agentflight.truncated"
 
 # Event kinds
 RUN = "run"

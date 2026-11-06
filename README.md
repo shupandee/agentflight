@@ -4,7 +4,7 @@ A black box recorder for AI agents. AgentFlight records what an agent does durin
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
 is stored as an ordered timeline you can query, and (from week 3) replay.
 
-> Status: early development (week 1, recorder core). APIs may change.
+> Status: early development (week 2, hardening). APIs may change.
 
 ## Architecture
 
@@ -32,7 +32,10 @@ flowchart LR
 ## Quickstart
 
 ```bash
-# 1. Server + Postgres (applies Alembic migrations on start)
+# 0. A key for the server and the SDK (never commit it)
+export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)
+
+# 1. Server + Postgres + retention job (applies Alembic migrations on start)
 docker compose up --build
 
 # or without Docker, using SQLite:
@@ -40,13 +43,13 @@ pip install -e ".[server]"
 alembic upgrade head            # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
 uvicorn agentflight.server.main:app
 
-# 2. Record the toy agent
+# 2. Record the toy agent (the SDK reads AGENTFLIGHT_API_KEY)
 pip install -e .
 python examples/toy_agent.py
 
 # 3. Inspect
-curl localhost:8000/v1/runs
-curl localhost:8000/v1/runs/<run_id>
+curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs
+curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs/<run_id>
 ```
 
 ## Recording API
@@ -127,15 +130,96 @@ Limitations (known, not yet handled):
 - **`BaseException`s are recorded and re-raised.** `KeyboardInterrupt` and `SystemExit` are
   never swallowed. Only ordinary `Exception`s raised by the instrumentation are suppressed.
 
+## Errors and failures
+
+Each run summary has two error numbers:
+
+- `errors` is the number of **distinct logical failures**.
+- `error_events` is the number of events with error status.
+
+Every error event carries `agentflight.failure.id`. The id follows the exception object, so
+a tool raising `LookupError`, the agent calling `agentflight.error(exc)` on it, and the run
+failing with it all share one id and count as **one** failure. An exception raised while
+handling a recorded one (`raise X from exc`, or inside its `except`) inherits that id.
+Independent exceptions get new ids and count separately. Every event is still stored.
+Error events from SDKs that don't send ids count one each.
+
+## Payload size and redaction
+
+```python
+agentflight.configure(
+    max_attr_chars=32_000,  # per payload; None disables the cap
+    redact=agentflight.redact_fields("api_key", "password", "authorization"),
+)
+```
+
+- **Truncation is explicit.** A payload (messages, response, tool args/result, metadata,
+  decision choice, state) longer than `max_attr_chars` is cut to that length. Its key is then
+  listed in the span's `agentflight.truncated` attribute, and in the API's per-event
+  `truncated` field, as
+  `{"original_length": ..., "stored_length": ..., "reason": "exceeds max_attr_chars=..."}`.
+  So you can always tell a truncated recording from the original message. The limit is a
+  storage limit, not a model context limit.
+- **Redaction.** `redact(key, value)` runs on every payload before it is serialized, and
+  `key` is the attribute name (for example `agentflight.tool.args`). `redact_fields(...)`
+  masks dict entries with those names (case-insensitive) at any depth. If your hook
+  raises, the value is replaced with `"<redaction failed>"`; it fails closed and nothing is
+  recorded.
+- **Not covered yet:** exception messages and stack traces, run and tool names, and model
+  names aren't passed through the hook.
+
+## Authentication
+
+The server **requires an API key by default** and refuses to start without one.
+
+| Setting | Meaning |
+| --- | --- |
+| `AGENTFLIGHT_API_KEY` | The key. Clients send `Authorization: Bearer <key>` (or `X-AgentFlight-Key`). |
+| `AGENTFLIGHT_AUTH_DISABLED=true` | Explicit opt-out for local development only. A warning is logged at startup. |
+
+- Keys are compared in constant time (`hmac.compare_digest`). Wrong or missing keys get
+  `401`, and the response never echoes the key.
+- Endpoints require an `ingest`, `read` or `delete` permission. Today the single key grants
+  all three. The permission check already takes a key-to-permissions map, so ingest-only and
+  read-only keys can be added later without changing the endpoints.
+- `Authorization` and `X-AgentFlight-Key` are never logged. `redact_headers()` is the
+  helper for anything that logs headers, and a log filter on the server's loggers scrubs the
+  configured key from any message as a backstop.
+- **SDK:** `configure(api_key=...)`, or the `AGENTFLIGHT_API_KEY` environment variable.
+  If the server rejects the key, the SDK logs one warning (without the key) and drops the
+  spans. The agent keeps running.
+- `/health` and `/ready` are unauthenticated so orchestrators can probe them.
+
+## Retention and deletion
+
+| Setting | Default |
+| --- | --- |
+| `AGENTFLIGHT_RETENTION_ENABLED` | `true` |
+| `AGENTFLIGHT_RETENTION_DAYS` | `30` |
+| `AGENTFLIGHT_CLEANUP_INTERVAL_HOURS` | `24` |
+
+```bash
+agentflight-server cleanup --dry-run    # count runs older than the retention period
+agentflight-server cleanup              # delete them (and all their events)
+agentflight-server cleanup --days 7     # one-off override
+agentflight-server cleanup --loop       # repeat every CLEANUP_INTERVAL_HOURS (Compose runs this)
+```
+
+A run's age is measured from when it ended, or from when it started if it never finished.
+Runs with no timestamps are kept. `DELETE /v1/runs/{id}` (which needs the `delete`
+permission) removes a single run with all its events, including the messages and tool
+payloads stored on them.
+
 ## HTTP API
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `POST` | `/v1/spans` | Ingest a batch of spans (`{"spans": [...]}`) |
-| `GET` | `/v1/runs` | List runs, newest first (`limit`, `offset`, `status`) with token/cost/error totals |
-| `GET` | `/v1/runs/{run_id}` | One run with its events ordered by start time |
-| `GET` | `/health` | Liveness (process is up) |
-| `GET` | `/ready` | Readiness (database reachable and migrated); 503 otherwise |
+| Method | Path | Permission | Description |
+| --- | --- | --- | --- |
+| `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
+| `GET` | `/v1/runs` | read | List runs, newest first (`limit`, `offset`, `status`) with token/cost/error totals |
+| `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time |
+| `DELETE` | `/v1/runs/{run_id}` | delete | Delete a run and all its events (`204`, or `404`) |
+| `GET` | `/health` | none | Liveness (process is up) |
+| `GET` | `/ready` | none | Readiness (database reachable and migrated); 503 otherwise |
 
 Interactive docs at `/docs` when the server is running.
 
@@ -150,13 +234,20 @@ ruff check . && ruff format --check . && mypy && pytest
 Tests use in-memory SQLite by default. Set `AGENTFLIGHT_TEST_DATABASE_URL` to a Postgres URL
 to run the same suite against Postgres (CI does both).
 
-CI also runs a Compose smoke test. It brings up `docker compose up --wait` (Postgres plus
-the server, both health-checked), runs `examples/toy_agent.py` against it, and uses
-`scripts/compose_smoke.py` to check through the API that both runs were persisted with the
-expected token, cost and error totals. The stack is always torn down afterwards. You can
-run it locally:
+CI also runs a Compose smoke test with a throwaway key. It brings up
+`docker compose up --wait` (Postgres plus the server, both health-checked) and runs
+`scripts/compose_smoke.py`, which checks that:
+
+- missing and wrong keys are rejected;
+- the toy agent still completes with a wrong key, and nothing is persisted;
+- with the right key, both runs are persisted with the expected token, cost and
+  (deduplicated) error totals;
+- `DELETE` removes a run.
+
+The stack is always torn down afterwards. You can run it locally:
 
 ```bash
+export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)
 docker compose up --build --wait
 python scripts/compose_smoke.py
 docker compose down --volumes
@@ -164,13 +255,15 @@ docker compose down --volumes
 
 ## Roadmap
 
-- **Week 1: recorder core** (this branch): SDK, OTel exporter, ingest API, Postgres storage,
-  migrations, tests, CI.
-- **Week 2: integrations.** Auto-instrumentation for OpenAI-style chat clients (tokens and
+- **Week 1: recorder core** (done): SDK, OTel exporter, ingest API, Postgres storage,
+  migrations, failure isolation, tests, CI with a Compose smoke test.
+- **Week 2: hardening** (this branch): logical failure counting, API-key auth, retention
+  and deletion, explicit truncation and redaction.
+- **Week 3: integrations.** Auto-instrumentation for OpenAI-style chat clients (tokens and
   usage taken from responses) and LangGraph, plus a sample agent recording real runs.
-- **Week 3: deterministic replay and fork.** Re-run a recorded trace step by step, serving
+- **Week 4: deterministic replay and fork.** Re-run a recorded trace step by step, serving
   cached model and tool outputs, and fork a run from any step with changed inputs.
-- **Week 4: React viewer and benchmarks.** Run timeline, decision tree, token spend and
+- **Week 5: React viewer and benchmarks.** Run timeline, decision tree, token spend and
   highlighted failures; README screenshots; recorder overhead measured on real runs and
   published with the method used.
 

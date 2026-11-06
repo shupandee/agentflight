@@ -36,8 +36,9 @@ def test_ready_checks_database(client: TestClient) -> None:
 def test_not_ready_without_schema() -> None:
     from agentflight.server import create_app
     from agentflight.server.db import make_engine
+    from agentflight.server.settings import Settings
 
-    with TestClient(create_app(make_engine("sqlite://"))) as c:
+    with TestClient(create_app(make_engine("sqlite://"), Settings(auth_disabled=True))) as c:
         assert c.get("/health").status_code == 200
         assert c.get("/ready").status_code == 503
 

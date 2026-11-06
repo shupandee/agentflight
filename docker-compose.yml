@@ -19,6 +19,8 @@ services:
     build: .
     environment:
       AGENTFLIGHT_DATABASE_URL: postgresql+psycopg://agentflight:agentflight@postgres:5432/agentflight
+      # Required. Generate one, e.g. `export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)`.
+      AGENTFLIGHT_API_KEY: ${AGENTFLIGHT_API_KEY:?set AGENTFLIGHT_API_KEY}
     ports:
       - "8000:8000"
     depends_on:
@@ -29,6 +31,18 @@ services:
       interval: 3s
       timeout: 5s
       retries: 30
+
+  cleanup:
+    build: .
+    command: ["agentflight-server", "cleanup", "--loop"]
+    environment:
+      AGENTFLIGHT_DATABASE_URL: postgresql+psycopg://agentflight:agentflight@postgres:5432/agentflight
+      AGENTFLIGHT_RETENTION_ENABLED: ${AGENTFLIGHT_RETENTION_ENABLED:-true}
+      AGENTFLIGHT_RETENTION_DAYS: ${AGENTFLIGHT_RETENTION_DAYS:-30}
+      AGENTFLIGHT_CLEANUP_INTERVAL_HOURS: ${AGENTFLIGHT_CLEANUP_INTERVAL_HOURS:-24}
+    depends_on:
+      server:
+        condition: service_healthy
 
 volumes:
   pgdata:

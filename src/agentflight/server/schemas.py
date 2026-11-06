@@ -46,6 +46,8 @@ class EventOut(BaseModel):
     end_time_ns: int | None
     duration_ms: float | None
     attributes: dict[str, Any]
+    # attribute key -> {original_length, stored_length, reason} for truncated payloads
+    truncated: dict[str, Any]
     span_events: list[dict[str, Any]]
 
 
@@ -60,7 +62,8 @@ class RunSummary(BaseModel):
     event_count: int
     llm_calls: int
     tool_calls: int
-    errors: int
+    errors: int  # distinct logical failures
+    error_events: int  # every event with error status
     tokens_in: int
     tokens_out: int
     cost_usd: float | None
