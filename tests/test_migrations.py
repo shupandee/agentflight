@@ -230,3 +230,74 @@ def test_0003_marks_runs_without_a_root_status_unknown(db_url: str) -> None:
     command.downgrade(cfg, "0002")
     assert statuses() == {"a": "ok", "b": "ok", "c": "error", "d": "running"}
     command.downgrade(cfg, "base")
+
+
+def test_sqlite_table_rebuild_keeps_existing_events(tmp_path: Path) -> None:
+    """Regression: SQLite batch migrations rebuild tables (copy, drop, rename).
+
+    With foreign keys on, dropping the old ``runs`` table cascade-deleted every event.
+    Migrate a database that already holds events through every rebuild and check that
+    all of them survive, and that the cascade still works for the app afterwards.
+    """
+    url = f"sqlite:///{tmp_path / 'rebuild.db'}"
+    cfg = _config(url)
+    command.upgrade(cfg, "0001")
+    engine = make_engine(url)  # the app's engine: foreign keys on
+    with engine.begin() as conn:
+        for r in "ab":
+            _insert(
+                conn,
+                "INSERT INTO runs (id, name, status, metadata) VALUES (:id, 'r', 'ok', '{}')",
+                id=r * 32,
+            )
+            for i in range(1, 4):
+                _insert(
+                    conn,
+                    EVENT_SQL,
+                    sid=f"{r}{i}" * 8,
+                    rid=r * 32,
+                    kind="llm",
+                    status="ok",
+                    start=i,
+                    end=i + 1,
+                    attrs="{}",
+                )
+    engine.dispose()
+
+    def snapshot() -> tuple[list[tuple[str, str]], list[str], str]:
+        e = make_engine(url)
+        with e.connect() as conn:
+            events = [
+                (r[0], r[1])
+                for r in conn.execute(text("SELECT span_id, run_id FROM events ORDER BY 1"))
+            ]
+            runs = [r[0] for r in conn.execute(text("SELECT id FROM runs ORDER BY 1"))]
+            ddl = conn.execute(
+                text("SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'")
+            ).scalar_one()
+        e.dispose()
+        return events, runs, ddl
+
+    before_events, before_runs, _ = snapshot()
+    assert len(before_events) == 6
+
+    command.upgrade(cfg, "head")
+    events, runs, ddl_head = snapshot()
+    assert (events, runs) == (before_events, before_runs)
+
+    command.downgrade(cfg, "0001")  # drops columns: rebuilds runs and events on SQLite
+    events, runs, ddl_down = snapshot()
+    assert ddl_down != ddl_head  # the table really was rebuilt
+    assert (events, runs) == (before_events, before_runs)
+
+    command.upgrade(cfg, "head")
+    events, runs, _ = snapshot()
+    assert (events, runs) == (before_events, before_runs)
+
+    # Foreign keys still hold: deleting a run through the app's engine removes its events.
+    engine = make_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM runs WHERE id = :id"), {"id": "a" * 32})
+        left = conn.execute(text("SELECT DISTINCT run_id FROM events")).scalars().all()
+    engine.dispose()
+    assert left == ["b" * 32]

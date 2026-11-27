@@ -213,3 +213,60 @@ def test_default_body_cap_is_16_mib(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AGENTFLIGHT_MAX_BODY_BYTES", raising=False)
     monkeypatch.setenv("AGENTFLIGHT_API_KEY", "k" * 32)
     assert Settings.from_env().max_body_bytes == 16 * 1024 * 1024
+
+
+def _drive(app: Any, headers: list[tuple[bytes, bytes]], chunks: list[bytes]) -> tuple[int, int]:
+    """Send ``chunks`` to ``app`` as a raw ASGI request; return (status, chunks read)."""
+    import asyncio
+
+    reads = 0
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal reads
+        if reads < len(chunks):
+            reads += 1
+            return {
+                "type": "http.request",
+                "body": chunks[reads - 1],
+                "more_body": reads < len(chunks),
+            }
+        await asyncio.sleep(3600)  # client would wait for a response; never end the body
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/spans",
+        "raw_path": b"/v1/spans",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"testserver"), (b"content-type", b"application/json"), *headers],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 80),
+    }
+    asyncio.run(asyncio.wait_for(app(scope, receive, send), timeout=10))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["status"], reads
+
+
+def test_body_cap_stops_reading_mid_stream(engine: Engine) -> None:
+    # A chunked body of 100 x 1 KiB chunks against a 4 KiB cap: the server must answer 413
+    # after the fifth chunk, not read (or buffer) the other 95.
+    app = create_app(engine, Settings(auth_disabled=True, max_body_bytes=4096))
+    status, reads = _drive(app, [], [b"x" * 1024] * 100)
+    assert status == 413
+    assert reads == 5
+
+
+def test_body_cap_rejects_on_content_length_before_reading(engine: Engine) -> None:
+    app = create_app(engine, Settings(auth_disabled=True, max_body_bytes=4096))
+    status, reads = _drive(app, [(b"content-length", b"1000000")], [b"x" * 1024] * 100)
+    assert status == 413
+    assert reads == 0
