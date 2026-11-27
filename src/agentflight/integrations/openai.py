@@ -12,6 +12,9 @@ package itself is never imported here, so it isn't a dependency::
 Each ``create`` call becomes an ``llm`` span with the model, messages, request params
 (tools, temperature, ...), the full response (including tool calls) and token usage from
 ``response.usage``. ``stream=True`` calls are passed through without recording.
+
+During ``agentflight.replay`` the client isn't called: the recorded response is returned,
+rebuilt as an ``openai`` ``ChatCompletion`` when that package is installed.
 """
 
 from __future__ import annotations
@@ -63,6 +66,37 @@ def _as_json(response: Any) -> Any:
     return response
 
 
+class _AttrDict(dict[str, Any]):
+    """A dict that also allows attribute access, standing in for a response object."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def model_dump(self, **_: Any) -> dict[str, Any]:
+        return dict(self)
+
+
+def _attr_view(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _AttrDict({k: _attr_view(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_attr_view(v) for v in value]
+    return value
+
+
+def _rebuild(recorded: Any) -> Any:
+    """Turn a recorded response back into a ``ChatCompletion`` (or an attribute view)."""
+    try:
+        from openai.types.chat import ChatCompletion
+
+        return ChatCompletion.model_validate(recorded)
+    except Exception:
+        return _attr_view(recorded)
+
+
 def _record(call: sdk.LLMCall, model: str, response: Any, cost: CostFn | None) -> None:
     usage = _get(response, "usage")
     tokens_in = _get(usage, "prompt_tokens") if usage is not None else None
@@ -93,6 +127,8 @@ def _wrap(create: Callable[..., Any], cost: CostFn | None) -> Callable[..., Any]
             model, messages, params = prepare(kwargs)
             with sdk.llm_call(model, messages, params=params) as call:
                 tag(call)
+                if call.replayed:
+                    return _rebuild(call.response)
                 response = await create(*args, **kwargs)
                 sdk._safe(_record, call, model, response, cost)
                 return response
@@ -107,6 +143,8 @@ def _wrap(create: Callable[..., Any], cost: CostFn | None) -> Callable[..., Any]
         model, messages, params = prepare(kwargs)
         with sdk.llm_call(model, messages, params=params) as call:
             tag(call)
+            if call.replayed:
+                return _rebuild(call.response)
             response = create(*args, **kwargs)
             sdk._safe(_record, call, model, response, cost)
             return response
