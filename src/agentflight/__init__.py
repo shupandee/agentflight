@@ -2,11 +2,13 @@
 
 from agentflight.exporter import AgentFlightExporter
 from agentflight.replayer import (
+    ForkSession,
     Recording,
     ReplayDivergence,
     ReplayedError,
     ReplayError,
     ReplaySession,
+    fork,
     replay,
 )
 from agentflight.sdk import (
@@ -29,6 +31,7 @@ from agentflight.sdk import (
 
 __all__ = [
     "AgentFlightExporter",
+    "ForkSession",
     "LLMCall",
     "Recorder",
     "Recording",
@@ -42,6 +45,7 @@ __all__ = [
     "error",
     "failure_id",
     "flush",
+    "fork",
     "get_recorder",
     "llm_call",
     "redact_fields",

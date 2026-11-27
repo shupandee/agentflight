@@ -13,6 +13,12 @@ Each of those calls is matched, in order, against the recorded steps. The call m
 the same kind, model or tool name and inputs (messages and params, or tool arguments) as
 the recorded step, otherwise :class:`ReplayDivergence` is raised. Replay fails closed: it
 never falls back to calling the real service.
+
+A fork replays the recording up to a chosen step and runs live from there, optionally
+substituting that step's output::
+
+    with agentflight.fork(recording, at=2, output="-5C, snow"):
+        answer = my_agent(question)  # steps 0-1 cached, step 2 returns the new output
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from agentflight import attributes as A
 from agentflight import sdk
 
 STEP_KINDS = (A.LLM, A.TOOL)
+_NO_OUTPUT: Any = object()
 _OUTPUT_KEY = {A.LLM: A.LLM_RESPONSE, A.TOOL: A.TOOL_RESULT}
 
 
@@ -234,9 +241,15 @@ class ReplaySession:
         return step.output
 
     def _take(self, kind: str, name: str, inputs: dict[str, Any]) -> tuple[str, Any, int]:
-        """Pick what to do for the next call: ("cached", value, index) or ("live", ...)."""
+        """Pick what to do for the next call: ("cached", step, index), ("override", value,
+        index) or ("live", None, index)."""
         index = self.cursor
         self.cursor += 1
+        return self._cached(index, kind, name, inputs)
+
+    def _cached(
+        self, index: int, kind: str, name: str, inputs: dict[str, Any]
+    ) -> tuple[str, Any, int]:
         steps = self.recording.steps
         if index >= len(steps):
             raise ReplayDivergence(
@@ -260,6 +273,39 @@ class ReplaySession:
         return True, self._serve(payload)
 
 
+class ForkSession(ReplaySession):
+    """Replays steps before ``at``, then runs live. Created by :func:`fork`."""
+
+    mode = "fork"
+
+    def __init__(self, recording: Recording, at: int, output: Any = _NO_OUTPUT) -> None:
+        super().__init__(recording)
+        count = len(recording.steps)
+        if not 0 <= at <= count:
+            raise ReplayError(f"fork step {at} out of range (recording has {count} steps)")
+        if output is not _NO_OUTPUT and at == count:
+            raise ReplayError(f"no step {at} to override (recording has {count} steps)")
+        self.at = at
+        self.output = output
+
+    def run_attributes(self) -> dict[str, Any]:
+        return {**super().run_attributes(), A.REPLAY_FORK_STEP: self.at}
+
+    def _take(self, kind: str, name: str, inputs: dict[str, Any]) -> tuple[str, Any, int]:
+        index = self.cursor
+        self.cursor += 1
+        if index < self.at:
+            return self._cached(index, kind, name, inputs)
+        if index == self.at and self.output is not _NO_OUTPUT:
+            step = self.recording.steps[index]
+            if (step.kind, step.name) != (kind, name):
+                raise ReplayDivergence(
+                    f"step {index}: recorded {step.kind} {step.name!r}, got {kind} {name!r}"
+                )
+            return "override", self.output, index
+        return "live", None, index
+
+
 @contextmanager
 def replay(recording: Recording) -> Iterator[ReplaySession]:
     """Replay ``recording``: recorded outputs are served and nothing is called live.
@@ -268,6 +314,25 @@ def replay(recording: Recording) -> Iterator[ReplaySession]:
     is itself recorded (as a new run) and can be compared with the original.
     """
     session = ReplaySession(recording)
+    token = sdk._replay_session.set(session)
+    try:
+        yield session
+    finally:
+        sdk._replay_session.reset(token)
+
+
+@contextmanager
+def fork(recording: Recording, at: int, *, output: Any = _NO_OUTPUT) -> Iterator[ForkSession]:
+    """Replay ``recording`` up to step ``at``, then run live.
+
+    Steps before ``at`` are served from the recording and must match it. Step ``at`` and
+    everything after it run live, so changed code, prompts or arguments take effect there.
+    With ``output=...``, step ``at`` isn't run: it returns that value instead (a tool
+    result, or a model response in the form your code reads it), and live execution
+    starts at the next step. ``at`` may equal the number of steps: the whole recording is
+    replayed and any further calls run live.
+    """
+    session = ForkSession(recording, at, output)
     token = sdk._replay_session.set(session)
     try:
         yield session
