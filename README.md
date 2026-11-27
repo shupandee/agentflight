@@ -766,11 +766,16 @@ docker compose down --volumes
 - **Week 6: tree, screenshots, overhead** (done): an indented span tree in the viewer,
   README screenshots, an overhead benchmark with its method and measured results, and a
   cap on the exporter's split-on-413 requests.
-- **Week 7: dropped spans** (this branch): spans dropped from a full export queue are
-  counted and shown as incomplete recordings in the viewer and replay; a configurable
-  queue size; split retries stop at the first non-413 failure; bounded `flush()` and
-  `shutdown()`; benchmark repeats and the server's ingest rate. Deferred: a demo,
-  overhead on real (non-synthetic) agent runs, and a rate limit on failed keys.
+- **Week 7: dropped spans** (done): spans dropped from a full export queue are counted
+  and shown as incomplete recordings in the viewer and replay; a configurable queue size;
+  split retries stop at the first non-413 failure; bounded `flush()` and `shutdown()`;
+  benchmark repeats and the server's ingest rate.
+- **0.1.0** (this branch): run spans on their own lane, so runs with drops still close;
+  release packaging (migrations in the package, `agentflight-server migrate`, a Trusted
+  Publishing release workflow) and the `/v1` stability policy; an opt-in on-disk spool
+  for failed exports. Next: OTLP ingest, `parent_run_id`, server-side redaction, run
+  diff. Deferred: a demo, overhead on real (non-synthetic) agent runs, and a rate limit
+  on failed keys.
 
 ## License
 
