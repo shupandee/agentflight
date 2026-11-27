@@ -358,6 +358,55 @@ Limitations (known, not yet handled):
 - **`BaseException`s are recorded and re-raised.** `KeyboardInterrupt` and `SystemExit` are
   never swallowed. Only ordinary `Exception`s raised by the instrumentation are suppressed.
 
+## Overhead
+
+Measured with [`scripts/bench_overhead.py`](scripts/bench_overhead.py) on 2026-11-27.
+Raw output: [`docs/benchmarks/overhead-2026-11-27.md`](docs/benchmarks/overhead-2026-11-27.md)
+(and [`.json`](docs/benchmarks/overhead-2026-11-27.json)).
+
+**Method.** The "agent" makes 5 model calls and 5 tool calls that do no work, so a run is
+11 spans and nearly all of its time is recording overhead. Each scenario runs it 2,000
+times after 200 warm-up runs, timing each run on the agent thread with
+`time.perf_counter_ns`; the table shows the median and 95th percentile per run, and the
+median added per span versus the same code without AgentFlight. The HTTP scenarios
+export to a real server (uvicorn + SQLite, separate process); the benchmark is pinned to
+one CPU and the server to the other seven, and afterwards it counts the spans the server
+stored. Messages are about 100 characters ("small") or 8,000 ("large").
+
+**Machine.** Linux 6.12 x86_64 VM, Intel Xeon (8 vCPUs, KVM), load average 0.66 at the
+start; CPython 3.13.5, opentelemetry-sdk 1.45.2, httpx 0.29.0, uvicorn 0.54.0.
+
+| Payload | Scenario | Median per run | p95 per run | Added per span | Spans stored |
+| --- | --- | ---: | ---: | ---: | ---: |
+| small | no AgentFlight | 0.7 µs | 0.8 µs | — | — |
+| small | SDK, no exporter | 378.8 µs | 421.6 µs | 34.4 µs | — |
+| small | SDK + JSON serialization, no network | 524.4 µs | 571.3 µs | 47.6 µs | — |
+| small | HTTP, `batch=True` (default), queue drained every 100 runs | 391.5 µs | 501.6 µs | 35.5 µs | 24,200 of 24,200 |
+| small | HTTP, `batch=True`, tight loop | 508.7 µs | 927.5 µs | 46.2 µs | 13,231 of 24,200 |
+| small | HTTP, `batch=False` | 63,637.1 µs | 70,917.7 µs | 5,785.1 µs | 24,200 of 24,200 |
+| large | no AgentFlight | 2.8 µs | 3.2 µs | — | — |
+| large | SDK, no exporter | 837.2 µs | 963.2 µs | 75.9 µs | — |
+| large | SDK + JSON serialization, no network | 1,248.2 µs | 1,353.5 µs | 113.2 µs | — |
+| large | HTTP, `batch=True` (default), queue drained every 100 runs | 839.3 µs | 1,124.4 µs | 76.0 µs | 24,200 of 24,200 |
+| large | HTTP, `batch=True`, tight loop | 961.9 µs | 2,167.6 µs | 87.2 µs | 12,690 of 24,200 |
+| large | HTTP, `batch=False` | 68,088.9 µs | 76,418.2 µs | 6,189.6 µs | 24,200 of 24,200 |
+
+What this says:
+
+- With the default `batch=True`, recording costs the agent about **35 µs per span with
+  small payloads and 76 µs with 8,000-character ones**, about 0.4 ms and 0.8 ms for this
+  11-span run. Export runs on a background thread and adds little on top while the queue
+  keeps up.
+- **A loop that makes spans with no real work in between outruns the exporter.**
+  OpenTelemetry's queue (2,048 spans) filled and it dropped 45-48% of the spans
+  (OpenTelemetry logs "Queue full, dropping Span"). Real agents wait hundreds of
+  milliseconds on model calls, but a burst of thousands of spans can lose some.
+- `batch=False` waits for an HTTP round trip and a database commit per span, about 6 ms
+  each here. Use it for short scripts and debugging, not in a loop.
+
+These are one machine's numbers for a synthetic agent, not a guarantee; run the script on
+yours (`python scripts/bench_overhead.py`, about 5 minutes; `--quick` for a short run).
+
 ## Run status
 
 | Status | Meaning |
