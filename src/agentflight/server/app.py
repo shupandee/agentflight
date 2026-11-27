@@ -25,6 +25,7 @@ from agentflight.server.schemas import (
     RunList,
 )
 from agentflight.server.settings import Permission, Settings
+from agentflight.server.viewer import install_viewer
 
 
 def get_session(request: Request) -> Iterator[Session]:
@@ -171,4 +172,5 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             raise HTTPException(status_code=404, detail="run not found")
         return Response(status_code=204)
 
+    install_viewer(app, settings)
     return app

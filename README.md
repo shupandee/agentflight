@@ -396,6 +396,28 @@ history, and give people and dashboards a `read` key.
   spans. The agent keeps running.
 - `/health` and `/ready` are unauthenticated so orchestrators can probe them.
 
+### Viewer sign-in
+
+The viewer at `/ui` asks once for a key with the `read` permission (an all-permission key
+works too) and then keeps a **signed session** in a cookie:
+
+- The cookie never contains the key. It holds an HMAC fingerprint of the key, the `read`
+  permission and an expiry, signed with the session secret. Every request re-checks the
+  fingerprint against the configured keys, so removing a key ends its sessions.
+- The cookie is `HttpOnly`, `SameSite=Strict`, scoped to `/ui`, and `Secure` when the
+  request is HTTPS (behind a TLS-terminating proxy, run uvicorn with `--proxy-headers`, or
+  set `AGENTFLIGHT_COOKIE_SECURE=true`).
+- Sessions are **read-only**. The `/v1` API never accepts the cookie, and the viewer has
+  no delete or ingest actions.
+- Cross-origin sign-in and sign-out posts are refused.
+- With `AGENTFLIGHT_AUTH_DISABLED=true` there is no sign-in page.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `AGENTFLIGHT_SESSION_SECRET` | random at startup | At least 32 characters. Set it when you run more than one worker or replica, or want sessions to survive a restart. |
+| `AGENTFLIGHT_SESSION_HOURS` | `12` | Session lifetime. |
+| `AGENTFLIGHT_COOKIE_SECURE` | `false` | Always mark the cookie `Secure`. |
+
 ## Ingest limits
 
 Every ingest request is bounded. The defaults are deliberately generous, so they shouldn't

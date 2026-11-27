@@ -69,6 +69,7 @@ DEFAULT_MAX_ATTRIBUTE_CHARS = 262_144
 # OpenTelemetry's SDK keeps at most 128 attributes and 128 events per span by default.
 DEFAULT_MAX_ATTRIBUTES_PER_SPAN = 1024
 DEFAULT_MAX_EVENTS_PER_SPAN = 1024
+DEFAULT_SESSION_HOURS = 12.0
 
 
 def _int(name: str, default: int) -> int:
@@ -100,6 +101,12 @@ class Settings:
     max_attribute_chars: int = DEFAULT_MAX_ATTRIBUTE_CHARS
     max_attributes_per_span: int = DEFAULT_MAX_ATTRIBUTES_PER_SPAN
     max_events_per_span: int = DEFAULT_MAX_EVENTS_PER_SPAN
+    # Viewer sessions. Without a secret, a random one is made at startup: sessions then end
+    # on restart and aren't shared between workers or replicas.
+    session_secret: str | None = field(default=None, repr=False)
+    session_hours: float = DEFAULT_SESSION_HOURS
+    # Always mark the session cookie Secure (it is already when the request is HTTPS).
+    cookie_secure: bool = False
 
     @property
     def api_keys(self) -> dict[str, frozenset[Permission]]:
@@ -133,6 +140,10 @@ class Settings:
         for name, value in limits.items():
             if value <= 0:
                 raise RuntimeError(f"{name} must be positive")
+        if self.session_hours <= 0:
+            raise RuntimeError("AGENTFLIGHT_SESSION_HOURS must be positive")
+        if self.session_secret is not None and len(self.session_secret) < 32:
+            raise RuntimeError("AGENTFLIGHT_SESSION_SECRET must be at least 32 characters")
 
     def abandoned_before_ns(self, now_ns: int) -> int | None:
         """Runs still ``running`` whose last span arrived before this are abandoned."""
@@ -167,4 +178,7 @@ class Settings:
             max_events_per_span=_int(
                 "AGENTFLIGHT_MAX_EVENTS_PER_SPAN", DEFAULT_MAX_EVENTS_PER_SPAN
             ),
+            session_secret=os.environ.get("AGENTFLIGHT_SESSION_SECRET") or None,
+            session_hours=_float("AGENTFLIGHT_SESSION_HOURS", DEFAULT_SESSION_HOURS),
+            cookie_secure=_bool("AGENTFLIGHT_COOKIE_SECURE", False),
         )

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}AgentFlight{% endblock %}</title>
+<link rel="stylesheet" href="/ui/static/viewer.css">
+{% block head %}{% endblock %}
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/ui">AgentFlight</a>
+  <span class="ver">v{{ version }}</span>
+  {% if not auth_disabled and path != "/ui/login" %}
+  <form class="logout" method="post" action="/ui/logout"><button type="submit">Sign out</button></form>
+  {% endif %}
+</header>
+<main>
+{% block main %}{% endblock %}
+</main>
+</body>
+</html>
