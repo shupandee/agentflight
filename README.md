@@ -35,6 +35,7 @@ flowchart LR
         OTel --> EXP[AgentFlightExporter<br/>batched HTTP JSON]
     end
     EXP -->|POST /v1/spans| API[FastAPI ingest server]
+    O[Any OpenTelemetry agent<br/>or Collector] -->|POST /v1/traces<br/>OTLP/HTTP| API
     API --> DB[(PostgreSQL<br/>runs + events)]
     C[curl / scripts] -->|GET /v1/runs, /v1/runs/:id| API
     V[Browser] -->|/ui viewer| API
@@ -218,6 +219,106 @@ Both examples run offline (scripted model, no API key needed):
 python examples/openai_agent.py      # uses the real API if OPENAI_API_KEY is set
 python examples/langgraph_agent.py
 ```
+
+## OTLP ingest (any OpenTelemetry agent)
+
+Agents that are already instrumented with OpenTelemetry (OpenLLMetry, OpenInference,
+framework auto-instrumentation or your own spans) can send traces to AgentFlight over
+standard **OTLP/HTTP**, without the AgentFlight SDK: `POST /v1/traces` accepts
+`application/x-protobuf` and `application/json`, optionally with
+`Content-Encoding: gzip`. OTLP over gRPC is not supported.
+
+Use an `ingest` key, sent as `Authorization: Bearer <key>` (or `X-AgentFlight-Key`).
+With the stock environment variables (the exporter appends `/v1/traces` to
+`OTEL_EXPORTER_OTLP_ENDPOINT`; the space in the header value is written `%20`):
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8000
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer%20${AGENTFLIGHT_INGEST_KEY}"
+export OTEL_EXPORTER_OTLP_COMPRESSION=gzip
+```
+
+Or in Python (`pip install opentelemetry-exporter-otlp-proto-http`):
+
+```python
+from opentelemetry.exporter.otlp.proto.http import Compression
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+exporter = OTLPSpanExporter(
+    endpoint="http://localhost:8000/v1/traces",
+    headers={"Authorization": f"Bearer {ingest_key}"},
+    compression=Compression.Gzip,
+)
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(exporter))
+```
+
+Or from an OpenTelemetry Collector, next to whatever else it exports to:
+
+```yaml
+exporters:
+  otlphttp/agentflight:
+    endpoint: http://agentflight:8000        # the exporter appends /v1/traces
+    headers:
+      authorization: "Bearer ${env:AGENTFLIGHT_INGEST_KEY}"
+    compression: gzip
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp/agentflight]
+```
+
+**How spans become runs.** One trace is one run (the run id is the trace id), as with
+the SDK:
+
+| OTLP | AgentFlight |
+| --- | --- |
+| Span without a parent | Closes the run: its name is the run name, its status the run status (`unset` counts as `ok`, OpenTelemetry's convention). Until it arrives the run is `running`. |
+| `gen_ai.operation.name` `chat`, `text_completion`, `generate_content` or `embeddings` (or a `gen_ai.request.model` / `gen_ai.system` / `gen_ai.provider.name` without an operation) | An `llm` event: model from `gen_ai.response.model`, else `gen_ai.request.model`; tokens from `gen_ai.usage.input_tokens` / `output_tokens` (or the older `prompt_tokens` / `completion_tokens`). These count in the run's call and token totals and the `model` filter. |
+| `gen_ai.operation.name` `execute_tool` (or a `gen_ai.tool.name` without an operation) | A `tool` event named by `gen_ai.tool.name` (the `tool` filter) |
+| Any other span | A `span` event |
+| Resource `service.name`, `service.namespace`, `service.version`, `deployment.environment(.name)` | Run metadata of the root span (the `meta=` filter) |
+| Every other attribute | Kept on the event as is. Resource attributes are copied to every span as `otel.resource.*`, plus `otel.scope.name` / `otel.scope.version`, `otel.span_kind` and `otel.links`. Span events are kept. |
+
+Spans that carry `agentflight.*` attributes (the SDK's own spans, sent through an OTLP
+exporter or a Collector) are read exactly as on `POST /v1/spans`; `gen_ai.*` attributes are
+not applied to them. Re-sending a batch is idempotent (spans are upserted by span id and
+totals recomputed in SQL), so exporter and Collector retries can't double-count.
+
+**Responses** follow the OTLP/HTTP spec, encoded like the request (protobuf or JSON):
+
+| Status | When | Retried by OTLP exporters |
+| --- | --- | --- |
+| `200` | Stored. Spans that can't be stored (an invalid trace or span id, an attribute over a [limit](#ingest-limits)) are left out and counted in `partial_success` (`rejected_spans`, `error_message` naming the first few); the rest of the batch is stored. | no |
+| `400` | The body isn't valid OTLP protobuf/JSON, or isn't valid gzip | no |
+| `401` / `403` | Missing or wrong key / a key without `ingest` | no |
+| `413` | Body over `AGENTFLIGHT_MAX_BODY_BYTES`, compressed **or decompressed** (decompression stops at the cap, so a gzip bomb can't use more memory than that), or more than `AGENTFLIGHT_MAX_SPANS_PER_BATCH` spans | no |
+| `415` | Another `Content-Type`, or a `Content-Encoding` other than `gzip` / `identity` | no |
+| `503` | The database is unavailable (with `Retry-After`) | yes |
+
+Errors carry a `google.rpc.Status` body. The server never answers `429` (it has no rate
+limit). Unlike the SDK's exporter, stock OTLP exporters don't split a batch on `413`; the
+default batch processor sends at most 512 spans per request, so keep payloads well under
+16 MiB per batch or raise the cap.
+
+**Limitations**
+
+- **No replay for OTLP-only runs.** Replay and fork need the recorded outputs the SDK
+  stores (`agentflight.llm.response`, `agentflight.tool.result`...). `gen_ai` prompts,
+  completions and tool arguments stay under their own attribute names, and the viewer shows
+  them, but `Recording` doesn't read them. SDK spans sent over OTLP stay replayable.
+- **No cost.** The `gen_ai` conventions have no cost attribute, so `cost_usd` is only set
+  from `agentflight.llm.cost_usd`.
+- **Distributed traces:** a trace whose root span lives in a service that doesn't export
+  to AgentFlight never closes, and shows as `abandoned` after the stale threshold. A trace
+  with several parentless spans takes its name and status from the last one received.
+- Span and span event names over 255 characters are truncated (not rejected, as
+  `POST /v1/spans` does).
+- The pre-1.0 `instrumentationLibrarySpans` field is ignored; send `scopeSpans`.
 
 ## Replay and fork
 
@@ -642,12 +743,14 @@ works too) and then keeps a **signed session** in a cookie:
 
 Every ingest request is bounded. The defaults are deliberately generous, so they shouldn't
 reject anything the SDK sends with its default settings; they will be tuned once real
-batch sizes are measured. A request over a limit gets `413` and nothing from it is stored.
+batch sizes are measured. A request over a limit gets `413` and nothing from it is stored. On `POST /v1/traces` the body
+cap also applies to the decompressed body, and a span over a per-span limit is rejected on
+its own (see [OTLP ingest](#otlp-ingest-any-opentelemetry-agent)).
 
 | Setting | Default | Limit |
 | --- | --- | --- |
 | `AGENTFLIGHT_MAX_BODY_BYTES` | `16777216` (16 MiB) | Request body size, checked from `Content-Length` and while reading chunked bodies |
-| `AGENTFLIGHT_MAX_SPANS_PER_BATCH` | `2048` | Spans in one `POST /v1/spans` (the SDK's batch processor sends at most 512 by default) |
+| `AGENTFLIGHT_MAX_SPANS_PER_BATCH` | `2048` | Spans in one `POST /v1/spans` or `POST /v1/traces` (the SDK's batch processor sends at most 512 by default) |
 | `AGENTFLIGHT_MAX_ATTRIBUTE_CHARS` | `262144` | Characters in one attribute value, span event attribute value or status message (the SDK caps payloads at 32,000 by default) |
 | `AGENTFLIGHT_MAX_ATTRIBUTES_PER_SPAN` | `1024` | Attributes on one span or span event (OpenTelemetry's SDK keeps 128 by default) |
 | `AGENTFLIGHT_MAX_EVENTS_PER_SPAN` | `1024` | Events on one span (OpenTelemetry's SDK keeps 128 by default) |
@@ -707,6 +810,7 @@ should ignore fields they don't know); a breaking change would mean `/v2`, serve
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |
 | `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
+| `POST` | `/v1/traces` | ingest | [OTLP/HTTP](#otlp-ingest-any-opentelemetry-agent) trace export (protobuf or JSON, optionally gzip) |
 | `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status` (`running`, `ok`, `error`, `unknown`, `abandoned`), `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5) |
 | `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time. Every event with payloads by default (what replay uses). `events_limit` (1-1000) and `events_offset` page the events; `payloads=false` leaves recorded payloads (messages, outputs, args, stack traces) out and lists them in each event's `omitted` |
 | `GET` | `/v1/runs/{run_id}/events/{span_id}` | read | One event with all of its payloads |
@@ -771,12 +875,16 @@ docker compose down --volumes
   and shown as incomplete recordings in the viewer and replay; a configurable queue size;
   split retries stop at the first non-413 failure; bounded `flush()` and `shutdown()`;
   benchmark repeats and the server's ingest rate.
-- **0.1.0** (this branch): run spans on their own lane, so runs with drops still close;
+- **0.1.0** (released): run spans on their own lane, so runs with drops still close;
   release packaging (migrations in the package, `agentflight-server migrate`, a Trusted
   Publishing release workflow) and the `/v1` stability policy; an opt-in on-disk spool
-  for failed exports. Next: OTLP ingest, `parent_run_id`, server-side redaction, run
-  diff. Deferred: a demo, overhead on real (non-synthetic) agent runs, and a rate limit
-  on failed keys.
+  for failed exports.
+- **OTLP ingest** (this branch): `POST /v1/traces` takes OTLP/HTTP (protobuf or JSON,
+  gzip) from any OpenTelemetry-instrumented agent or Collector, with `gen_ai.*` mapped to
+  models, tokens and tools. Deferred: OTLP over gRPC, replay from `gen_ai` content,
+  cost from a price table.
+- **Next:** `parent_run_id`, server-side redaction, run diff. Deferred: a demo, overhead
+  on real (non-synthetic) agent runs, and a rate limit on failed keys.
 
 ## License
 
