@@ -576,8 +576,9 @@ docker compose down --volumes
   htmx, no JavaScript build) with a run list, filters, a run timeline and highlighted
   failures; stored run totals and batched ingest; run filters and paged run detail;
   scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
-  exception messages and stack traces. Deferred to later weeks: README screenshots and a
-  demo, and recorder overhead measured on real runs and published with the method used.
+  exception messages and stack traces. Deferred to later weeks: an indented span tree in
+  the viewer, README screenshots and a demo, recorder overhead measured on real runs and
+  published with the method used, and a rate limit on failed keys.
 
 ## License
 

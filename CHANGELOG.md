@@ -16,6 +16,11 @@ can break a client is listed under **Behaviour changes**.
   `AGENTFLIGHT_API_KEY` or any `AGENTFLIGHT_API_KEYS` key is shorter (the error names the
   setting, never the key). There is still no rate limit on failed keys; long random keys
   are what keep guessing impractical until there is.
+- **Runs that stop reporting become `abandoned`, not `running` forever.** A run still
+  `running` with no span received for `AGENTFLIGHT_STALE_AFTER_MINUTES` (default `60`,
+  `0` turns it off) is shown and filtered as `abandoned`. It is decided when runs are
+  read, nothing stored changes, and a late span makes the run `running` again. Clients
+  that treat anything other than `running`/`ok`/`error` as unexpected need updating.
 - **`GET /v1/runs?status=` is validated.** Allowed values are `running`, `ok`, `error`,
   `unknown` and `abandoned`; anything else gets `422` instead of an empty list.
 - **Ingest is bounded.** `POST /v1/spans` answers `413` when a request breaks a size limit
@@ -49,9 +54,6 @@ can break a client is listed under **Behaviour changes**.
 - **Paged run detail:** `GET /v1/runs/{id}` takes `events_limit`, `events_offset` and
   `payloads=false`. The default is unchanged: every event with its payloads.
 - `GET /v1/runs/{run_id}/events/{span_id}` returns one event with its payloads.
-- **`abandoned` status:** a `running` run with no span received for
-  `AGENTFLIGHT_STALE_AFTER_MINUTES` (default `60`, `0` turns it off), decided when runs
-  are read.
 - Run summaries include `last_seen_ns` and `root_span_id`. Run detail includes
   `events_offset` and `events_limit`, and each event has an `omitted` list.
 
