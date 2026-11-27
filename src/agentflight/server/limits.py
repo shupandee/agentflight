@@ -81,35 +81,34 @@ def _size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str))
 
 
+def span_problem(span: SpanIn, settings: Settings) -> str | None:
+    """Why this span breaks a configured size limit, or None if it doesn't."""
+    max_chars = settings.max_attribute_chars
+    if len(span.attributes) > settings.max_attributes_per_span:
+        return f"{len(span.attributes)} attributes; the limit is {settings.max_attributes_per_span}"
+    if len(span.events) > settings.max_events_per_span:
+        return f"{len(span.events)} events; the limit is {settings.max_events_per_span}"
+    if span.status_message is not None and len(span.status_message) > max_chars:
+        return f"status_message exceeds {max_chars} characters"
+    for key, value in span.attributes.items():
+        if len(key) > 255 or _size(value) > max_chars:
+            return f"attribute {key[:255]!r} exceeds the size limit"
+    for event in span.events:
+        if len(event.attributes) > settings.max_attributes_per_span:
+            return f"event {event.name!r} has too many attributes"
+        for key, value in event.attributes.items():
+            if len(key) > 255 or _size(value) > max_chars:
+                return f"event {event.name!r} attribute {key[:255]!r} exceeds the size limit"
+    return None
+
+
 def check_spans(spans: list[SpanIn], settings: Settings) -> None:
     """Raise 413 if a batch breaks a configured limit. Nothing is stored in that case."""
     if len(spans) > settings.max_spans_per_batch:
         raise PayloadTooLarge(
             f"{len(spans)} spans in one batch; the limit is {settings.max_spans_per_batch}"
         )
-    max_chars = settings.max_attribute_chars
     for i, span in enumerate(spans):
-        where = f"span {i} ({span.span_id})"
-        if len(span.attributes) > settings.max_attributes_per_span:
-            raise PayloadTooLarge(
-                f"{where}: {len(span.attributes)} attributes; the limit is "
-                f"{settings.max_attributes_per_span}"
-            )
-        if len(span.events) > settings.max_events_per_span:
-            raise PayloadTooLarge(
-                f"{where}: {len(span.events)} events; the limit is {settings.max_events_per_span}"
-            )
-        if span.status_message is not None and len(span.status_message) > max_chars:
-            raise PayloadTooLarge(f"{where}: status_message exceeds {max_chars} characters")
-        for key, value in span.attributes.items():
-            if len(key) > 255 or _size(value) > max_chars:
-                raise PayloadTooLarge(f"{where}: attribute {key[:255]!r} exceeds the size limit")
-        for event in span.events:
-            if len(event.attributes) > settings.max_attributes_per_span:
-                raise PayloadTooLarge(f"{where}: event {event.name!r} has too many attributes")
-            for key, value in event.attributes.items():
-                if len(key) > 255 or _size(value) > max_chars:
-                    raise PayloadTooLarge(
-                        f"{where}: event {event.name!r} attribute {key[:255]!r} exceeds the "
-                        "size limit"
-                    )
+        problem = span_problem(span, settings)
+        if problem is not None:
+            raise PayloadTooLarge(f"span {i} ({span.span_id}): {problem}")

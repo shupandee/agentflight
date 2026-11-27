@@ -62,26 +62,34 @@ def permissions_for(key: str, keys: Mapping[str, frozenset[Permission]]) -> froz
     return _match(key, keys)
 
 
+def authorize(request: Request, permission: Permission) -> HTTPException | None:
+    """The error to answer with if this request may not use ``permission`` (else None)."""
+    settings: Settings = request.app.state.settings
+    if settings.auth_disabled:
+        return None
+    key = presented_key(request)
+    if key is None:
+        return HTTPException(
+            status_code=401,
+            detail="missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    perms = _match(key, settings.api_keys)
+    if not perms:
+        return HTTPException(
+            status_code=401,
+            detail="invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if permission not in perms:
+        return HTTPException(status_code=403, detail=f"key lacks {permission} permission")
+    return None
+
+
 def require(permission: Permission) -> Callable[[Request], None]:
     def dependency(request: Request) -> None:
-        settings: Settings = request.app.state.settings
-        if settings.auth_disabled:
-            return
-        key = presented_key(request)
-        if key is None:
-            raise HTTPException(
-                status_code=401,
-                detail="missing API key",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        perms = _match(key, settings.api_keys)
-        if not perms:
-            raise HTTPException(
-                status_code=401,
-                detail="invalid API key",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        if permission not in perms:
-            raise HTTPException(status_code=403, detail=f"key lacks {permission} permission")
+        error = authorize(request, permission)
+        if error is not None:
+            raise error
 
     return dependency
