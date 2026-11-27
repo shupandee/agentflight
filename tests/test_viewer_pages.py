@@ -83,18 +83,19 @@ def test_run_page_uses_paged_payload_free_mode(
 ) -> None:
     run_id = record("weather", "paris-SECRET-PAYLOAD")
     calls: list[dict[str, Any]] = []
-    real = service.get_run
+    real = service.get_run_tree_page
 
     def spy(*args: Any, **kwargs: Any) -> Any:
         calls.append(kwargs)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(service, "get_run", spy)
+    monkeypatch.setattr(service, "get_run_tree_page", spy)
+    whole_run = service.get_run
+    monkeypatch.setattr(service, "get_run", None)  # the viewer never loads a whole run
     page = ui.get(f"/ui/runs/{run_id}")
+    monkeypatch.setattr(service, "get_run", whole_run)
     assert page.status_code == 200
-    assert calls and all(
-        c["payloads"] is False and c["events_limit"] == routes.EVENTS_PAGE for c in calls
-    )
+    assert calls and all(c["limit"] == routes.EVENTS_PAGE for c in calls)
     # Payloads aren't on the page; they load per event.
     assert "answer paris-SECRET-PAYLOAD" not in page.text
     assert "model-a" in page.text and "<svg" in page.text

@@ -83,10 +83,25 @@ The server includes a read-only viewer at `/ui`:
 - **Runs:** every run with its status, start time, duration, call counts, failures, tokens
   and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
   time. Filters update the table in place.
-- **Run page:** a timeline of the run's events with a bar per event on the run's time
-  axis, failures highlighted with their messages, and replay/fork runs linked to the run
-  they came from. Events load in pages of 100 without payloads; selecting an event loads
-  its messages, outputs, arguments and stack traces on demand.
+- **Run page:** the run's spans as an indented tree (each span under its parent,
+  siblings in start order) with a bar per span on the run's time axis, failures
+  highlighted with their messages, and replay/fork runs linked to the run they came
+  from. A span whose parent never arrived starts its own subtree at the left. Events load
+  in pages of 100 without payloads, and the next page continues the tree where the last
+  one stopped; selecting an event loads its messages, outputs, arguments and stack traces
+  on demand. (To page in tree order the server reads every span's id and parent for each
+  page, which is cheap next to loading the events themselves.)
+
+![Run list with filters](docs/screenshots/run-list.png)
+
+![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](docs/screenshots/run-page.png)
+
+![A LangGraph run: model and tool calls nested under graph nodes](docs/screenshots/span-tree.png)
+
+![A fork run, linked to its source run, with cached, overridden and live steps](docs/screenshots/fork-run.png)
+
+The screenshots come from the browser smoke test against the example agents; regenerate
+them with `AGENTFLIGHT_SCREENSHOT_DIR=docs/screenshots pytest tests/test_viewer_browser.py`.
 
 It is server-rendered (Jinja2 and [htmx](https://htmx.org), vendored, no build step) and
 reads through the same service functions and JSON shapes as the `/v1` API, so another
@@ -354,6 +369,55 @@ Limitations (known, not yet handled):
 - **`BaseException`s are recorded and re-raised.** `KeyboardInterrupt` and `SystemExit` are
   never swallowed. Only ordinary `Exception`s raised by the instrumentation are suppressed.
 
+## Overhead
+
+Measured with [`scripts/bench_overhead.py`](scripts/bench_overhead.py) on 2026-11-27.
+Raw output: [`docs/benchmarks/overhead-2026-11-27.md`](docs/benchmarks/overhead-2026-11-27.md)
+(and [`.json`](docs/benchmarks/overhead-2026-11-27.json)).
+
+**Method.** The "agent" makes 5 model calls and 5 tool calls that do no work, so a run is
+11 spans and nearly all of its time is recording overhead. Each scenario runs it 2,000
+times after 200 warm-up runs, timing each run on the agent thread with
+`time.perf_counter_ns`; the table shows the median and 95th percentile per run, and the
+median added per span versus the same code without AgentFlight. The HTTP scenarios
+export to a real server (uvicorn + SQLite, separate process); the benchmark is pinned to
+one CPU and the server to the other seven, and afterwards it counts the spans the server
+stored. Messages are about 100 characters ("small") or 8,000 ("large").
+
+**Machine.** Linux 6.12 x86_64 VM, Intel Xeon (8 vCPUs, KVM), load average 0.66 at the
+start; CPython 3.13.5, opentelemetry-sdk 1.45.2, httpx 0.29.0, uvicorn 0.54.0.
+
+| Payload | Scenario | Median per run | p95 per run | Added per span | Spans stored |
+| --- | --- | ---: | ---: | ---: | ---: |
+| small | no AgentFlight | 0.7 µs | 0.8 µs | — | — |
+| small | SDK, no exporter | 378.8 µs | 421.6 µs | 34.4 µs | — |
+| small | SDK + JSON serialization, no network | 524.4 µs | 571.3 µs | 47.6 µs | — |
+| small | HTTP, `batch=True` (default), queue drained every 100 runs | 391.5 µs | 501.6 µs | 35.5 µs | 24,200 of 24,200 |
+| small | HTTP, `batch=True`, tight loop | 508.7 µs | 927.5 µs | 46.2 µs | 13,231 of 24,200 |
+| small | HTTP, `batch=False` | 63,637.1 µs | 70,917.7 µs | 5,785.1 µs | 24,200 of 24,200 |
+| large | no AgentFlight | 2.8 µs | 3.2 µs | — | — |
+| large | SDK, no exporter | 837.2 µs | 963.2 µs | 75.9 µs | — |
+| large | SDK + JSON serialization, no network | 1,248.2 µs | 1,353.5 µs | 113.2 µs | — |
+| large | HTTP, `batch=True` (default), queue drained every 100 runs | 839.3 µs | 1,124.4 µs | 76.0 µs | 24,200 of 24,200 |
+| large | HTTP, `batch=True`, tight loop | 961.9 µs | 2,167.6 µs | 87.2 µs | 12,690 of 24,200 |
+| large | HTTP, `batch=False` | 68,088.9 µs | 76,418.2 µs | 6,189.6 µs | 24,200 of 24,200 |
+
+What this says:
+
+- With the default `batch=True`, recording costs the agent about **35 µs per span with
+  small payloads and 76 µs with 8,000-character ones**, about 0.4 ms and 0.8 ms for this
+  11-span run. Export runs on a background thread and adds little on top while the queue
+  keeps up.
+- **A loop that makes spans with no real work in between outruns the exporter.**
+  OpenTelemetry's queue (2,048 spans) filled and it dropped 45-48% of the spans
+  (OpenTelemetry logs "Queue full, dropping Span"). Real agents wait hundreds of
+  milliseconds on model calls, but a burst of thousands of spans can lose some.
+- `batch=False` waits for an HTTP round trip and a database commit per span, about 6 ms
+  each here. Use it for short scripts and debugging, not in a loop.
+
+These are one machine's numbers for a synthetic agent, not a guarantee; run the script on
+yours (`python scripts/bench_overhead.py`, about 5 minutes; `--quick` for a short run).
+
 ## Run status
 
 | Status | Meaning |
@@ -488,8 +552,17 @@ batch sizes are measured. A request over a limit gets `413` and nothing from it 
 | `AGENTFLIGHT_MAX_EVENTS_PER_SPAN` | `1024` | Events on one span (OpenTelemetry's SDK keeps 128 by default) |
 
 A full SDK batch of payload-heavy spans can be bigger than 16 MiB. When the server answers
-`413`, the SDK's exporter splits the batch in half and retries each half, so only a single
-span over the cap is dropped (with a warning).
+`413`, the SDK's exporter splits the batch in half and retries each half, so only spans
+over the cap on their own are dropped, with one warning per export.
+
+Splitting is capped at `max_export_attempts` HTTP requests per export (default `32`, set
+it with `configure(max_export_attempts=...)`); whatever is still unsent then is dropped.
+Isolating one oversized span in a full 512-span batch takes 19 requests. Worst case, one
+export takes `max_export_attempts` × `timeout` (32 × 5 s with the defaults) when every
+request is slow. With `batch=True` (the default) that happens on the exporter's background
+thread, though `flush()` and `shutdown()` wait for it. With `batch=False` every span is
+exported on its own as it ends, so there is nothing to split and a span end blocks for at
+most one `timeout`.
 
 Span, span event and attribute names are limited to 255 characters (`422` above that). If
 you turn off the SDK's payload cap (`max_attr_chars=None`), raise
@@ -576,9 +649,12 @@ docker compose down --volumes
   htmx, no JavaScript build) with a run list, filters, a run timeline and highlighted
   failures; stored run totals and batched ingest; run filters and paged run detail;
   scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
-  exception messages and stack traces. Deferred to later weeks: an indented span tree in
-  the viewer, README screenshots and a demo, recorder overhead measured on real runs and
-  published with the method used, and a rate limit on failed keys.
+  exception messages and stack traces.
+- **Week 6: tree, screenshots, overhead** (this branch): an indented span tree in the
+  viewer, README screenshots, an overhead benchmark with its method and measured results,
+  and a cap on the exporter's split-on-413 requests. Deferred: a demo, overhead on real
+  (non-synthetic) agent runs, a setting for the export queue size, and a rate limit on
+  failed keys.
 
 ## License
 

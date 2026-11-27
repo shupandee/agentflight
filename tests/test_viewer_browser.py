@@ -9,6 +9,7 @@ work in a real browser under the viewer's Content-Security-Policy, with no CSP v
 
 from __future__ import annotations
 
+import itertools
 import os
 import socket
 import subprocess
@@ -66,7 +67,7 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             time.sleep(0.1)
         else:
             pytest.fail("server did not become ready")
-        for example in ("toy_agent.py", "replay_agent.py"):
+        for example in ("toy_agent.py", "replay_agent.py", "langgraph_agent.py"):
             subprocess.run(
                 [sys.executable, str(ROOT / "examples" / example)],
                 cwd=ROOT / "examples",
@@ -147,6 +148,27 @@ def test_viewer_in_a_real_browser(server: str, browser: object) -> None:
     assert "agentflight.llm.messages" in page.inner_text("#detail")
     if shots:
         page.screenshot(path=f"{shots}/run-page.png", full_page=True)
+
+    # The span tree: LangGraph nests model and tool calls under graph nodes.
+    graph_id = next(
+        r["id"]
+        for r in httpx.get(f"{server}/v1/runs", headers=auth).json()["runs"]
+        if r["name"] == "langgraph-weather-agent"
+    )
+    page.goto(f"{server}/ui/runs/{graph_id}")
+    tree_rows = page.locator("table.events tbody tr[data-depth]")
+    depths = [int(d) for d in tree_rows.evaluate_all("rs => rs.map(r => r.dataset.depth)")]
+    assert depths[0] == 0 and max(depths) >= 2
+    assert all(b <= a + 1 for a, b in itertools.pairwise(depths))  # no jumps
+    lefts: dict[int, float] = {}
+    for i, depth in enumerate(depths):
+        box = tree_rows.nth(i).locator("button.link").bounding_box()
+        assert box is not None
+        lefts.setdefault(depth, box["x"])
+    # Deeper rows really are indented on screen (the CSS classes apply under the CSP).
+    assert lefts[0] < lefts[1] < lefts[2]
+    if shots:
+        page.screenshot(path=f"{shots}/span-tree.png", full_page=True)
 
     fork_id = next(
         r["id"]

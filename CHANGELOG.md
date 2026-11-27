@@ -4,7 +4,27 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 the project is in early development (`0.x`), `/v1` can still change, and every change that
 can break a client is listed under **Behaviour changes**.
 
-## Unreleased (week 5)
+## Unreleased (week 6)
+
+### Added
+
+- **Span tree in the viewer.** The run page nests each span under its parent (siblings in
+  start order) and pages in tree order. Spans whose parent is missing start their own
+  subtree. The `/v1` API's event order is unchanged.
+- **README screenshots** of the run list, run page, span tree and a fork run, under
+  `docs/screenshots/`, taken by the browser smoke test.
+- **Overhead benchmark.** `scripts/bench_overhead.py` measures what recording adds per
+  span (no exporter, serialization only, HTTP with and without batching) and counts what
+  the server stored. Results and method are in the README under "Overhead".
+
+### Changed
+
+- **Split-on-413 retries are capped per export.** The exporter makes at most
+  `max_export_attempts` requests per export (default `32`, `configure(...)` takes it);
+  spans still unsent then are dropped. Each export that drops spans now logs one warning
+  with the count, instead of one per failed request.
+
+## Week 5 (merged in #3)
 
 ### Behaviour changes
 

@@ -32,7 +32,7 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.trace import Span, Status, StatusCode
 
 from agentflight import attributes as A
-from agentflight.exporter import AgentFlightExporter
+from agentflight.exporter import DEFAULT_MAX_ATTEMPTS, AgentFlightExporter
 
 logger = logging.getLogger("agentflight")
 
@@ -315,6 +315,7 @@ def configure(
     api_key: str | None = None,
     max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
     redact: Redactor | None = None,
+    max_export_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
@@ -322,6 +323,8 @@ def configure(
     ``max_attr_chars`` caps each recorded payload (``None`` disables the cap); truncation
     is recorded in ``agentflight.truncated``. ``redact(key, value)`` runs on every payload
     before it is serialized; if it raises, the value is replaced with a placeholder.
+    ``max_export_attempts`` caps the HTTP requests one export makes while splitting
+    batches the server rejects as too large (413).
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
@@ -329,7 +332,10 @@ def configure(
     try:
         key = api_key if api_key is not None else os.environ.get("AGENTFLIGHT_API_KEY")
         _recorder = Recorder(
-            exporter or AgentFlightExporter(endpoint, timeout=timeout, api_key=key),
+            exporter
+            or AgentFlightExporter(
+                endpoint, timeout=timeout, api_key=key, max_attempts=max_export_attempts
+            ),
             batch=batch,
             max_attr_chars=max_attr_chars,
             redact=redact,

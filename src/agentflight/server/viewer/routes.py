@@ -206,18 +206,16 @@ def run_list_table(request: Request, db: DB) -> Response:
 def _timeline_page(
     request: Request, db: Session, run_id: str, offset: int
 ) -> dict[str, Any] | None:
-    # The viewer always uses the paged, payload-free mode of the run API.
-    run = service.get_run(
-        db,
-        run_id,
-        events_limit=EVENTS_PAGE,
-        events_offset=offset,
-        payloads=False,
-        abandoned_before_ns=_abandoned_before(request),
+    # Paged and payload-free, like the run API, but in span tree order with depths.
+    found = service.get_run_tree_page(
+        db, run_id, offset=offset, limit=EVENTS_PAGE, abandoned_before_ns=_abandoned_before(request)
     )
-    if run is None:
+    if found is None:
         return None
+    run, depths = found
     detail = run.model_dump()
+    for event, depth in zip(detail["events"], depths, strict=True):
+        event["depth"] = depth
     return {
         "run": detail,
         "events": detail["events"],
