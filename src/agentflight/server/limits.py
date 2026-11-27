@@ -40,7 +40,7 @@ class BodySizeLimit:
                 except ValueError:
                     too_big = False
                 if too_big:
-                    await _reject(send, detail)
+                    await _reject(send, detail, scope)
                     return
         seen = 0
 
@@ -57,14 +57,22 @@ class BodySizeLimit:
         await self.app(scope, counting_receive, send)
 
 
-async def _reject(send: Send, detail: str) -> None:
+async def _reject(send: Send, detail: str, scope: Scope) -> None:
     body = json.dumps({"detail": detail}).encode()
+    media = b"application/json"
+    if scope.get("path") == "/v1/traces":  # OTLP clients expect a google.rpc.Status
+        from agentflight.server import otlp
+
+        headers = dict(scope.get("headers", []))
+        fmt = otlp.request_format(headers.get(b"content-type", b"").decode("latin-1"))
+        fmt = fmt or otlp.JSON
+        body, media = otlp.encode_status(fmt, otlp.RESOURCE_EXHAUSTED, detail), fmt.encode()
     await send(
         {
             "type": "http.response.start",
             "status": 413,
             "headers": [
-                (b"content-type", b"application/json"),
+                (b"content-type", media),
                 (b"content-length", str(len(body)).encode()),
                 (b"connection", b"close"),
             ],

@@ -5,18 +5,20 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from agentflight import __version__
-from agentflight.server import service
-from agentflight.server.auth import RedactingFilter, require
+from agentflight.server import otlp, service
+from agentflight.server.auth import RedactingFilter, authorize, require
 from agentflight.server.db import make_engine, session_factory
-from agentflight.server.limits import BodySizeLimit, check_spans
+from agentflight.server.limits import BodySizeLimit, PayloadTooLarge, check_spans
 from agentflight.server.schemas import (
     EventOut,
     IngestRequest,
@@ -105,6 +107,66 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
         check_spans(body.spans, settings)
         run_ids = service.ingest_spans(session, body.spans)
         return IngestResponse(accepted=len(body.spans), runs=run_ids)
+
+    def store_otlp(body: bytes, fmt: str, encoding: str | None) -> otlp.Converted:
+        raw = otlp.decompress(body, encoding, settings.max_body_bytes)
+        request = otlp.parse(raw, fmt)
+        count = otlp.span_count(request)
+        if count > settings.max_spans_per_batch:
+            raise otlp.OTLPError(
+                413,
+                otlp.RESOURCE_EXHAUSTED,
+                f"{count} spans in one request; the limit is {settings.max_spans_per_batch}",
+            )
+        converted = otlp.convert(request, settings)
+        if converted.spans:
+            with app.state.sessions() as session:
+                service.ingest_spans(session, converted.spans, converted.roots)
+        return converted
+
+    @app.post(
+        "/v1/traces",
+        summary="OTLP/HTTP trace ingest (protobuf or JSON, optionally gzip)",
+        response_class=Response,
+    )
+    async def otlp_traces(request: Request) -> Response:
+        fmt = otlp.request_format(request.headers.get("content-type"))
+        reply = fmt or otlp.JSON
+
+        def error(
+            status: int, code: int, message: str, headers: Mapping[str, str] | None = None
+        ) -> Response:
+            body = otlp.encode_status(reply, code, message)
+            return Response(body, status_code=status, media_type=reply, headers=headers)
+
+        denied = authorize(request, Permission.INGEST)
+        if denied is not None:
+            code = otlp.UNAUTHENTICATED if denied.status_code == 401 else otlp.PERMISSION_DENIED
+            return error(denied.status_code, code, str(denied.detail), denied.headers)
+        if fmt is None:
+            return error(
+                415,
+                otlp.INVALID_ARGUMENT,
+                f"Content-Type must be {otlp.PROTOBUF} or {otlp.JSON}",
+            )
+        body = bytearray()
+        try:
+            async for chunk in request.stream():
+                body += chunk
+        except PayloadTooLarge as exc:
+            return error(413, otlp.RESOURCE_EXHAUSTED, str(exc.detail))
+        encoding = request.headers.get("content-encoding")
+        try:
+            converted = await run_in_threadpool(store_otlp, bytes(body), fmt, encoding)
+        except otlp.OTLPError as exc:
+            return error(exc.status, exc.code, exc.message)
+        except (OperationalError, InterfaceError, IntegrityError):
+            # Transient (database down, or a concurrent insert of the same run): retryable.
+            logging.getLogger("agentflight").warning("OTLP ingest failed", exc_info=True)
+            return error(
+                503, otlp.UNAVAILABLE, "database unavailable, retry later", {"Retry-After": "5"}
+            )
+        return Response(otlp.encode_response(fmt, converted), media_type=fmt)
 
     @app.get("/v1/runs", response_model=RunList, dependencies=[CanRead])
     def list_runs(
