@@ -1,10 +1,50 @@
 # Changelog
 
-All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefix; while
-the project is in early development (`0.x`), `/v1` can still change, and every change that
-can break a client is listed under **Behaviour changes**.
+All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefix (see
+"HTTP API versioning" under 0.1.0); every change that can break a client is listed under
+**Behaviour changes**.
 
-## Unreleased
+## 0.1.0 (not yet released; dated when it is tagged)
+
+The first release on PyPI: `pip install agentflight` for the SDK,
+`pip install "agentflight[server]"` for the server and viewer. It contains everything
+below (weeks 1-7) plus the changes in this section.
+
+### HTTP API versioning
+
+Every endpoint a client uses is under `/v1`: `POST /v1/spans` (ingest),
+`GET /v1/runs`, `GET /v1/runs/{run_id}`, `GET /v1/runs/{run_id}/events/{span_id}` and
+`DELETE /v1/runs/{run_id}`. `/health` and `/ready` are unversioned, and the viewer's
+`/ui` pages are not an API. From 0.1.0 on, `/v1` is stable:
+
+- **Only additive changes within `/v1`:** new endpoints, new optional request fields or
+  query parameters, new response fields and new values where a field is documented as
+  open-ended. Clients must ignore response fields they don't know.
+- **Nothing is removed, renamed or given a new meaning within `/v1`:** paths, methods,
+  required fields, field types, status codes, auth scopes, paging and the span JSON that
+  `POST /v1/spans` accepts (including the `agentflight.*` attributes the server reads).
+- **A breaking change means `/v2`.** `/v2` would be served next to `/v1` for at least one
+  minor release after it ships, and `/v1`'s removal would be announced here under
+  Behaviour changes first.
+- **Any SDK 0.1+ works with any server 0.1+** as long as both speak `/v1`; the SDK only
+  uses `POST /v1/spans`, and the replayer the read endpoints.
+- Security fixes are the one exception: if a `/v1` behaviour is unsafe it can change in
+  a patch release, and the change is listed here.
+
+The Python API is not covered by this: while AgentFlight is `0.x`, a minor release
+(0.2, 0.3, ...) can still change it, and every such change is listed under Behaviour
+changes.
+
+### Packaging
+
+- **Version 0.1.0**, read by the build from `agentflight.__version__`. Package metadata
+  now has classifiers, keywords, project URLs and the license file; README links and
+  images are absolute so they work on PyPI; the sdist holds the source, tests, examples
+  and scripts only.
+- **Release workflow** (`.github/workflows/release.yml`): pushing a tag `v*` builds the
+  sdist and wheel, checks the tag matches the version, runs `twine check --strict`,
+  smoke-tests the wheel in a clean venv (`scripts/smoke_installed.py`) and publishes to
+  PyPI with Trusted Publishing (environment `pypi`, no stored token).
 
 ### Added
 

@@ -4,7 +4,7 @@ A black box recorder for AI agents. AgentFlight records what an agent does durin
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
 is stored as an ordered timeline you can query, replay and fork.
 
-> Status: early development (week 5, viewer). APIs may change; see [CHANGELOG.md](CHANGELOG.md).
+> Status: early development (week 5, viewer). APIs may change; see [CHANGELOG.md](https://github.com/shupandee/agentflight/blob/main/CHANGELOG.md).
 
 ## AgentFlight, Langfuse, LangSmith or Phoenix?
 
@@ -62,7 +62,8 @@ export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)
 # 1. Server + Postgres + retention job (applies Alembic migrations on start)
 docker compose up --build
 
-# or without Docker, using SQLite:
+# or without Docker, using SQLite (from a checkout; once 0.1.0 is on PyPI,
+# `pip install "agentflight[server]"` works too):
 pip install -e ".[server]"
 agentflight-server migrate      # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
 agentflight-server serve        # http://127.0.0.1:8000
@@ -93,13 +94,13 @@ The server includes a read-only viewer at `/ui`:
   on demand. An incomplete recording gets a warning above the timeline. (To page in tree order the server reads every span's id and parent for each
   page, which is cheap next to loading the events themselves.)
 
-![Run list with filters](docs/screenshots/run-list.png)
+![Run list with filters](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-list.png)
 
-![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](docs/screenshots/run-page.png)
+![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-page.png)
 
-![A LangGraph run: model and tool calls nested under graph nodes](docs/screenshots/span-tree.png)
+![A LangGraph run: model and tool calls nested under graph nodes](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/span-tree.png)
 
-![A fork run, linked to its source run, with cached, overridden and live steps](docs/screenshots/fork-run.png)
+![A fork run, linked to its source run, with cached, overridden and live steps](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/fork-run.png)
 
 The screenshots come from the browser smoke test against the example agents; regenerate
 them with `AGENTFLIGHT_SCREENSHOT_DIR=docs/screenshots pytest tests/test_viewer_browser.py`.
@@ -409,10 +410,10 @@ Limitations (known, not yet handled):
 
 ## Overhead
 
-Measured with [`scripts/bench_overhead.py`](scripts/bench_overhead.py) on 2026-11-27:
+Measured with [`scripts/bench_overhead.py`](https://github.com/shupandee/agentflight/blob/main/scripts/bench_overhead.py) on 2026-11-27:
 **5 repeats**, each against a fresh server. Raw output:
-[`docs/benchmarks/overhead-2026-11-27-5-repeats.md`](docs/benchmarks/overhead-2026-11-27-5-repeats.md)
-(and [`.json`](docs/benchmarks/overhead-2026-11-27-5-repeats.json)). The numbers
+[`docs/benchmarks/overhead-2026-11-27-5-repeats.md`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-5-repeats.md)
+(and [`.json`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-5-repeats.json)). The numbers
 published with week 6 came from a single run; these replace them.
 
 **Method.** The "agent" makes 5 model calls and 5 tool calls that do no work, so a run is
@@ -654,6 +655,12 @@ permission) removes a single run with all its events, including the messages and
 payloads stored on them.
 
 ## HTTP API
+
+The API is versioned by its `/v1` prefix. From 0.1.0 on, `/v1` only changes in ways
+that don't break clients (new endpoints, optional fields, new response fields; clients
+should ignore fields they don't know); a breaking change would mean `/v2`, served next to
+`/v1` for a while. The full policy is in the
+[changelog](https://github.com/shupandee/agentflight/blob/main/CHANGELOG.md#http-api-versioning).
 
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |

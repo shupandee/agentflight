@@ -1,20 +1,42 @@
 [build-system]
-requires = ["hatchling>=1.21"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "agentflight"
-version = "0.1.0.dev0"
+dynamic = ["version"]
 description = "Black box recorder for AI agents: record, replay and debug agent runs"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Deepanshu Gautam" }]
+keywords = ["agents", "llm", "opentelemetry", "tracing", "replay", "observability"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Logging",
+    "Typing :: Typed",
+]
 dependencies = [
     "opentelemetry-api>=1.24",
     "opentelemetry-sdk>=1.24",
     "httpx>=0.27",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shupandee/agentflight"
+Repository = "https://github.com/shupandee/agentflight"
+Issues = "https://github.com/shupandee/agentflight/issues"
+Changelog = "https://github.com/shupandee/agentflight/blob/main/CHANGELOG.md"
 
 [project.scripts]
 agentflight-server = "agentflight.server.cli:main"
@@ -38,8 +60,23 @@ dev = [
     "mypy>=1.10",
 ]
 
+[tool.hatch.version]
+path = "src/agentflight/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentflight"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/scripts",
+    "/alembic.ini",
+    "/CHANGELOG.md",
+    "/README.md",
+    "/LICENSE",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
