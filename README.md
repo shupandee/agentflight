@@ -4,7 +4,26 @@ A black box recorder for AI agents. AgentFlight records what an agent does durin
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
 is stored as an ordered timeline you can query, replay and fork.
 
-> Status: early development (week 4, replay and fork). APIs may change.
+> Status: early development (week 5, viewer). APIs may change; see [CHANGELOG.md](CHANGELOG.md).
+
+## AgentFlight, Langfuse, LangSmith or Phoenix?
+
+[Langfuse](https://langfuse.com/docs), [LangSmith](https://docs.langchain.com/langsmith/home)
+and [Arize Phoenix](https://arize.com/docs/phoenix) are full LLM engineering platforms.
+Besides tracing they offer evaluations, datasets and experiments, prompt management and
+dashboards, with many framework and provider integrations. Langfuse and Phoenix can be
+self-hosted and accept OpenTelemetry traces. LangSmith runs as a LangChain cloud service,
+with self-hosted and bring-your-own-cloud options on its Enterprise plan.
+
+AgentFlight is much smaller: a Python recorder, one server on Postgres (or SQLite) and a
+read-only viewer, with no evaluations, prompt management or dashboards. Its focus is
+re-running your own agent code from a recording. [Replay](#replay-and-fork) serves the
+recorded model and tool outputs back to the same code in your process, offline, and fork
+swaps one step and runs live from there. That's different from re-running a single LLM
+call in a playground (Phoenix's span replay, for example, replays LLM calls with different
+inputs). Choose one of the platforms if you need evaluations, prompt management or team
+features; AgentFlight if you want a small self-hosted recorder with step-by-step replay
+of agent runs.
 
 ## Architecture
 
@@ -188,6 +207,18 @@ Re-run an agent against a recorded run. Recorded model and tool outputs are serv
 calling anything, so a replay costs nothing and gives the same result. A fork replays up to
 a step, then runs live from there.
 
+**Know the limits first:**
+
+- **Only intercepted calls are replayed.** Replay suits agents that only call models and
+  tools. File writes, database queries, raw HTTP, the clock and randomness inside your
+  agent still run live during a replay. Replay only notices them indirectly, when they
+  change the input of a later step and that step diverges.
+- **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
+  which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
+  this) and streamed OpenAI calls (`stream=True`).
+- **Sequential agents only.** Steps are matched in recorded order, so calls made in
+  parallel threads or tasks can come in a different order and diverge.
+
 ```python
 recording = agentflight.Recording.fetch(run_id)  # or Recording.load("run.json")
 for step in recording.steps:
@@ -264,9 +295,7 @@ print(session.diverged_at)  # e.g. 0: the first model call already differed
 
 **What it doesn't guarantee:**
 
-- **Only intercepted calls are replayed.** Raw HTTP, database queries, file reads, the
-  clock or randomness inside your agent still run live. Replay only catches them
-  indirectly: if they change the input of a later step, that step diverges.
+- **Only intercepted calls are replayed** (see the limits above).
 - **Outputs come back as recorded JSON.** Tuples come back as lists, and custom objects
   come back as whatever was recorded (often a `repr` string). Redacted values come back
   redacted. A step whose recorded output was truncated raises `ReplayError` instead of
@@ -274,13 +303,8 @@ print(session.diverged_at)  # e.g. 0: the first model call already differed
   compared.
 - **Use the same `redact` hook** (and `max_attr_chars`) as when recording, or the inputs
   won't match.
-- **Sequential agents only.** Steps are matched in recorded order. Calls made in parallel
-  threads or tasks can come in a different order and diverge. The replay is bound to the
-  current context (a `ContextVar`): asyncio tasks started inside it see it, but new threads
-  don't.
-- **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
-  which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
-  this) and streamed OpenAI calls.
+- **Sequential agents only** (see above). The replay is bound to the current context (a
+  `ContextVar`): asyncio tasks started inside it see it, but new threads don't.
 
 `python examples/replay_agent.py` records the toy agent, replays it and forks it at the
 tool step (needs the server running).
@@ -529,13 +553,16 @@ docker compose down --volumes
 - **Week 3: integrations** (done): OpenAI-style chat client instrumentation (usage from
   responses) and a LangGraph callback handler, with offline example agents.
   Deferred: streaming and the Responses API.
-- **Week 4: deterministic replay and fork** (this branch): replay a recorded run from
+- **Week 4: deterministic replay and fork** (done): replay a recorded run from
   cached model and tool outputs with divergence checks, and fork from any step with a
   substituted output or changed code. Deferred: LangGraph replay, streamed calls,
   parallel tool calls, a server-side "fork" endpoint.
-- **Week 5: React viewer and benchmarks.** Run timeline, decision tree, token spend and
-  highlighted failures; README screenshots; recorder overhead measured on real runs and
-  published with the method used.
+- **Week 5: viewer and scale fixes** (this branch): a server-rendered viewer (Jinja2 and
+  htmx, no JavaScript build) with a run list, filters, a run timeline and highlighted
+  failures; stored run totals and batched ingest; run filters and paged run detail;
+  scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
+  exception messages and stack traces. Deferred to later weeks: README screenshots and a
+  demo, and recorder overhead measured on real runs and published with the method used.
 
 ## License
 
