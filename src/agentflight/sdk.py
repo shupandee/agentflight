@@ -17,6 +17,7 @@ import uuid
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
@@ -41,6 +42,10 @@ DEFAULT_MAX_ATTR_CHARS = 32_000
 REDACTION_FAILED = "<redaction failed>"
 
 Redactor = Callable[[str, Any], Any]
+
+# The active replay session (see agentflight.replayer), or None when recording normally.
+# Kept here so the SDK needs no import of the replayer; it only calls ``session.next``.
+_replay_session: ContextVar[Any] = ContextVar("agentflight_replay_session", default=None)
 
 
 def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -367,12 +372,27 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
 
     Runs always start a new trace, even when nested inside another span.
     """
-    with _span(
-        f"run:{name}",
-        lambda: {A.KIND: A.RUN, A.RUN_NAME: name, A.RUN_METADATA: _Payload(metadata or {})},
-        new_trace=True,
-    ) as span:
-        yield RunHandle(span=span, name=name)
+
+    def attrs() -> dict[str, Any]:
+        out: dict[str, Any] = {
+            A.KIND: A.RUN,
+            A.RUN_NAME: name,
+            A.RUN_METADATA: _Payload(metadata or {}),
+        }
+        session = _replay_session.get()
+        if session is not None:
+            out.update(session.run_attributes())
+        return out
+
+    with _span(f"run:{name}", attrs, new_trace=True) as span:
+        session = _replay_session.get()
+        if session is not None:
+            _safe(session.bind_run, span)
+        try:
+            yield RunHandle(span=span, name=name)
+        finally:
+            if session is not None:
+                _safe(session.unbind_run, span)
 
 
 @dataclass
@@ -385,6 +405,8 @@ class LLMCall:
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: float | None = None
+    # True when a replay served this call from a recording; ``response`` holds the output.
+    replayed: bool = False
     _start: float = field(default_factory=time.perf_counter)
 
     def record(
@@ -440,7 +462,16 @@ def llm_call(
         return out
 
     with _span(name or f"llm:{model}", attrs) as span:
-        yield LLMCall(span=span, model=model)
+        call = LLMCall(span=span, model=model)
+        session = _replay_session.get()
+        if session is not None:
+            inputs = {A.LLM_MESSAGES: messages, A.LLM_PARAMS: params or None}
+            hit, value = session.next(A.LLM, model, inputs, span)
+            if hit:
+                call.replayed = True
+                call.response = value
+                _safe(_set_payload, span, A.LLM_RESPONSE, value)
+        yield call
 
 
 def _bind_args(func: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -467,6 +498,19 @@ def _set_result(span: Span, result: Any) -> None:
     _safe(_set_payload, span, A.TOOL_RESULT, result)
 
 
+def _replayed_result(
+    tool_name: str, fn: Callable[..., Any], args: Any, kwargs: Any, span: Span
+) -> tuple[bool, Any]:
+    """(True, recorded result) if an active replay serves this tool call."""
+    session = _replay_session.get()
+    if session is None:
+        return False, None
+    hit, value = session.next(A.TOOL, tool_name, {A.TOOL_ARGS: _bind_args(fn, args, kwargs)}, span)
+    if hit:
+        _set_result(span, value)
+    return hit, value
+
+
 @overload
 def tool(func: Callable[P, R], /) -> Callable[P, R]: ...
 @overload
@@ -490,6 +534,9 @@ def tool(
             @functools.wraps(fn)
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
                 with _tool_span(tool_name, fn, args, kwargs) as span:
+                    hit, value = _replayed_result(tool_name, fn, args, kwargs, span)
+                    if hit:
+                        return value
                     result = await fn(*args, **kwargs)
                     _set_result(span, result)
                     return result
@@ -499,6 +546,9 @@ def tool(
         @functools.wraps(fn)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             with _tool_span(tool_name, fn, args, kwargs) as span:
+                hit, value = _replayed_result(tool_name, fn, args, kwargs, span)
+                if hit:
+                    return value  # type: ignore[no-any-return]
                 result = fn(*args, **kwargs)
                 _set_result(span, result)
                 return result

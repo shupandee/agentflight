@@ -2,9 +2,9 @@
 
 A black box recorder for AI agents. AgentFlight records what an agent does during a run:
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
-is stored as an ordered timeline you can query, and (from week 4) replay.
+is stored as an ordered timeline you can query, replay and fork.
 
-> Status: early development (week 3, integrations). APIs may change.
+> Status: early development (week 4, replay and fork). APIs may change.
 
 ## Architecture
 
@@ -157,6 +157,109 @@ Both examples run offline (scripted model, no API key needed):
 python examples/openai_agent.py      # uses the real API if OPENAI_API_KEY is set
 python examples/langgraph_agent.py
 ```
+
+## Replay and fork
+
+Re-run an agent against a recorded run. Recorded model and tool outputs are served instead of
+calling anything, so a replay costs nothing and gives the same result. A fork replays up to
+a step, then runs live from there.
+
+```python
+recording = agentflight.Recording.fetch(run_id)  # or Recording.load("run.json")
+for step in recording.steps:
+    print(step.index, step.kind, step.name)  # 0 llm gpt-4o-mini, 1 tool search, ...
+
+with agentflight.replay(recording) as session:
+    answer = my_agent(question)  # same code as the recorded run
+assert session.remaining == 0  # the replay covered every recorded step
+
+with agentflight.fork(recording, at=1, output="no results"):
+    answer = my_agent(question)  # step 0 cached, step 1 returns "no results", rest live
+
+with agentflight.fork(recording, at=2):
+    answer = my_agent(question)  # steps 0-1 cached, live from step 2 (e.g. a changed prompt)
+```
+
+**Steps.** A step is one `@agentflight.tool` call or one model call (`instrument_openai`, or
+an `llm_call` block), in the order recorded. A call made inside another step (say, a model
+call inside a tool) is part of that step. Serving the outer call means the inner one
+never runs.
+
+**What gets intercepted.** Only these calls are intercepted:
+
+- `@agentflight.tool` functions: the recorded result is returned and the function doesn't
+  run.
+- Clients wrapped with `instrument_openai`: the client isn't called. The recorded response
+  comes back as an `openai` `ChatCompletion` (or as a dict with attribute access if
+  `openai` isn't installed).
+- Manual `llm_call` blocks, only if your code checks `call.replayed`:
+
+  ```python
+  with agentflight.llm_call(model, messages) as call:
+      if call.replayed:
+          reply = call.response
+      else:
+          reply = client.chat(...)
+          call.record(reply, tokens_in=..., tokens_out=...)
+  ```
+
+**What replay guarantees:**
+
+- Each intercepted call is checked against its recorded step: the same kind, the same
+  model or tool name, and the same inputs (messages and params, or bound tool arguments).
+  Inputs are compared after the same redaction and truncation that was used for recording.
+  Any mismatch, or a call beyond the end of the recording, raises `ReplayDivergence`
+  naming the step and the field. Values are never included in the error.
+- By default, replay never falls back to a live call. If a step can't be served, it
+  raises (unlike recording, which is fail-open). A recorded failure is re-raised. Built-in exception types
+  (`LookupError`, `ValueError`...) come back as that type with the recorded message. Other
+  types raise `ReplayedError`, which carries `error_type` and `message`.
+- A replay or fork is recorded as a new run. Its run carries
+  `agentflight.replay.source_run`, `.mode` (`replay`/`fork`) and `.fork_step`. Each step span
+  carries `agentflight.replay.step` and `agentflight.replay.source` (`cached`, `override`
+  or `live`). Cached calls record no tokens or cost, because nothing was spent.
+
+**Going live on divergence (opt-in).** `replay(recording, on_divergence="live")` and
+`fork(..., on_divergence="live")` don't raise on the first mismatch. Instead they stop
+serving recorded outputs: that step and every later call run live, and the steps are marked
+`live`. The step and the reason are recorded on the session (`session.diverged_at`,
+`session.divergence`), on the innermost open run as `agentflight.replay.diverged_at` and
+`agentflight.replay.divergence`, and in a warning on the `agentflight` logger.
+
+```python
+with agentflight.replay(recording, on_divergence="live") as session:
+    answer = my_agent(new_question)
+print(session.diverged_at)  # e.g. 0: the first model call already differed
+```
+
+- This makes real model and tool calls from the divergence point on, so use it only
+  where that's acceptable.
+- Only mismatches switch to live. That covers a different kind, name or input, or a call
+  beyond the recording. A step whose recorded output was truncated still raises
+  `ReplayError`, and a recorded failure is still re-raised.
+
+**What it doesn't guarantee:**
+
+- **Only intercepted calls are replayed.** Raw HTTP, database queries, file reads, the
+  clock or randomness inside your agent still run live. Replay only catches them
+  indirectly: if they change the input of a later step, that step diverges.
+- **Outputs come back as recorded JSON.** Tuples come back as lists, and custom objects
+  come back as whatever was recorded (often a `repr` string). Redacted values come back
+  redacted. A step whose recorded output was truncated raises `ReplayError` instead of
+  returning a partial value. If an input was truncated, only the stored prefix is
+  compared.
+- **Use the same `redact` hook** (and `max_attr_chars`) as when recording, or the inputs
+  won't match.
+- **Sequential agents only.** Steps are matched in recorded order. Calls made in parallel
+  threads or tasks can come in a different order and diverge. The replay is bound to the
+  current context (a `ContextVar`): asyncio tasks started inside it see it, but new threads
+  don't.
+- **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
+  which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
+  this) and streamed OpenAI calls.
+
+`python examples/replay_agent.py` records the toy agent, replays it and forks it at the
+tool step (needs the server running).
 
 ## Failure isolation
 
@@ -332,11 +435,13 @@ docker compose down --volumes
   migrations, failure isolation, tests, CI with a Compose smoke test.
 - **Week 2: hardening** (done): logical failure counting, API-key auth, retention
   and deletion, explicit truncation and redaction.
-- **Week 3: integrations** (this branch): OpenAI-style chat client instrumentation (usage
-  from responses) and a LangGraph callback handler, with offline example agents.
+- **Week 3: integrations** (done): OpenAI-style chat client instrumentation (usage from
+  responses) and a LangGraph callback handler, with offline example agents.
   Deferred: streaming and the Responses API.
-- **Week 4: deterministic replay and fork.** Re-run a recorded trace step by step, serving
-  cached model and tool outputs, and fork a run from any step with changed inputs.
+- **Week 4: deterministic replay and fork** (this branch): replay a recorded run from
+  cached model and tool outputs with divergence checks, and fork from any step with a
+  substituted output or changed code. Deferred: LangGraph replay, streamed calls,
+  parallel tool calls, a server-side "fork" endpoint.
 - **Week 5: React viewer and benchmarks.** Run timeline, decision tree, token spend and
   highlighted failures; README screenshots; recorder overhead measured on real runs and
   published with the method used.

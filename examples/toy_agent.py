@@ -41,6 +41,8 @@ def fake_model(messages: list[dict[str, str]]) -> str:
 
 def chat(messages: list[dict[str, str]]) -> str:
     with agentflight.llm_call("fake-model-1", messages) as call:
+        if call.replayed:  # served from a recording (see examples/replay_agent.py)
+            return str(call.response)
         reply = fake_model(messages)
         # A real client would report usage; here we count words as a stand-in.
         tokens_in = sum(len(m["content"].split()) for m in messages)

@@ -41,6 +41,17 @@ ERROR_MESSAGE = "agentflight.error.message"
 # Same id on every event caused by one underlying exception (tool span, agent log, run).
 FAILURE_ID = "agentflight.failure.id"
 
+# Replay and fork (see agentflight.replayer)
+REPLAY_SOURCE_RUN = "agentflight.replay.source_run"  # on the run: the recording it replays
+REPLAY_MODE = "agentflight.replay.mode"  # on the run: "replay" or "fork"
+REPLAY_FORK_STEP = "agentflight.replay.fork_step"  # on the run, for forks
+# On the run, with on_divergence="live": first step that didn't match, and why
+REPLAY_DIVERGED_AT = "agentflight.replay.diverged_at"
+REPLAY_DIVERGENCE = "agentflight.replay.divergence"
+REPLAY_STEP = "agentflight.replay.step"  # on llm/tool spans: step index in the recording
+# On llm/tool spans: "cached" (served from the recording), "override" (fork output) or "live"
+REPLAY_SOURCE = "agentflight.replay.source"
+
 # JSON object: attribute key -> {original_length, stored_length, reason}
 TRUNCATED = "agentflight.truncated"
 
