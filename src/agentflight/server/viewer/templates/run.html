@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ run.name or run.id }} · AgentFlight{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/ui">Runs</a> / <span class="id">{{ run.id }}</span></p>
+<section class="run-head">
+  <h1>{{ run.name or "(unnamed run)" }} <span class="status st-{{ run.status }}">{{ run.status }}</span></h1>
+  <dl class="stats">
+    <div><dt>Started</dt><dd>{{ run.start_time_ns | utc }}</dd></div>
+    <div><dt>Duration</dt><dd>{{ run.duration_ms | duration }}</dd></div>
+    <div><dt>Events</dt><dd>{{ run.event_count | number }}</dd></div>
+    <div><dt>LLM calls</dt><dd>{{ run.llm_calls | number }}</dd></div>
+    <div><dt>Tool calls</dt><dd>{{ run.tool_calls | number }}</dd></div>
+    <div><dt>Tokens in / out</dt><dd>{{ run.tokens_in | number }} / {{ run.tokens_out | number }}</dd></div>
+    <div><dt>Cost</dt><dd>{{ run.cost_usd | cost }}</dd></div>
+    <div{% if run.errors %} class="bad"{% endif %}><dt>Failures</dt><dd>{{ run.errors | number }} <span class="muted">({{ run.error_events | number }} error events)</span></dd></div>
+  </dl>
+  {% if replay %}
+  <p class="replay">
+    {{ replay.mode or "replay" }} of <a href="/ui/runs/{{ replay.source_run }}">{{ replay.source_run }}</a>
+    {% if replay.fork_step is not none %}· forked at step {{ replay.fork_step }}{% endif %}
+    {% if replay.diverged_at is not none %}· went live at step {{ replay.diverged_at }}: {{ replay.divergence }}{% endif %}
+  </p>
+  {% endif %}
+  {% if run.metadata %}
+  <details class="meta"><summary>Metadata</summary><pre>{{ run.metadata | pretty }}</pre></details>
+  {% endif %}
+</section>
+<div class="run-body">
+  <section class="timeline">
+    <h2>Timeline</h2>
+    <table class="events">
+      <thead><tr><th>Start</th><th>Kind</th><th>Event</th><th class="num">Duration</th><th class="bar-col">Timeline</th></tr></thead>
+      <tbody id="events">
+      {% include "_timeline_rows.html" %}
+      </tbody>
+    </table>
+  </section>
+  <aside id="detail" class="detail" aria-live="polite">
+    <p class="muted">Select an event to see its payloads.</p>
+  </aside>
+</div>
+{% endblock %}

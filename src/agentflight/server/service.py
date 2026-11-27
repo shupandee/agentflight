@@ -246,6 +246,7 @@ def summarize(run: Run, abandoned_before_ns: int | None = None) -> RunSummary:
         name=run.name,
         status=shown_status(run, abandoned_before_ns),
         last_seen_ns=run.last_seen_ns,
+        root_span_id=run.root_span_id,
         start_time_ns=run.start_time_ns,
         end_time_ns=run.end_time_ns,
         duration_ms=_duration_ms(run.start_time_ns, run.end_time_ns),

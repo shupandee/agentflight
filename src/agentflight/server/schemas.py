@@ -60,6 +60,7 @@ class RunSummary(BaseModel):
     # span received for longer than the server's stale threshold)
     status: str
     last_seen_ns: int | None  # server time the last span of this run was received
+    root_span_id: str | None  # the run span, once it has arrived
     start_time_ns: int | None
     end_time_ns: int | None
     duration_ms: float | None

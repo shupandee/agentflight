@@ -1,0 +1,35 @@
+{% if form.errors %}
+<ul class="error" role="alert">{% for e in form.errors %}<li>{{ e }}</li>{% endfor %}</ul>
+{% endif %}
+<p class="muted count">{{ total | number }} run{% if total != 1 %}s{% endif %}{% if total %}, showing {{ form.offset + 1 }}–{{ form.offset + runs | length }}{% endif %}</p>
+{% if runs %}
+<table class="runs">
+  <thead>
+    <tr><th>Run</th><th>Status</th><th>Started</th><th class="num">Duration</th><th class="num">LLM calls</th><th class="num">Tool calls</th><th class="num">Errors</th><th class="num">Tokens in / out</th><th class="num">Cost</th></tr>
+  </thead>
+  <tbody>
+  {% for r in runs %}
+    <tr{% if r.errors %} class="has-errors"{% endif %}>
+      <td><a href="/ui/runs/{{ r.id }}">{{ r.name or "(unnamed)" }}</a><div class="id">{{ r.id }}</div></td>
+      <td><span class="status st-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{{ r.start_time_ns | utc }}</td>
+      <td class="num">{{ r.duration_ms | duration }}</td>
+      <td class="num">{{ r.llm_calls | number }}</td>
+      <td class="num">{{ r.tool_calls | number }}</td>
+      <td class="num">{{ r.errors | number }}</td>
+      <td class="num">{{ r.tokens_in | number }} / {{ r.tokens_out | number }}</td>
+      <td class="num">{{ r.cost_usd | cost }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+<nav class="pager">
+  {% if form.offset > 0 %}
+  {% set prev = [form.offset - page_size, 0] | max %}
+  <a href="/ui?{{ form.values | qs(offset=prev) }}" hx-get="/ui/runs?{{ form.values | qs(offset=prev) }}" hx-target="#runs">← Newer</a>
+  {% endif %}
+  {% if form.offset + page_size < total %}
+  <a href="/ui?{{ form.values | qs(offset=form.offset + page_size) }}" hx-get="/ui/runs?{{ form.values | qs(offset=form.offset + page_size) }}" hx-target="#runs">Older →</a>
+  {% endif %}
+</nav>

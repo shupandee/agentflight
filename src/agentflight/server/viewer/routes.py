@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from sqlalchemy.orm import Session
 
 from agentflight import __version__
+from agentflight.server import service
 from agentflight.server.auth import permissions_for
+from agentflight.server.schemas import RunSummary
 from agentflight.server.settings import Permission, Settings
+from agentflight.server.viewer.format import FILTERS, parse_filters, replay_info, timeline_scale
 from agentflight.server.viewer.session import (
     COOKIE_NAME,
     COOKIE_PATH,
@@ -26,6 +31,8 @@ from agentflight.server.viewer.session import (
 
 HERE = Path(__file__).parent
 LOGIN_PATH = "/ui/login"
+RUNS_PAGE = 50
+EVENTS_PAGE = 100
 
 # No inline script or style anywhere; everything comes from /ui/static.
 CONTENT_SECURITY_POLICY = (
@@ -52,6 +59,7 @@ def make_environment() -> Environment:
         lstrip_blocks=True,
     )
     env.globals["version"] = __version__
+    env.filters.update(FILTERS)
     return env
 
 
@@ -138,10 +146,110 @@ def logout(request: Request) -> Response:
     return response
 
 
-@router.get("", response_class=HTMLResponse)
-def index(request: Request) -> Response:
-    require_viewer(request)
-    return _render(request, "index.html")
+def _session(request: Request) -> Iterator[Session]:
+    with request.app.state.sessions() as session:
+        yield session
+
+
+DB = Annotated[Session, Depends(_session)]
+Viewer = Depends(require_viewer)
+
+
+def _abandoned_before(request: Request) -> int | None:
+    settings: Settings = request.app.state.settings
+    return settings.abandoned_before_ns(time.time_ns())
+
+
+def _run_list(request: Request, db: Session) -> dict[str, Any]:
+    form = parse_filters(request.query_params)
+    runs: list[RunSummary] = []
+    total = 0
+    if not form.errors:
+        runs, total = service.list_runs(
+            db,
+            limit=RUNS_PAGE,
+            offset=form.offset,
+            filters=form.filters,
+            abandoned_before_ns=_abandoned_before(request),
+        )
+    return {
+        "form": form,
+        "runs": [r.model_dump() for r in runs],
+        "total": total,
+        "page_size": RUNS_PAGE,
+        "statuses": service.STATUSES,
+    }
+
+
+@router.get("", response_class=HTMLResponse, dependencies=[Viewer])
+def run_list_page(request: Request, db: DB) -> Response:
+    return _render(request, "runs.html", **_run_list(request, db))
+
+
+@router.get("/runs", response_class=HTMLResponse, dependencies=[Viewer])
+def run_list_table(request: Request, db: DB) -> Response:
+    """The run table alone, for htmx swaps; a plain visit gets the full page."""
+    if not request.headers.get("hx-request"):
+        query = request.url.query
+        return RedirectResponse("/ui" + (f"?{query}" if query else ""), status_code=303)
+    return _render(request, "_runs_table.html", **_run_list(request, db))
+
+
+def _timeline_page(
+    request: Request, db: Session, run_id: str, offset: int
+) -> dict[str, Any] | None:
+    # The viewer always uses the paged, payload-free mode of the run API.
+    run = service.get_run(
+        db,
+        run_id,
+        events_limit=EVENTS_PAGE,
+        events_offset=offset,
+        payloads=False,
+        abandoned_before_ns=_abandoned_before(request),
+    )
+    if run is None:
+        return None
+    detail = run.model_dump()
+    return {
+        "run": detail,
+        "events": detail["events"],
+        "scale": timeline_scale(detail),
+        "next_offset": offset + EVENTS_PAGE if offset + EVENTS_PAGE < run.event_count else None,
+    }
+
+
+@router.get("/runs/{run_id}", response_class=HTMLResponse, dependencies=[Viewer])
+def run_page(request: Request, db: DB, run_id: str) -> Response:
+    page = _timeline_page(request, db, run_id, 0)
+    if page is None:
+        return _render(request, "not_found.html", status_code=404, what="run")
+    root = None
+    root_span_id = page["run"].get("root_span_id")
+    if root_span_id:
+        event = service.get_event(db, run_id, root_span_id)
+        root = event.model_dump() if event else None
+    return _render(request, "run.html", replay=replay_info(root), **page)
+
+
+@router.get("/runs/{run_id}/events", response_class=HTMLResponse, dependencies=[Viewer])
+def run_events(
+    request: Request, db: DB, run_id: str, offset: Annotated[int, Query(ge=0)] = 0
+) -> Response:
+    """More timeline rows (htmx "load more")."""
+    page = _timeline_page(request, db, run_id, offset)
+    if page is None:
+        return _render(request, "not_found.html", status_code=404, what="run")
+    return _render(request, "_timeline_rows.html", **page)
+
+
+@router.get("/runs/{run_id}/events/{span_id}", response_class=HTMLResponse, dependencies=[Viewer])
+def event_panel(request: Request, db: DB, run_id: str, span_id: str) -> Response:
+    """One event with all of its payloads, loaded when a timeline row is opened."""
+    event = service.get_event(db, run_id, span_id)
+    if event is None:
+        return _render(request, "not_found.html", status_code=404, what="event")
+    template = "_event.html" if request.headers.get("hx-request") else "event.html"
+    return _render(request, template, run_id=run_id, event=event.model_dump())
 
 
 def install_viewer(app: FastAPI, settings: Settings) -> None:

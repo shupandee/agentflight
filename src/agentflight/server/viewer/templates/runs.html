@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Runs · AgentFlight{% endblock %}
+{% block main %}
+<h1>Runs</h1>
+<form class="filters" method="get" action="/ui" hx-get="/ui/runs" hx-target="#runs" hx-trigger="submit, change">
+  <label>Status
+    <select name="status">
+      <option value="">any</option>
+      {% for s in statuses %}<option value="{{ s }}"{% if form.values.status == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Name <input name="name" value="{{ form.values.name }}" placeholder="contains…"></label>
+  <label>Model <input name="model" value="{{ form.values.model }}" placeholder="exact"></label>
+  <label>Tool <input name="tool" value="{{ form.values.tool }}" placeholder="exact"></label>
+  <label>Errors
+    <select name="has_errors">
+      <option value="">any</option>
+      <option value="yes"{% if form.values.has_errors == "yes" %} selected{% endif %}>with errors</option>
+      <option value="no"{% if form.values.has_errors == "no" %} selected{% endif %}>without errors</option>
+    </select>
+  </label>
+  <label>Metadata <input name="meta" value="{{ form.values.meta }}" placeholder="key:value"></label>
+  <label>Started after (UTC) <input type="datetime-local" name="since" value="{{ form.values.since }}" step="1"></label>
+  <label>Started before (UTC) <input type="datetime-local" name="until" value="{{ form.values.until }}" step="1"></label>
+  <button type="submit">Filter</button>
+  <a class="reset" href="/ui">Reset</a>
+</form>
+<div id="runs">
+{% include "_runs_table.html" %}
+</div>
+{% endblock %}

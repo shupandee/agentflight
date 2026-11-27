@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}{{ event.name }} · AgentFlight{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/ui">Runs</a> / <a href="/ui/runs/{{ run_id }}">{{ run_id }}</a></p>
+{% include "_event.html" %}
+{% endblock %}

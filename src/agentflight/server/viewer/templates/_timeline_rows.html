@@ -1,0 +1,22 @@
+{% for e in events %}
+{% set bar = scale.bar(e) %}
+<tr class="k-{{ e.kind }}{% if e.status == 'error' %} err{% endif %}">
+  <td class="mono">{{ e.start_time_ns | offset_ms(scale.start_ns) }}</td>
+  <td><span class="kind kind-{{ e.kind }}">{{ e.kind }}</span></td>
+  <td>
+    <button type="button" class="link" hx-get="/ui/runs/{{ run.id }}/events/{{ e.span_id }}" hx-target="#detail">{{ e.name }}</button>
+    {% if e.kind == "llm" and e.attributes["agentflight.llm.tokens_in"] is defined %}
+    <span class="muted">{{ e.attributes["agentflight.llm.tokens_in"] | number }} → {{ e.attributes.get("agentflight.llm.tokens_out") | number }} tokens</span>
+    {% endif %}
+    {% if e.attributes["agentflight.replay.source"] is defined %}<span class="replayed">{{ e.attributes["agentflight.replay.source"] }}</span>{% endif %}
+    {% if e.status == "error" %}<div class="errmsg">{{ e.status_message or "error" }}</div>{% endif %}
+  </td>
+  <td class="num">{{ e.duration_ms | duration }}</td>
+  <td class="bar-col"><svg class="bar" viewBox="0 0 1000 12" preserveAspectRatio="none" aria-hidden="true"><rect x="{{ bar[0] }}" y="1" width="{{ bar[1] }}" height="10" rx="2"></rect></svg></td>
+</tr>
+{% endfor %}
+{% if next_offset is not none %}
+<tr class="more" id="more-{{ next_offset }}">
+  <td colspan="5"><button type="button" hx-get="/ui/runs/{{ run.id }}/events?offset={{ next_offset }}" hx-target="#more-{{ next_offset }}" hx-swap="outerHTML">Load more events ({{ next_offset }} of {{ run.event_count | number }} shown)</button></td>
+</tr>
+{% endif %}

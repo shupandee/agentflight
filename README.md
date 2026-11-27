@@ -17,7 +17,8 @@ flowchart LR
     end
     EXP -->|POST /v1/spans| API[FastAPI ingest server]
     API --> DB[(PostgreSQL<br/>runs + events)]
-    C[curl / viewer] -->|GET /v1/runs, /v1/runs/:id| API
+    C[curl / scripts] -->|GET /v1/runs, /v1/runs/:id| API
+    V[Browser] -->|/ui viewer| API
 ```
 
 - **One run = one OpenTelemetry trace.** `agentflight.run(...)` opens the root span; its
@@ -51,10 +52,29 @@ uvicorn agentflight.server.main:app
 pip install -e .
 python examples/toy_agent.py
 
-# 3. Inspect
+# 3. Inspect: open http://localhost:8000/ui and sign in with the key, or use the API
 curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs
 curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs/<run_id>
 ```
+
+## Viewer
+
+The server includes a read-only viewer at `/ui`:
+
+- **Runs:** every run with its status, start time, duration, call counts, failures, tokens
+  and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
+  time. Filters update the table in place.
+- **Run page:** a timeline of the run's events with a bar per event on the run's time
+  axis, failures highlighted with their messages, and replay/fork runs linked to the run
+  they came from. Events load in pages of 100 without payloads; selecting an event loads
+  its messages, outputs, arguments and stack traces on demand.
+
+It is server-rendered (Jinja2 and [htmx](https://htmx.org), vendored, no build step) and
+reads through the same service functions and JSON shapes as the `/v1` API, so another
+frontend can be built on the API alone. Everything a run recorded is treated as untrusted:
+templates autoescape everything and nothing is marked safe, and pages are served with a
+Content-Security-Policy that allows no inline script or style (`script-src 'self'`). See
+[Viewer sign-in](#viewer-sign-in) for how sessions work.
 
 ## Recording API
 
