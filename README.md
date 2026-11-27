@@ -4,7 +4,26 @@ A black box recorder for AI agents. AgentFlight records what an agent does durin
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
 is stored as an ordered timeline you can query, replay and fork.
 
-> Status: early development (week 4, replay and fork). APIs may change.
+> Status: early development (week 5, viewer). APIs may change; see [CHANGELOG.md](CHANGELOG.md).
+
+## AgentFlight, Langfuse, LangSmith or Phoenix?
+
+[Langfuse](https://langfuse.com/docs), [LangSmith](https://docs.langchain.com/langsmith/home)
+and [Arize Phoenix](https://arize.com/docs/phoenix) are full LLM engineering platforms.
+Besides tracing they offer evaluations, datasets and experiments, prompt management and
+dashboards, with many framework and provider integrations. Langfuse and Phoenix can be
+self-hosted and accept OpenTelemetry traces. LangSmith runs as a LangChain cloud service,
+with self-hosted and bring-your-own-cloud options on its Enterprise plan.
+
+AgentFlight is much smaller: a Python recorder, one server on Postgres (or SQLite) and a
+read-only viewer, with no evaluations, prompt management or dashboards. Its focus is
+re-running your own agent code from a recording. [Replay](#replay-and-fork) serves the
+recorded model and tool outputs back to the same code in your process, offline, and fork
+swaps one step and runs live from there. That's different from re-running a single LLM
+call in a playground (Phoenix's span replay, for example, replays LLM calls with different
+inputs). Choose one of the platforms if you need evaluations, prompt management or team
+features; AgentFlight if you want a small self-hosted recorder with step-by-step replay
+of agent runs.
 
 ## Architecture
 
@@ -17,7 +36,8 @@ flowchart LR
     end
     EXP -->|POST /v1/spans| API[FastAPI ingest server]
     API --> DB[(PostgreSQL<br/>runs + events)]
-    C[curl / viewer] -->|GET /v1/runs, /v1/runs/:id| API
+    C[curl / scripts] -->|GET /v1/runs, /v1/runs/:id| API
+    V[Browser] -->|/ui viewer| API
 ```
 
 - **One run = one OpenTelemetry trace.** `agentflight.run(...)` opens the root span; its
@@ -27,7 +47,11 @@ flowchart LR
 - The SDK uses its **own TracerProvider**, so it doesn't change any global OTel setup your
   app already has.
 - The server **upserts by span id** (re-sent batches are idempotent) and accepts child spans
-  before their root span arrives (the run shows as `running` until then).
+  before their root span arrives (the run shows as `running` until then; see
+  [Run status](#run-status)).
+- **Run totals are stored on the run row** (calls, errors, tokens, cost) and recomputed in
+  SQL for every run an ingest batch touches, so listing runs never reads their events and
+  re-sent spans can't make the totals drift.
 
 ## Quickstart
 
@@ -47,10 +71,29 @@ uvicorn agentflight.server.main:app
 pip install -e .
 python examples/toy_agent.py
 
-# 3. Inspect
+# 3. Inspect: open http://localhost:8000/ui and sign in with the key, or use the API
 curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs
 curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs/<run_id>
 ```
+
+## Viewer
+
+The server includes a read-only viewer at `/ui`:
+
+- **Runs:** every run with its status, start time, duration, call counts, failures, tokens
+  and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
+  time. Filters update the table in place.
+- **Run page:** a timeline of the run's events with a bar per event on the run's time
+  axis, failures highlighted with their messages, and replay/fork runs linked to the run
+  they came from. Events load in pages of 100 without payloads; selecting an event loads
+  its messages, outputs, arguments and stack traces on demand.
+
+It is server-rendered (Jinja2 and [htmx](https://htmx.org), vendored, no build step) and
+reads through the same service functions and JSON shapes as the `/v1` API, so another
+frontend can be built on the API alone. Everything a run recorded is treated as untrusted:
+templates autoescape everything and nothing is marked safe, and pages are served with a
+Content-Security-Policy that allows no inline script or style (`script-src 'self'`). See
+[Viewer sign-in](#viewer-sign-in) for how sessions work.
 
 ## Recording API
 
@@ -164,6 +207,18 @@ Re-run an agent against a recorded run. Recorded model and tool outputs are serv
 calling anything, so a replay costs nothing and gives the same result. A fork replays up to
 a step, then runs live from there.
 
+**Know the limits first:**
+
+- **Only intercepted calls are replayed.** Replay suits agents that only call models and
+  tools. File writes, database queries, raw HTTP, the clock and randomness inside your
+  agent still run live during a replay. Replay only notices them indirectly, when they
+  change the input of a later step and that step diverges.
+- **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
+  which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
+  this) and streamed OpenAI calls (`stream=True`).
+- **Sequential agents only.** Steps are matched in recorded order, so calls made in
+  parallel threads or tasks can come in a different order and diverge.
+
 ```python
 recording = agentflight.Recording.fetch(run_id)  # or Recording.load("run.json")
 for step in recording.steps:
@@ -240,9 +295,7 @@ print(session.diverged_at)  # e.g. 0: the first model call already differed
 
 **What it doesn't guarantee:**
 
-- **Only intercepted calls are replayed.** Raw HTTP, database queries, file reads, the
-  clock or randomness inside your agent still run live. Replay only catches them
-  indirectly: if they change the input of a later step, that step diverges.
+- **Only intercepted calls are replayed** (see the limits above).
 - **Outputs come back as recorded JSON.** Tuples come back as lists, and custom objects
   come back as whatever was recorded (often a `repr` string). Redacted values come back
   redacted. A step whose recorded output was truncated raises `ReplayError` instead of
@@ -250,13 +303,8 @@ print(session.diverged_at)  # e.g. 0: the first model call already differed
   compared.
 - **Use the same `redact` hook** (and `max_attr_chars`) as when recording, or the inputs
   won't match.
-- **Sequential agents only.** Steps are matched in recorded order. Calls made in parallel
-  threads or tasks can come in a different order and diverge. The replay is bound to the
-  current context (a `ContextVar`): asyncio tasks started inside it see it, but new threads
-  don't.
-- **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
-  which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
-  this) and streamed OpenAI calls.
+- **Sequential agents only** (see above). The replay is bound to the current context (a
+  `ContextVar`): asyncio tasks started inside it see it, but new threads don't.
 
 `python examples/replay_agent.py` records the toy agent, replays it and forks it at the
 tool step (needs the server running).
@@ -306,6 +354,20 @@ Limitations (known, not yet handled):
 - **`BaseException`s are recorded and re-raised.** `KeyboardInterrupt` and `SystemExit` are
   never swallowed. Only ordinary `Exception`s raised by the instrumentation are suppressed.
 
+## Run status
+
+| Status | Meaning |
+| --- | --- |
+| `running` | The run span hasn't arrived with an end time yet. |
+| `ok` / `error` | The run span ended with that status. |
+| `unknown` | The run span ended without setting a status (possible with raw `/v1/spans` senders and non-SDK OTel spans; the SDK always sets one). |
+| `abandoned` | Still `running`, but no span of the run has been received for `AGENTFLIGHT_STALE_AFTER_MINUTES` (default `60`, `0` turns it off), e.g. because the agent process crashed. |
+
+`abandoned` is never stored. It's decided when runs are read, from the run's
+`last_seen_ns` (server time of its last received span), so changing the threshold needs no
+data fix, and a late span turns the run back into `running` or its final status. Filter
+with `GET /v1/runs?status=abandoned`.
+
 ## Errors and failures
 
 Each run summary has two error numbers:
@@ -341,8 +403,15 @@ agentflight.configure(
   masks dict entries with those names (case-insensitive) at any depth. If your hook
   raises, the value is replaced with `"<redaction failed>"`; it fails closed and nothing is
   recorded.
-- **Not covered yet:** exception messages and stack traces, run and tool names, and model
-  names aren't passed through the hook.
+- **Errors are redacted too.** Exception messages go through the hook with the key
+  `agentflight.error.message`, and stack traces with `exception.stacktrace`, before they
+  are stored (in the error attributes, the span status and the OpenTelemetry `exception`
+  event). Both are plain strings, so a hook that should scrub them has to handle `str`
+  values; `redact_fields(...)` only masks dict entries. Both are capped at
+  `max_attr_chars`, and a cut message is listed in `agentflight.truncated`.
+- **Names are not redacted.** Run, tool and model names are stored as given, because
+  replay matches steps by them. Don't put personal data or secrets in run names (or tool
+  names); put them in metadata or arguments, where the hook applies.
 
 ## Authentication
 
@@ -350,21 +419,81 @@ The server **requires an API key by default** and refuses to start without one.
 
 | Setting | Meaning |
 | --- | --- |
-| `AGENTFLIGHT_API_KEY` | The key. Clients send `Authorization: Bearer <key>` (or `X-AgentFlight-Key`). |
+| `AGENTFLIGHT_API_KEY` | A key with every permission. Clients send `Authorization: Bearer <key>` (or `X-AgentFlight-Key`). |
+| `AGENTFLIGHT_API_KEYS` | Scoped keys: comma-separated `<key>:<permission>[+<permission>...]`, e.g. `k1:ingest,k2:read,k3:read+delete`. |
 | `AGENTFLIGHT_AUTH_DISABLED=true` | Explicit opt-out for local development only. A warning is logged at startup. |
 
+The server starts if at least one of `AGENTFLIGHT_API_KEY` and `AGENTFLIGHT_API_KEYS` is
+set. Give recorders an `ingest`-only key, so a leaked agent key can't read or delete
+history, and give people and dashboards a `read` key.
+
+- Every configured key must be at least 32 characters (`openssl rand -hex 32` gives 64);
+  a shorter one stops the server at startup, and the error names the setting, not the
+  key. That is what makes guessing impractical: **the sign-in page and the API have no
+  rate limit on failed keys yet** (deferred; put a rate-limiting proxy in front if you
+  need one now).
 - Keys are compared in constant time (`hmac.compare_digest`). Wrong or missing keys get
   `401`, and the response never echoes the key.
-- Endpoints require an `ingest`, `read` or `delete` permission. Today the single key grants
-  all three. The permission check already takes a key-to-permissions map, so ingest-only and
-  read-only keys can be added later without changing the endpoints.
+- Endpoints require an `ingest`, `read` or `delete` permission. A valid key without the
+  needed permission gets `403`. A malformed `AGENTFLIGHT_API_KEYS` (unknown permission,
+  duplicate key) stops the server at startup, and the error never includes the key.
 - `Authorization` and `X-AgentFlight-Key` are never logged. `redact_headers()` is the
   helper for anything that logs headers, and a log filter on the server's loggers scrubs the
-  configured key from any message as a backstop.
+  configured keys from any message as a backstop.
 - **SDK:** `configure(api_key=...)`, or the `AGENTFLIGHT_API_KEY` environment variable.
   If the server rejects the key, the SDK logs one warning (without the key) and drops the
   spans. The agent keeps running.
 - `/health` and `/ready` are unauthenticated so orchestrators can probe them.
+
+### Viewer sign-in
+
+The viewer at `/ui` asks once for a key with the `read` permission (an all-permission key
+works too) and then keeps a **signed session** in a cookie:
+
+- The cookie never contains the key. It holds an HMAC fingerprint of the key, the `read`
+  permission and an expiry, signed with the session secret. Every request re-checks the
+  fingerprint against the configured keys, so removing a key ends its sessions.
+- The cookie is `HttpOnly`, `SameSite=Strict`, scoped to `/ui`, and `Secure` when the
+  request is HTTPS (behind a TLS-terminating proxy, run uvicorn with `--proxy-headers`, or
+  set `AGENTFLIGHT_COOKIE_SECURE=true`).
+- Sessions are **read-only**. The `/v1` API never accepts the cookie, and the viewer has
+  no delete or ingest actions.
+- Sign-in and sign-out posts must carry an `Origin` header whose host matches `Host`;
+  a cross-site, `null` or **missing** `Origin` gets `403` (current browsers always send
+  it on form posts). A reverse proxy must pass the original `Host` through.
+- With `AGENTFLIGHT_AUTH_DISABLED=true` there is no sign-in page.
+- By default the signing secret is an HMAC of all configured API keys, so every worker
+  and replica with the same keys accepts the same sessions and restarts don't sign anyone
+  out. **Rotating, adding or removing any key ends every viewer session**; people sign in
+  again. Set `AGENTFLIGHT_SESSION_SECRET` to decouple sessions from the keys.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `AGENTFLIGHT_SESSION_SECRET` | derived from the API keys | Override for the signing secret, at least 32 characters. |
+| `AGENTFLIGHT_SESSION_HOURS` | `12` | Session lifetime. |
+| `AGENTFLIGHT_COOKIE_SECURE` | `false` | Always mark the cookie `Secure`. |
+
+## Ingest limits
+
+Every ingest request is bounded. The defaults are deliberately generous, so they shouldn't
+reject anything the SDK sends with its default settings; they will be tuned once real
+batch sizes are measured. A request over a limit gets `413` and nothing from it is stored.
+
+| Setting | Default | Limit |
+| --- | --- | --- |
+| `AGENTFLIGHT_MAX_BODY_BYTES` | `16777216` (16 MiB) | Request body size, checked from `Content-Length` and while reading chunked bodies |
+| `AGENTFLIGHT_MAX_SPANS_PER_BATCH` | `2048` | Spans in one `POST /v1/spans` (the SDK's batch processor sends at most 512 by default) |
+| `AGENTFLIGHT_MAX_ATTRIBUTE_CHARS` | `262144` | Characters in one attribute value, span event attribute value or status message (the SDK caps payloads at 32,000 by default) |
+| `AGENTFLIGHT_MAX_ATTRIBUTES_PER_SPAN` | `1024` | Attributes on one span or span event (OpenTelemetry's SDK keeps 128 by default) |
+| `AGENTFLIGHT_MAX_EVENTS_PER_SPAN` | `1024` | Events on one span (OpenTelemetry's SDK keeps 128 by default) |
+
+A full SDK batch of payload-heavy spans can be bigger than 16 MiB. When the server answers
+`413`, the SDK's exporter splits the batch in half and retries each half, so only a single
+span over the cap is dropped (with a warning).
+
+Span, span event and attribute names are limited to 255 characters (`422` above that). If
+you turn off the SDK's payload cap (`max_attr_chars=None`), raise
+`AGENTFLIGHT_MAX_ATTRIBUTE_CHARS` too, or large payloads will be rejected.
 
 ## Retention and deletion
 
@@ -391,8 +520,9 @@ payloads stored on them.
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |
 | `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
-| `GET` | `/v1/runs` | read | List runs, newest first (`limit`, `offset`, `status`) with token/cost/error totals |
-| `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time |
+| `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status` (`running`, `ok`, `error`, `unknown`, `abandoned`), `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5) |
+| `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time. Every event with payloads by default (what replay uses). `events_limit` (1-1000) and `events_offset` page the events; `payloads=false` leaves recorded payloads (messages, outputs, args, stack traces) out and lists them in each event's `omitted` |
+| `GET` | `/v1/runs/{run_id}/events/{span_id}` | read | One event with all of its payloads |
 | `DELETE` | `/v1/runs/{run_id}` | delete | Delete a run and all its events (`204`, or `404`) |
 | `GET` | `/health` | none | Liveness (process is up) |
 | `GET` | `/ready` | none | Readiness (database reachable and migrated); 503 otherwise |
@@ -438,13 +568,17 @@ docker compose down --volumes
 - **Week 3: integrations** (done): OpenAI-style chat client instrumentation (usage from
   responses) and a LangGraph callback handler, with offline example agents.
   Deferred: streaming and the Responses API.
-- **Week 4: deterministic replay and fork** (this branch): replay a recorded run from
+- **Week 4: deterministic replay and fork** (done): replay a recorded run from
   cached model and tool outputs with divergence checks, and fork from any step with a
   substituted output or changed code. Deferred: LangGraph replay, streamed calls,
   parallel tool calls, a server-side "fork" endpoint.
-- **Week 5: React viewer and benchmarks.** Run timeline, decision tree, token spend and
-  highlighted failures; README screenshots; recorder overhead measured on real runs and
-  published with the method used.
+- **Week 5: viewer and scale fixes** (this branch): a server-rendered viewer (Jinja2 and
+  htmx, no JavaScript build) with a run list, filters, a run timeline and highlighted
+  failures; stored run totals and batched ingest; run filters and paged run detail;
+  scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
+  exception messages and stack traces. Deferred to later weeks: an indented span tree in
+  the viewer, README screenshots and a demo, recorder overhead measured on real runs and
+  published with the method used, and a rate limit on failed keys.
 
 ## License
 

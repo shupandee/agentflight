@@ -21,6 +21,11 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     url = config.attributes.get("url") or database_url()
     with make_engine(url).connect() as connection:
+        if connection.dialect.name == "sqlite":
+            # Batch migrations rebuild SQLite tables (copy, drop, rename). With foreign keys
+            # on, dropping ``runs`` would cascade-delete every event.
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
             context.run_migrations()

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class SpanEventIn(BaseModel):
-    name: str
+    name: str = Field(max_length=255)
     time_ns: int
     attributes: dict[str, Any] = Field(default_factory=dict)
 
@@ -17,7 +17,7 @@ class SpanIn(BaseModel):
     trace_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     span_id: str = Field(pattern=r"^[0-9a-f]{16}$")
     parent_span_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
-    name: str
+    name: str = Field(max_length=255)
     start_time_ns: int
     end_time_ns: int | None = None
     status: Literal["unset", "ok", "error"] = "unset"
@@ -49,12 +49,18 @@ class EventOut(BaseModel):
     # attribute key -> {original_length, stored_length, reason} for truncated payloads
     truncated: dict[str, Any]
     span_events: list[dict[str, Any]]
+    # With ``payloads=false``: attribute keys (and "span_events") left out of this event
+    omitted: list[str] = Field(default_factory=list)
 
 
 class RunSummary(BaseModel):
     id: str
     name: str | None
+    # running | ok | error | unknown (ended without a status) | abandoned (running, but no
+    # span received for longer than the server's stale threshold)
     status: str
+    last_seen_ns: int | None  # server time the last span of this run was received
+    root_span_id: str | None  # the run span, once it has arrived
     start_time_ns: int | None
     end_time_ns: int | None
     duration_ms: float | None
@@ -71,6 +77,10 @@ class RunSummary(BaseModel):
 
 class RunDetail(RunSummary):
     events: list[EventOut]
+    # Paging of ``events``; ``event_count`` is the total. ``events_limit`` is null when
+    # every event from ``events_offset`` on is included.
+    events_offset: int = 0
+    events_limit: int | None = None
 
 
 class RunList(BaseModel):

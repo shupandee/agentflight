@@ -57,6 +57,11 @@ def _match(key: str, keys: Mapping[str, frozenset[Permission]]) -> frozenset[Per
     return granted
 
 
+def permissions_for(key: str, keys: Mapping[str, frozenset[Permission]]) -> frozenset[Permission]:
+    """Permissions a presented key grants (empty if it matches no configured key)."""
+    return _match(key, keys)
+
+
 def require(permission: Permission) -> Callable[[Request], None]:
     def dependency(request: Request) -> None:
         settings: Settings = request.app.state.settings

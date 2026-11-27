@@ -116,4 +116,4 @@ def test_settings_defaults_and_validation() -> None:
     s = Settings(api_key="k")
     assert (s.retention_enabled, s.retention_days, s.cleanup_interval_hours) == (True, 30, 24)
     with pytest.raises(RuntimeError):
-        Settings(api_key="k", retention_days=0).validate()
+        Settings(api_key="k" * 32, retention_days=0).validate()

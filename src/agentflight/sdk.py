@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+import traceback
 import uuid
 import weakref
 from collections.abc import Callable, Iterator
@@ -40,6 +41,7 @@ R = TypeVar("R")
 
 DEFAULT_MAX_ATTR_CHARS = 32_000
 REDACTION_FAILED = "<redaction failed>"
+EXCEPTION_STACKTRACE = "exception.stacktrace"
 
 Redactor = Callable[[str, Any], Any]
 
@@ -124,9 +126,7 @@ def _finalize(attrs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _set_payload(span: Span, key: str, value: Any) -> None:
-    text, info = _encode(key, value)
-    span.set_attribute(key, text)
+def _note_truncation(span: Span, key: str, info: dict[str, Any] | None) -> None:
     if info:
         existing: dict[str, Any] = {}
         current = getattr(span, "attributes", None) or {}
@@ -134,6 +134,31 @@ def _set_payload(span: Span, key: str, value: Any) -> None:
             existing = json.loads(current[A.TRUNCATED])
         existing[key] = info
         span.set_attribute(A.TRUNCATED, json.dumps(existing))
+
+
+def _set_payload(span: Span, key: str, value: Any) -> None:
+    text, info = _encode(key, value)
+    span.set_attribute(key, text)
+    _note_truncation(span, key, info)
+
+
+def _redact_text(key: str, text: str) -> tuple[str, dict[str, Any] | None]:
+    """Redact and size-limit plain text (exception messages, stack traces).
+
+    Unlike payloads it's stored as the text itself, not JSON. A hook that returns a non-string
+    gets its result JSON-encoded; a failing hook fails closed like it does for payloads.
+    """
+    redacted = _redact(key, text)
+    out = redacted if isinstance(redacted, str) else _dump(redacted)
+    limit = _recorder.max_attr_chars
+    if limit is None or len(out) <= limit:
+        return out, None
+    info = {
+        "original_length": len(out),
+        "stored_length": limit,
+        "reason": f"exceeds max_attr_chars={limit}",
+    }
+    return out[:limit], info
 
 
 def redact_fields(*names: str, replacement: str = "[REDACTED]") -> Redactor:
@@ -209,13 +234,38 @@ def failure_id(exc: BaseException) -> str:
     return fid
 
 
+def _stacktrace(exc: BaseException) -> str:
+    try:
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        return f"<unformattable traceback for {type(exc).__name__}>"
+
+
 def _record_error(span: Span, exc: BaseException) -> None:
-    message = _exc_text(exc)
+    """Record an exception on a span. The message and stack trace go through the ``redact``
+    hook (keys ``agentflight.error.message`` and ``exception.stacktrace``) and are capped at
+    ``max_attr_chars``, like payloads; nothing unredacted is stored."""
+    error_type = type(exc).__name__
+    message, info = _redact_text(A.ERROR_MESSAGE, _exc_text(exc))
     span.set_attribute(A.FAILURE_ID, failure_id(exc))
-    _safe(span.record_exception, exc)
-    span.set_attribute(A.ERROR_TYPE, type(exc).__name__)
+    stack, _ = _redact_text(EXCEPTION_STACKTRACE, _stacktrace(exc))
+    # OpenTelemetry's exception event (semantic convention names), built here instead of
+    # span.record_exception() so the message and stack trace are redacted first.
+    module, qualname = type(exc).__module__, type(exc).__qualname__
+    _safe(
+        span.add_event,
+        "exception",
+        {
+            "exception.type": f"{module}.{qualname}" if module != "builtins" else qualname,
+            "exception.message": message,
+            EXCEPTION_STACKTRACE: stack,
+            "exception.escaped": "False",
+        },
+    )
+    span.set_attribute(A.ERROR_TYPE, error_type)
     span.set_attribute(A.ERROR_MESSAGE, message)
-    span.set_status(Status(StatusCode.ERROR, f"{type(exc).__name__}: {message}"))
+    _note_truncation(span, A.ERROR_MESSAGE, info)
+    span.set_status(Status(StatusCode.ERROR, f"{error_type}: {message}"))
 
 
 class Recorder:

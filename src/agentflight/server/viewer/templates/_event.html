@@ -1,0 +1,36 @@
+<article class="event">
+  <h3><span class="kind kind-{{ event.kind }}">{{ event.kind }}</span> {{ event.name }} <span class="status st-{{ 'error' if event.status == 'error' else ('ok' if event.status == 'ok' else 'unknown') }}">{{ event.status }}</span></h3>
+  <dl class="kv">
+    <dt>Span</dt><dd class="mono">{{ event.span_id }}</dd>
+    {% if event.parent_span_id %}<dt>Parent</dt><dd class="mono">{{ event.parent_span_id }}</dd>{% endif %}
+    <dt>Started</dt><dd>{{ event.start_time_ns | utc }}</dd>
+    <dt>Duration</dt><dd>{{ event.duration_ms | duration }}</dd>
+    {% if event.status_message %}<dt>Status message</dt><dd class="errmsg">{{ event.status_message }}</dd>{% endif %}
+  </dl>
+  {% if event.truncated %}
+  <div class="note">
+    <strong>Truncated when recorded:</strong>
+    <ul>{% for key, info in event.truncated.items() %}<li><code>{{ key }}</code>: {{ info.get("stored_length") | number }} of {{ info.get("original_length") | number }} characters kept</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  <h4>Attributes</h4>
+  {% for key, value in event.attributes.items() %}
+  {% if key != "agentflight.truncated" %}
+  <details class="attr"{% if loop.index <= 6 %} open{% endif %}>
+    <summary><code>{{ key }}</code></summary>
+    <pre>{{ value | pretty }}</pre>
+  </details>
+  {% endif %}
+  {% endfor %}
+  {% if event.span_events %}
+  <h4>Span events</h4>
+  {% for se in event.span_events %}
+  <details class="attr" open>
+    <summary><code>{{ se.get("name") }}</code> <span class="muted">{{ se.get("time_ns") | utc }}</span></summary>
+    {% for key, value in (se.get("attributes") or {}).items() %}
+    <div class="se-attr"><code>{{ key }}</code><pre>{{ value | pretty }}</pre></div>
+    {% endfor %}
+  </details>
+  {% endfor %}
+  {% endif %}
+</article>

@@ -14,7 +14,7 @@ from agentflight.server.db import make_engine
 from agentflight.server.models import Base
 from agentflight.server.settings import Settings
 
-TEST_KEY = "test-key-0123456789"
+TEST_KEY = "test-key-0123456789abcdef0123456789"
 
 
 @pytest.fixture
