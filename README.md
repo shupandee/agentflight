@@ -27,7 +27,8 @@ flowchart LR
 - The SDK uses its **own TracerProvider**, so it doesn't change any global OTel setup your
   app already has.
 - The server **upserts by span id** (re-sent batches are idempotent) and accepts child spans
-  before their root span arrives (the run shows as `running` until then).
+  before their root span arrives (the run shows as `running` until then; see
+  [Run status](#run-status)).
 - **Run totals are stored on the run row** (calls, errors, tokens, cost) and recomputed in
   SQL for every run an ingest batch touches, so listing runs never reads their events and
   re-sent spans can't make the totals drift.
@@ -309,6 +310,20 @@ Limitations (known, not yet handled):
 - **`BaseException`s are recorded and re-raised.** `KeyboardInterrupt` and `SystemExit` are
   never swallowed. Only ordinary `Exception`s raised by the instrumentation are suppressed.
 
+## Run status
+
+| Status | Meaning |
+| --- | --- |
+| `running` | The run span hasn't arrived with an end time yet. |
+| `ok` / `error` | The run span ended with that status. |
+| `unknown` | The run span ended without setting a status (possible with raw `/v1/spans` senders and non-SDK OTel spans; the SDK always sets one). |
+| `abandoned` | Still `running`, but no span of the run has been received for `AGENTFLIGHT_STALE_AFTER_MINUTES` (default `60`, `0` turns it off), e.g. because the agent process crashed. |
+
+`abandoned` is never stored. It's decided when runs are read, from the run's
+`last_seen_ns` (server time of its last received span), so changing the threshold needs no
+data fix, and a late span turns the run back into `running` or its final status. Filter
+with `GET /v1/runs?status=abandoned`.
+
 ## Errors and failures
 
 Each run summary has two error numbers:
@@ -374,6 +389,24 @@ history, and give people and dashboards a `read` key.
   spans. The agent keeps running.
 - `/health` and `/ready` are unauthenticated so orchestrators can probe them.
 
+## Ingest limits
+
+Every ingest request is bounded. The defaults are deliberately generous, so they shouldn't
+reject anything the SDK sends with its default settings; they will be tuned once real
+batch sizes are measured. A request over a limit gets `413` and nothing from it is stored.
+
+| Setting | Default | Limit |
+| --- | --- | --- |
+| `AGENTFLIGHT_MAX_BODY_BYTES` | `67108864` (64 MiB) | Request body size, checked from `Content-Length` and while reading chunked bodies |
+| `AGENTFLIGHT_MAX_SPANS_PER_BATCH` | `2048` | Spans in one `POST /v1/spans` (the SDK's batch processor sends at most 512 by default) |
+| `AGENTFLIGHT_MAX_ATTRIBUTE_CHARS` | `262144` | Characters in one attribute value, span event attribute value or status message (the SDK caps payloads at 32,000 by default) |
+| `AGENTFLIGHT_MAX_ATTRIBUTES_PER_SPAN` | `1024` | Attributes on one span or span event (OpenTelemetry's SDK keeps 128 by default) |
+| `AGENTFLIGHT_MAX_EVENTS_PER_SPAN` | `1024` | Events on one span (OpenTelemetry's SDK keeps 128 by default) |
+
+Span, span event and attribute names are limited to 255 characters (`422` above that). If
+you turn off the SDK's payload cap (`max_attr_chars=None`), raise
+`AGENTFLIGHT_MAX_ATTRIBUTE_CHARS` too, or large payloads will be rejected.
+
 ## Retention and deletion
 
 | Setting | Default |
@@ -399,7 +432,7 @@ payloads stored on them.
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |
 | `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
-| `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status`, `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5) |
+| `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status` (`running`, `ok`, `error`, `unknown`, `abandoned`), `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5) |
 | `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time. Every event with payloads by default (what replay uses). `events_limit` (1-1000) and `events_offset` page the events; `payloads=false` leaves recorded payloads (messages, outputs, args, stack traces) out and lists them in each event's `omitted` |
 | `GET` | `/v1/runs/{run_id}/events/{span_id}` | read | One event with all of its payloads |
 | `DELETE` | `/v1/runs/{run_id}` | delete | Delete a run and all its events (`204`, or `404`) |

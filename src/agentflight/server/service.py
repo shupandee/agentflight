@@ -8,14 +8,30 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Select, case, delete, distinct, exists, func, or_, select
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    case,
+    delete,
+    distinct,
+    exists,
+    false,
+    func,
+    or_,
+    select,
+)
 from sqlalchemy.orm import Session
 
 from agentflight import attributes as A
 from agentflight.server.models import Event, Run
 from agentflight.server.schemas import EventOut, RunDetail, RunSummary, SpanIn
 
-RUN_STATUS = {"ok": "ok", "error": "error", "unset": "ok"}
+# Stored run status from the root span's status. A root span that ended without setting a
+# status is "unknown" (not "ok"): nothing reported success.
+RUN_STATUS = {"ok": "ok", "error": "error", "unset": "unknown"}
+# Every status a client can see. "abandoned" is never stored: it's a "running" run with no
+# span received for longer than the stale threshold, decided when the run is read.
+STATUSES = ("running", "ok", "error", "unknown", "abandoned")
 
 
 def _loads(value: Any) -> Any:
@@ -137,9 +153,9 @@ def ingest_spans(session: Session, spans: list[SpanIn]) -> list[str]:
             runs[span.trace_id] = run
         run.last_seen_ns = now
 
-        kind = str(span.attributes.get(A.KIND, "span"))
+        kind = str(span.attributes.get(A.KIND, "span"))[:16]
         if kind == A.RUN:
-            run.name = str(span.attributes.get(A.RUN_NAME, span.name))
+            run.name = str(span.attributes.get(A.RUN_NAME, span.name))[:255]
             run.root_span_id = span.span_id
             run.start_time_ns = span.start_time_ns
             run.end_time_ns = span.end_time_ns
@@ -213,11 +229,23 @@ _JSON_SUFFIXES = (
 )
 
 
-def summarize(run: Run) -> RunSummary:
+def shown_status(run: Run, abandoned_before_ns: int | None) -> str:
+    if (
+        run.status == "running"
+        and abandoned_before_ns is not None
+        and run.last_seen_ns is not None
+        and run.last_seen_ns < abandoned_before_ns
+    ):
+        return "abandoned"
+    return run.status
+
+
+def summarize(run: Run, abandoned_before_ns: int | None = None) -> RunSummary:
     return RunSummary(
         id=run.id,
         name=run.name,
-        status=run.status,
+        status=shown_status(run, abandoned_before_ns),
+        last_seen_ns=run.last_seen_ns,
         start_time_ns=run.start_time_ns,
         end_time_ns=run.end_time_ns,
         duration_ms=_duration_ms(run.start_time_ns, run.end_time_ns),
@@ -250,9 +278,20 @@ class RunFilters:
     metadata: tuple[tuple[str, str], ...] = ()  # string metadata values, exact match
 
 
-def _filtered(query: Select[Any], f: RunFilters) -> Select[Any]:
+def _status_filter(status: str, abandoned_before_ns: int | None) -> ColumnElement[bool]:
+    running = Run.status == "running"
+    if status == "abandoned":
+        if abandoned_before_ns is None:
+            return false()
+        return running & (Run.last_seen_ns < abandoned_before_ns)
+    if status == "running" and abandoned_before_ns is not None:
+        return running & (Run.last_seen_ns.is_(None) | (Run.last_seen_ns >= abandoned_before_ns))
+    return Run.status == status
+
+
+def _filtered(query: Select[Any], f: RunFilters, abandoned_before_ns: int | None) -> Select[Any]:
     if f.status:
-        query = query.where(Run.status == f.status)
+        query = query.where(_status_filter(f.status, abandoned_before_ns))
     if f.name:
         query = query.where(Run.name.icontains(f.name, autoescape=True))
     if f.since_ns is not None:
@@ -276,14 +315,15 @@ def list_runs(
     limit: int,
     offset: int,
     filters: RunFilters | None = None,
+    abandoned_before_ns: int | None = None,
 ) -> tuple[list[RunSummary], int]:
     f = filters or RunFilters()
-    query = _filtered(select(Run), f)
-    count_query = _filtered(select(func.count()).select_from(Run), f)
+    query = _filtered(select(Run), f, abandoned_before_ns)
+    count_query = _filtered(select(func.count()).select_from(Run), f, abandoned_before_ns)
     query = query.order_by(Run.start_time_ns.desc(), Run.id).limit(limit).offset(offset)
     runs = session.scalars(query).all()
     total = session.scalar(count_query) or 0
-    return [summarize(r) for r in runs], total
+    return [summarize(r, abandoned_before_ns) for r in runs], total
 
 
 # Attribute suffixes that hold recorded payloads (messages, outputs, args...). Left out of
@@ -306,6 +346,7 @@ def get_run(
     events_limit: int | None = None,
     events_offset: int = 0,
     payloads: bool = True,
+    abandoned_before_ns: int | None = None,
 ) -> RunDetail | None:
     """One run with its events in start order. By default every event with its payloads
     (what replay needs); ``events_limit``/``events_offset`` page them and
@@ -325,7 +366,7 @@ def get_run(
     if not payloads:
         events = [_without_payloads(e) for e in events]
     return RunDetail(
-        **summarize(run).model_dump(),
+        **summarize(run, abandoned_before_ns).model_dump(),
         events=events,
         events_offset=events_offset,
         events_limit=events_limit,

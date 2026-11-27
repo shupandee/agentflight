@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class SpanEventIn(BaseModel):
-    name: str
+    name: str = Field(max_length=255)
     time_ns: int
     attributes: dict[str, Any] = Field(default_factory=dict)
 
@@ -17,7 +17,7 @@ class SpanIn(BaseModel):
     trace_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     span_id: str = Field(pattern=r"^[0-9a-f]{16}$")
     parent_span_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
-    name: str
+    name: str = Field(max_length=255)
     start_time_ns: int
     end_time_ns: int | None = None
     status: Literal["unset", "ok", "error"] = "unset"
@@ -56,7 +56,10 @@ class EventOut(BaseModel):
 class RunSummary(BaseModel):
     id: str
     name: str | None
+    # running | ok | error | unknown (ended without a status) | abandoned (running, but no
+    # span received for longer than the server's stale threshold)
     status: str
+    last_seen_ns: int | None  # server time the last span of this run was received
     start_time_ns: int | None
     end_time_ns: int | None
     duration_ms: float | None

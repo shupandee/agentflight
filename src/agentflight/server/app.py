@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Iterator
 from typing import Annotated, Literal
 
@@ -15,6 +16,7 @@ from agentflight import __version__
 from agentflight.server import service
 from agentflight.server.auth import RedactingFilter, require
 from agentflight.server.db import make_engine, session_factory
+from agentflight.server.limits import BodySizeLimit, check_spans
 from agentflight.server.schemas import (
     EventOut,
     IngestRequest,
@@ -32,7 +34,7 @@ def get_session(request: Request) -> Iterator[Session]:
 
 SessionDep = Annotated[Session, Depends(get_session)]
 
-RunStatus = Literal["running", "ok", "error"]
+RunStatus = Literal["running", "ok", "error", "unknown", "abandoned"]
 NAME_HELP = "case-insensitive substring of the run name"
 META_HELP = "metadata filter `key:value` (string values, exact match); repeat for AND"
 _META_KEY = re.compile(service.META_KEY_PATTERN)
@@ -80,6 +82,7 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
 
     app = FastAPI(title="AgentFlight", version=__version__)
     app.state.settings = settings
+    app.add_middleware(BodySizeLimit, max_bytes=settings.max_body_bytes)
     app.state.engine = engine or make_engine()
     app.state.sessions = session_factory(app.state.engine)
 
@@ -98,6 +101,7 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
 
     @app.post("/v1/spans", response_model=IngestResponse, status_code=202, dependencies=[CanIngest])
     def ingest(body: IngestRequest, session: SessionDep) -> IngestResponse:
+        check_spans(body.spans, settings)
         run_ids = service.ingest_spans(session, body.spans)
         return IngestResponse(accepted=len(body.spans), runs=run_ids)
 
@@ -125,7 +129,13 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             tool=tool,
             metadata=parse_meta(meta or []),
         )
-        runs, total = service.list_runs(session, limit=limit, offset=offset, filters=filters)
+        runs, total = service.list_runs(
+            session,
+            limit=limit,
+            offset=offset,
+            filters=filters,
+            abandoned_before_ns=settings.abandoned_before_ns(time.time_ns()),
+        )
         return RunList(runs=runs, total=total)
 
     @app.get("/v1/runs/{run_id}", response_model=RunDetail, dependencies=[CanRead])
@@ -142,6 +152,7 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             events_limit=events_limit,
             events_offset=events_offset,
             payloads=payloads,
+            abandoned_before_ns=settings.abandoned_before_ns(time.time_ns()),
         )
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")

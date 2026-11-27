@@ -182,3 +182,51 @@ def test_0002_backfills_event_columns_and_run_totals(db_url: str) -> None:
     engine.dispose()
     assert "event_count" not in names
     command.downgrade(cfg, "base")
+
+
+def test_0003_marks_runs_without_a_root_status_unknown(db_url: str) -> None:
+    cfg = _config(db_url)
+    command.upgrade(cfg, "0002")
+    engine = make_engine(db_url)
+    rows = [
+        ("a", "ok", "unset"),
+        ("b", "ok", "ok"),
+        ("c", "error", "error"),
+        ("d", "running", None),
+    ]
+    with engine.begin() as conn:
+        for rid, status, root_status in rows:
+            _insert(
+                conn,
+                "INSERT INTO runs (id, name, status, root_span_id, metadata) "
+                "VALUES (:id, 'r', :status, :root, '{}')",
+                id=rid * 32,
+                status=status,
+                root=(rid * 16) if root_status else None,
+            )
+            if root_status:
+                _insert(
+                    conn,
+                    EVENT_SQL,
+                    sid=rid * 16,
+                    rid=rid * 32,
+                    kind="run",
+                    status=root_status,
+                    start=1,
+                    end=2,
+                    attrs="{}",
+                )
+    engine.dispose()
+
+    def statuses() -> dict[str, str]:
+        e = make_engine(db_url)
+        with e.connect() as conn:
+            out = {r[0][0]: r[1] for r in conn.execute(text("SELECT id, status FROM runs"))}
+        e.dispose()
+        return out
+
+    command.upgrade(cfg, "0003")
+    assert statuses() == {"a": "unknown", "b": "ok", "c": "error", "d": "running"}
+    command.downgrade(cfg, "0002")
+    assert statuses() == {"a": "ok", "b": "ok", "c": "error", "d": "running"}
+    command.downgrade(cfg, "base")
