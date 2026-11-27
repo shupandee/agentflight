@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from fastapi import Request
@@ -77,6 +78,20 @@ class SessionSigner:
         if version != SESSION_VERSION or perms != [Permission.READ.value] or expires_at <= now:
             return None
         return ViewerSession(fingerprint=fingerprint, expires_at=expires_at)
+
+
+_DERIVE_LABEL = b"agentflight viewer session secret v1"
+
+
+def derive_session_secret(keys: Mapping[str, frozenset[Permission]]) -> bytes:
+    """The default session secret: an HMAC of every configured key.
+
+    Every worker and replica with the same keys derives the same secret, so sessions work
+    across them with no extra setting. Adding, removing or changing a key changes the
+    secret and ends every session. ``AGENTFLIGHT_SESSION_SECRET`` overrides it.
+    """
+    material = "\n".join(sorted(keys)).encode()
+    return hmac.new(_DERIVE_LABEL, material, hashlib.sha256).digest()
 
 
 def read_key_fingerprints(signer: SessionSigner, settings: Settings) -> frozenset[str]:

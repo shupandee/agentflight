@@ -455,10 +455,14 @@ works too) and then keeps a **signed session** in a cookie:
   no delete or ingest actions.
 - Cross-origin sign-in and sign-out posts are refused.
 - With `AGENTFLIGHT_AUTH_DISABLED=true` there is no sign-in page.
+- By default the signing secret is an HMAC of all configured API keys, so every worker
+  and replica with the same keys accepts the same sessions and restarts don't sign anyone
+  out. **Rotating, adding or removing any key ends every viewer session**; people sign in
+  again. Set `AGENTFLIGHT_SESSION_SECRET` to decouple sessions from the keys.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `AGENTFLIGHT_SESSION_SECRET` | random at startup | At least 32 characters. Set it when you run more than one worker or replica, or want sessions to survive a restart. |
+| `AGENTFLIGHT_SESSION_SECRET` | derived from the API keys | Override for the signing secret, at least 32 characters. |
 | `AGENTFLIGHT_SESSION_HOURS` | `12` | Session lifetime. |
 | `AGENTFLIGHT_COOKIE_SECURE` | `false` | Always mark the cookie `Secure`. |
 

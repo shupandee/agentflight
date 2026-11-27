@@ -26,6 +26,7 @@ from agentflight.server.viewer.session import (
     COOKIE_PATH,
     SessionSigner,
     current_session,
+    derive_session_secret,
     is_https,
 )
 
@@ -253,9 +254,14 @@ def event_panel(request: Request, db: DB, run_id: str, span_id: str) -> Response
 
 
 def install_viewer(app: FastAPI, settings: Settings) -> None:
-    secret = settings.session_secret.encode() if settings.session_secret else None
+    if settings.session_secret:
+        secret = settings.session_secret.encode()
+    elif settings.api_keys:
+        secret = derive_session_secret(settings.api_keys)
+    else:  # auth disabled: there are no sessions to sign
+        secret = secrets.token_bytes(32)
     app.state.session_signer = SessionSigner(
-        secret or secrets.token_bytes(32), max_age_seconds=int(settings.session_hours * 3600)
+        secret, max_age_seconds=int(settings.session_hours * 3600)
     )
     app.state.viewer_env = make_environment()
 

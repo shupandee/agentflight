@@ -101,8 +101,8 @@ class Settings:
     max_attribute_chars: int = DEFAULT_MAX_ATTRIBUTE_CHARS
     max_attributes_per_span: int = DEFAULT_MAX_ATTRIBUTES_PER_SPAN
     max_events_per_span: int = DEFAULT_MAX_EVENTS_PER_SPAN
-    # Viewer sessions. Without a secret, a random one is made at startup: sessions then end
-    # on restart and aren't shared between workers or replicas.
+    # Viewer sessions. Without a secret, one is derived from the configured API keys, so
+    # every worker and replica agrees on it; changing any key ends all sessions.
     session_secret: str | None = field(default=None, repr=False)
     session_hours: float = DEFAULT_SESSION_HOURS
     # Always mark the session cookie Secure (it is already when the request is HTTPS).

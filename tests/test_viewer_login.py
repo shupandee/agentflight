@@ -11,9 +11,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from agentflight.server import create_app
-from agentflight.server.settings import Settings, parse_api_keys
+from agentflight.server.settings import Permission, Settings, parse_api_keys
 from agentflight.server.viewer.routes import CONTENT_SECURITY_POLICY
-from agentflight.server.viewer.session import COOKIE_NAME, SessionSigner
+from agentflight.server.viewer.session import COOKIE_NAME, SessionSigner, derive_session_secret
 from tests.conftest import TEST_KEY
 
 READ_KEY = "viewer-read-key-0123456789"
@@ -190,3 +190,40 @@ def test_templates_have_no_inline_script_style_or_safe_filter() -> None:
         assert not re.search(r"\sstyle=", text), path.name
         assert not re.search(r"\son[a-z]+=", text), path.name
         assert "hx-on" not in text, path.name
+
+
+def test_default_secret_is_shared_by_workers_with_the_same_keys(engine: Engine) -> None:
+    first = TestClient(create_app(engine, settings(session_secret=None)), follow_redirects=False)
+    sign_in(first)
+    token = first.cookies[COOKIE_NAME]
+    # A second worker (another app instance) with the same keys accepts the session.
+    second = TestClient(create_app(engine, settings(session_secret=None)), follow_redirects=False)
+    second.cookies.set(COOKIE_NAME, token, path="/ui")
+    assert second.get("/ui").status_code == 200
+
+
+def test_changing_any_key_ends_sessions_with_the_default_secret(engine: Engine) -> None:
+    first = TestClient(create_app(engine, settings(session_secret=None)), follow_redirects=False)
+    sign_in(first)
+    token = first.cookies[COOKIE_NAME]
+    rotated = settings(session_secret=None, api_key="r" * 40)  # read key unchanged
+    other = TestClient(create_app(engine, rotated), follow_redirects=False)
+    other.cookies.set(COOKIE_NAME, token, path="/ui")
+    assert other.get("/ui").status_code == 303
+
+
+def test_session_secret_override_survives_key_changes(engine: Engine) -> None:
+    first = TestClient(create_app(engine, settings()), follow_redirects=False)
+    sign_in(first)
+    token = first.cookies[COOKIE_NAME]
+    rotated = TestClient(create_app(engine, settings(api_key="r" * 40)), follow_redirects=False)
+    rotated.cookies.set(COOKIE_NAME, token, path="/ui")
+    assert rotated.get("/ui").status_code == 200
+
+
+def test_derived_secret_depends_only_on_the_key_set() -> None:
+    a = {"k1": frozenset({Permission.READ}), "k2": frozenset(Permission)}
+    b = dict(reversed(list(a.items())))
+    assert derive_session_secret(a) == derive_session_secret(b)
+    assert derive_session_secret(a) != derive_session_secret({"k1": frozenset(Permission)})
+    assert b"k1" not in derive_session_secret(a)
