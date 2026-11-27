@@ -25,19 +25,24 @@ from __future__ import annotations
 
 import builtins
 import json
+import logging
 import os
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from opentelemetry.trace import Span
 
 from agentflight import attributes as A
 from agentflight import sdk
+
+logger = logging.getLogger("agentflight")
+
+OnDivergence = Literal["raise", "live"]
 
 STEP_KINDS = (A.LLM, A.TOOL)
 _NO_OUTPUT: Any = object()
@@ -198,10 +203,25 @@ class ReplaySession:
 
     mode = "replay"
 
-    def __init__(self, recording: Recording) -> None:
+    def __init__(self, recording: Recording, on_divergence: OnDivergence = "raise") -> None:
+        if on_divergence not in ("raise", "live"):
+            raise ValueError(f"on_divergence must be 'raise' or 'live', not {on_divergence!r}")
         self.recording = recording
+        self.on_divergence = on_divergence
         self.cursor = 0  # number of model/tool calls seen so far
+        # With on_divergence="live": the first step that didn't match, and why.
+        self.diverged_at: int | None = None
+        self.divergence: str | None = None
+        self._runs: list[Span] = []  # open runs, innermost last
         self._lock = threading.Lock()
+
+    def bind_run(self, span: Span) -> None:
+        """Called by the SDK when a run opens, so a divergence can be noted on it."""
+        self._runs.append(span)
+
+    def unbind_run(self, span: Span) -> None:
+        if span in self._runs:
+            self._runs.remove(span)
 
     @property
     def remaining(self) -> int:
@@ -245,7 +265,31 @@ class ReplaySession:
         index) or ("live", None, index)."""
         index = self.cursor
         self.cursor += 1
+        if self.diverged_at is not None:
+            return "live", None, index
+        try:
+            return self._plan(index, kind, name, inputs)
+        except ReplayDivergence as exc:
+            if self.on_divergence == "raise":
+                raise
+            self._diverge(index, str(exc))
+            return "live", None, index
+
+    def _plan(
+        self, index: int, kind: str, name: str, inputs: dict[str, Any]
+    ) -> tuple[str, Any, int]:
         return self._cached(index, kind, name, inputs)
+
+    def _diverge(self, index: int, reason: str) -> None:
+        self.diverged_at = index
+        self.divergence = reason
+        logger.warning(
+            "agentflight: replay diverged (%s); running live from step %d", reason, index
+        )
+        span = self._runs[-1] if self._runs else None
+        if span is not None:
+            sdk._safe(span.set_attribute, A.REPLAY_DIVERGED_AT, index)
+            sdk._safe(span.set_attribute, A.REPLAY_DIVERGENCE, reason)
 
     def _cached(
         self, index: int, kind: str, name: str, inputs: dict[str, Any]
@@ -278,8 +322,14 @@ class ForkSession(ReplaySession):
 
     mode = "fork"
 
-    def __init__(self, recording: Recording, at: int, output: Any = _NO_OUTPUT) -> None:
-        super().__init__(recording)
+    def __init__(
+        self,
+        recording: Recording,
+        at: int,
+        output: Any = _NO_OUTPUT,
+        on_divergence: OnDivergence = "raise",
+    ) -> None:
+        super().__init__(recording, on_divergence)
         count = len(recording.steps)
         if not 0 <= at <= count:
             raise ReplayError(f"fork step {at} out of range (recording has {count} steps)")
@@ -291,9 +341,9 @@ class ForkSession(ReplaySession):
     def run_attributes(self) -> dict[str, Any]:
         return {**super().run_attributes(), A.REPLAY_FORK_STEP: self.at}
 
-    def _take(self, kind: str, name: str, inputs: dict[str, Any]) -> tuple[str, Any, int]:
-        index = self.cursor
-        self.cursor += 1
+    def _plan(
+        self, index: int, kind: str, name: str, inputs: dict[str, Any]
+    ) -> tuple[str, Any, int]:
         if index < self.at:
             return self._cached(index, kind, name, inputs)
         if index == self.at and self.output is not _NO_OUTPUT:
@@ -307,13 +357,20 @@ class ForkSession(ReplaySession):
 
 
 @contextmanager
-def replay(recording: Recording) -> Iterator[ReplaySession]:
+def replay(
+    recording: Recording, *, on_divergence: OnDivergence = "raise"
+) -> Iterator[ReplaySession]:
     """Replay ``recording``: recorded outputs are served and nothing is called live.
 
     Runs recorded inside the block carry ``agentflight.replay.*`` attributes, so a replay
     is itself recorded (as a new run) and can be compared with the original.
+
+    ``on_divergence="raise"`` (the default) raises :class:`ReplayDivergence` at the first
+    call that doesn't match the recording. ``"live"`` instead stops serving recorded
+    outputs at that step and runs it and every later call live; the step and reason are
+    kept on the session (``diverged_at``, ``divergence``) and on the run span.
     """
-    session = ReplaySession(recording)
+    session = ReplaySession(recording, on_divergence)
     token = sdk._replay_session.set(session)
     try:
         yield session
@@ -322,7 +379,13 @@ def replay(recording: Recording) -> Iterator[ReplaySession]:
 
 
 @contextmanager
-def fork(recording: Recording, at: int, *, output: Any = _NO_OUTPUT) -> Iterator[ForkSession]:
+def fork(
+    recording: Recording,
+    at: int,
+    *,
+    output: Any = _NO_OUTPUT,
+    on_divergence: OnDivergence = "raise",
+) -> Iterator[ForkSession]:
     """Replay ``recording`` up to step ``at``, then run live.
 
     Steps before ``at`` are served from the recording and must match it. Step ``at`` and
@@ -330,9 +393,10 @@ def fork(recording: Recording, at: int, *, output: Any = _NO_OUTPUT) -> Iterator
     With ``output=...``, step ``at`` isn't run: it returns that value instead (a tool
     result, or a model response in the form your code reads it), and live execution
     starts at the next step. ``at`` may equal the number of steps: the whole recording is
-    replayed and any further calls run live.
+    replayed and any further calls run live. ``on_divergence`` works as in :func:`replay`
+    for the replayed prefix (and the override step's kind and name).
     """
-    session = ForkSession(recording, at, output)
+    session = ForkSession(recording, at, output, on_divergence)
     token = sdk._replay_session.set(session)
     try:
         yield session

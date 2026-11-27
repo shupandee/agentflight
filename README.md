@@ -210,14 +210,33 @@ never runs.
   Inputs are compared after the same redaction and truncation that was used for recording.
   Any mismatch, or a call beyond the end of the recording, raises `ReplayDivergence`
   naming the step and the field. Values are never included in the error.
-- Replay never falls back to a live call. If a step can't be served, it raises (unlike
-  recording, which is fail-open). A recorded failure is re-raised. Built-in exception types
+- By default, replay never falls back to a live call. If a step can't be served, it
+  raises (unlike recording, which is fail-open). A recorded failure is re-raised. Built-in exception types
   (`LookupError`, `ValueError`...) come back as that type with the recorded message. Other
   types raise `ReplayedError`, which carries `error_type` and `message`.
 - A replay or fork is recorded as a new run. Its run carries
   `agentflight.replay.source_run`, `.mode` (`replay`/`fork`) and `.fork_step`. Each step span
   carries `agentflight.replay.step` and `agentflight.replay.source` (`cached`, `override`
   or `live`). Cached calls record no tokens or cost, because nothing was spent.
+
+**Going live on divergence (opt-in).** `replay(recording, on_divergence="live")` and
+`fork(..., on_divergence="live")` don't raise on the first mismatch. Instead they stop
+serving recorded outputs: that step and every later call run live, and the steps are marked
+`live`. The step and the reason are recorded on the session (`session.diverged_at`,
+`session.divergence`), on the innermost open run as `agentflight.replay.diverged_at` and
+`agentflight.replay.divergence`, and in a warning on the `agentflight` logger.
+
+```python
+with agentflight.replay(recording, on_divergence="live") as session:
+    answer = my_agent(new_question)
+print(session.diverged_at)  # e.g. 0: the first model call already differed
+```
+
+- This makes real model and tool calls from the divergence point on, so use it only
+  where that's acceptable.
+- Only mismatches switch to live. That covers a different kind, name or input, or a call
+  beyond the recording. A step whose recorded output was truncated still raises
+  `ReplayError`, and a recorded failure is still re-raised.
 
 **What it doesn't guarantee:**
 

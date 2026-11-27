@@ -291,3 +291,52 @@ def test_replay_is_scoped_to_its_block(recorded: TestClient) -> None:
         assert not call.replayed
     assert get_weather("Delhi") == "31C, sunny"
     assert LIVE["tool"] == 1
+
+
+def run_event(client: TestClient, run_id: str) -> dict[str, Any]:
+    return next(e for e in stored(client, run_id)["events"] if e["kind"] == "run")
+
+
+def test_on_divergence_live_runs_live_from_the_first_mismatch(recorded: TestClient) -> None:
+    recording, _ = record(recorded, "Weather in Delhi?")
+    with agentflight.replay(recording, on_divergence="live") as session:
+        run_id, answer = agent("Weather in Paris?")
+
+    assert answer == "Final: RESULT 18C, cloudy"
+    assert (LIVE["llm"], LIVE["tool"]) == (2, 1)
+    assert session.diverged_at == 0
+    assert session.divergence is not None and "step 0" in session.divergence
+    root = run_event(recorded, run_id)
+    assert root["attributes"][A.REPLAY_DIVERGED_AT] == 0
+    assert root["attributes"][A.REPLAY_DIVERGENCE] == session.divergence
+    steps = [e for e in stored(recorded, run_id)["events"] if e["kind"] in ("llm", "tool")]
+    assert {e["attributes"][A.REPLAY_SOURCE] for e in steps} == {"live"}
+
+
+def test_on_divergence_live_keeps_the_matching_prefix_cached(recorded: TestClient) -> None:
+    recording, answer = record(recorded, "Weather in Delhi?")
+    with (
+        agentflight.replay(recording, on_divergence="live") as session,
+        agentflight.run("extra") as r,
+    ):
+        assert agent("Weather in Delhi?")[1] == answer
+        assert not LIVE
+        assert get_weather("Paris") == "18C, cloudy"  # beyond the recording
+        assert get_weather("Delhi") == "31C, sunny"  # stays live after diverging
+    assert LIVE["tool"] == 2
+    assert session.diverged_at == 3
+    assert "not in the recording" in (session.divergence or "")
+    # The divergence is noted on the innermost run open when it happened.
+    assert run_event(recorded, r.run_id)["attributes"][A.REPLAY_DIVERGED_AT] == 3
+
+
+def test_on_divergence_is_validated(recorded: TestClient) -> None:
+    recording, _ = record(recorded, "Weather in Delhi?")
+    with (
+        pytest.raises(ValueError, match="on_divergence"),
+        agentflight.replay(
+            recording,
+            on_divergence="skip",  # type: ignore[arg-type]
+        ),
+    ):
+        pass

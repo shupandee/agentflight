@@ -385,7 +385,14 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
         return out
 
     with _span(f"run:{name}", attrs, new_trace=True) as span:
-        yield RunHandle(span=span, name=name)
+        session = _replay_session.get()
+        if session is not None:
+            _safe(session.bind_run, span)
+        try:
+            yield RunHandle(span=span, name=name)
+        finally:
+            if session is not None:
+                _safe(session.unbind_run, span)
 
 
 @dataclass

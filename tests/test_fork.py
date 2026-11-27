@@ -89,3 +89,20 @@ def test_fork_step_is_validated(
     recording, _ = record(recorded, "Weather in Delhi?")
     with pytest.raises(ReplayError, match=match), agentflight.fork(recording, at=at, **kwargs):
         pass
+
+
+def test_fork_on_divergence_live(recorded: TestClient) -> None:
+    recording, _ = record(recorded, "Weather in Delhi?")
+    with agentflight.fork(recording, at=2, on_divergence="live") as session:
+        assert chat([{"role": "user", "content": "Weather in Delhi?"}]) == "CALL Delhi"
+        assert get_weather("Paris") == "18C, cloudy"  # step 1 differs: live from here
+    assert (LIVE["llm"], LIVE["tool"]) == (0, 1)
+    assert session.diverged_at == 1
+
+
+def test_fork_override_kind_mismatch_goes_live(recorded: TestClient) -> None:
+    recording, _ = record(recorded, "Weather in Delhi?")
+    with agentflight.fork(recording, at=0, output="x", on_divergence="live") as session:
+        assert get_weather("Delhi") == "31C, sunny"
+    assert LIVE["tool"] == 1
+    assert session.diverged_at == 0
