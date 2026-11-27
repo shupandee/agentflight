@@ -4,7 +4,19 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 the project is in early development (`0.x`), `/v1` can still change, and every change that
 can break a client is listed under **Behaviour changes**.
 
-## Unreleased (week 7)
+## Unreleased
+
+### Changed
+
+- **Run spans skip the batch queue.** A run's root span goes to a small lane of its own,
+  sent by a dedicated thread as soon as the run ends (with a deadline, the exporter's
+  `timeout`), so a run whose other spans were dropped still closes with its status and
+  `dropped_spans` instead of showing as `abandoned`. Ending a run never waits on the
+  network; `flush()`/`shutdown()` wait for the lane within their timeouts. The queue
+  slots that used to be kept for run spans are gone. New:
+  `AgentFlightExporter.export_within(spans, deadline_s)`.
+
+## Week 7 (merged in #5)
 
 ### Added
 

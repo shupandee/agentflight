@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -59,6 +60,7 @@ class _ExportState:
     """Shared by the requests of one ``export()`` call."""
 
     remaining: int
+    deadline: float | None = None  # time.monotonic() value; None: no overall deadline
     aborted: str | None = None
 
     def abort(self, reason: str) -> str:
@@ -96,6 +98,7 @@ class AgentFlightExporter(SpanExporter):
         self._url = endpoint.rstrip("/") + INGEST_PATH
         self._auth_warned = False
         self._max_attempts = max_attempts
+        self._timeout = timeout
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout)
         self._headers = dict(headers or {})
@@ -106,10 +109,24 @@ class AgentFlightExporter(SpanExporter):
         return f"AgentFlightExporter(url={self._url!r})"
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        return self._export(spans, deadline_s=None)
+
+    def export_within(self, spans: Sequence[ReadableSpan], deadline_s: float) -> SpanExportResult:
+        """Like ``export``, but give up after ``deadline_s`` seconds in total.
+
+        Each request's timeouts are capped to what is left of the deadline, and no request
+        starts after it has passed. Used for run spans, which skip the batch queue.
+        """
+        return self._export(spans, deadline_s=deadline_s)
+
+    def _export(
+        self, spans: Sequence[ReadableSpan], *, deadline_s: float | None
+    ) -> SpanExportResult:
         # Never raise: OTel processors log exporter exceptions, but a custom processor might
         # not, and export failures must never reach agent code.
         try:
-            state = _ExportState(remaining=self._max_attempts)
+            deadline = None if deadline_s is None else time.monotonic() + deadline_s
+            state = _ExportState(remaining=self._max_attempts, deadline=deadline)
             dropped, reason = self._send(list(spans), state)
         except Exception as exc:
             logger.warning("agentflight: failed to export %d spans: %r", len(spans), exc)
@@ -134,10 +151,17 @@ class AgentFlightExporter(SpanExporter):
             return len(spans), state.aborted
         if state.remaining <= 0:
             return len(spans), f"gave up after {self._max_attempts} requests"
+        extra: dict[str, Any] = {}
+        if state.deadline is not None:
+            left = state.deadline - time.monotonic()
+            if left <= 0:
+                return len(spans), state.abort("deadline passed")
+            # An injected client keeps its own timeouts, capped to the deadline.
+            extra["timeout"] = min(left, self._timeout) if self._owns_client else left
         state.remaining -= 1
         try:
             payload = {"spans": [span_to_dict(s) for s in spans]}
-            response = self._client.post(self._url, json=payload, headers=self._headers)
+            response = self._client.post(self._url, json=payload, headers=self._headers, **extra)
         except Exception as exc:
             return len(spans), state.abort(repr(exc))
         if response.status_code in (401, 403):

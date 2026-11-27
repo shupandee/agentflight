@@ -351,6 +351,20 @@ Guarantees:
   `__str__` raise. Values are cut off at 32,000 characters.
 - **No blocking in the default mode.** With `batch=True` (the default), spans are exported
   on a background thread, so a hanging server doesn't slow the agent down.
+- **Run spans skip the queue.** A run's root span (the one that closes the run and
+  carries its status and drop count) doesn't go through the bounded batch queue. It goes
+  to a lane of its own, which a dedicated thread sends as soon as the run ends, several at
+  a time if runs end together. So a run whose other spans were dropped still closes on
+  the server instead of staying `running` and later showing as `abandoned`. Ending a run
+  only appends the span to that lane under a lock; the agent thread never waits on the
+  network. Each send has a deadline: no request starts after it, and each request's
+  timeouts are capped to what is left of it (the exporter's `timeout`, 5 s by default).
+  It's still best effort and fail-open: if the send fails or runs out of time, the run
+  span is lost like any failed export (and the run can end up `abandoned`), and if more
+  than 1,024 run spans are waiting, new ones are dropped and counted. Each run span is
+  handed to the exporter once, never to both the lane and the queue. The exporter is
+  only ever called by one thread at a time, so a run span can wait for a batch that is
+  being sent. `flush()` and `shutdown()` wait for the lane too, within their timeouts.
 - **Bounded waits.** `flush(timeout_millis=30_000)` and `shutdown(timeout_millis=30_000)`
   never raise and return within their timeout. AgentFlight enforces this itself, because
   OpenTelemetry's isn't reliable: in opentelemetry-sdk 1.45, `force_flush(300)` against a
@@ -375,11 +389,12 @@ Limitations (known, not yet handled):
   itself before handing a span to OpenTelemetry, so it knows every span it drops (on its
   own, OpenTelemetry 1.45 drops the *oldest* queued span, which can belong to another
   run). When a run ends, the spans of that run dropped so far go on the run span as
-  `agentflight.run.dropped_spans`, and the viewer and replay warn about it. A few queue
-  slots are kept for run spans so the span carrying the count is rarely the one dropped.
-  What this can't cover: spans of the run that end *after* the run span (background
-  threads or tasks still running), a run span that is itself dropped, and spans lost
-  later in export (server down, see "Lost spans"). Those are only in the recorder's
+  `agentflight.run.dropped_spans`, and the viewer and replay warn about it. Run spans
+  skip the queue (see "Run spans skip the queue"), so the span carrying the count isn't
+  competing with the spans it counts. What this can't cover: spans of the run that end
+  *after* the run span (background threads or tasks still running), a run span dropped
+  because more than 1,024 were waiting to be sent, and spans lost later in export
+  (server down, see "Lost spans"). Those are only in the recorder's
   total, `agentflight.get_recorder().dropped_spans`, and a warning is logged on the first
   drop. `batch=False` has no queue and never drops this way.
 - **`batch=False` blocks.** It exports inside the agent's thread, so each span can block

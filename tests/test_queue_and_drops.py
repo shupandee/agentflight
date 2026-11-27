@@ -113,10 +113,10 @@ def test_dropped_spans_are_counted_and_recorded_on_the_run(
         rec, exporter, run_id = _fill(queue=80, spans=300)
     exporter.release.set()
     assert agentflight.flush(timeout_millis=5_000)
-    # 80 slots, 10 kept for run spans: the first 70 decisions fit, and the export
-    # worker may already have taken some of them off the queue, so at most 230 dropped.
+    # 80 slots (run spans don't use them): the first 80 decisions fit, and the export
+    # worker may already have taken some of them off the queue, so at most 220 dropped.
     dropped = rec.dropped_spans
-    assert 0 < dropped <= 300 - 70
+    assert 0 < dropped <= 300 - 80
     run_span = _run_span(exporter, run_id)  # the run span itself got through
     assert (run_span.attributes or {})[A.RUN_DROPPED_SPANS] == dropped
     assert len(exporter.exported) == 301 - dropped  # nothing lost without being counted

@@ -339,6 +339,7 @@ class Recorder:
         max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
         redact: Redactor | None = None,
         max_queue_size: int | None = None,
+        run_span_deadline_s: float = 5.0,
     ) -> None:
         self.max_attr_chars = max_attr_chars
         self.redact = redact
@@ -354,6 +355,7 @@ class Recorder:
                     exporter,
                     max_queue_size=self.max_queue_size,
                     max_export_batch_size=min(_export_batch_size(), self.max_queue_size),
+                    run_span_deadline_s=run_span_deadline_s,
                 )
                 processor = self._queue
             else:
@@ -431,6 +433,7 @@ def configure(
             max_attr_chars=max_attr_chars,
             redact=redact,
             max_queue_size=max_queue_size,
+            run_span_deadline_s=timeout,
         )
     except Exception:
         logger.warning("agentflight: configure failed; recording disabled", exc_info=True)
