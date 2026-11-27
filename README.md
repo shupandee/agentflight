@@ -28,6 +28,9 @@ flowchart LR
   app already has.
 - The server **upserts by span id** (re-sent batches are idempotent) and accepts child spans
   before their root span arrives (the run shows as `running` until then).
+- **Run totals are stored on the run row** (calls, errors, tokens, cost) and recomputed in
+  SQL for every run an ingest batch touches, so listing runs never reads their events and
+  re-sent spans can't make the totals drift.
 
 ## Quickstart
 
