@@ -293,7 +293,7 @@ totals recomputed in SQL), so exporter and Collector retries can't double-count.
 
 | Status | When | Retried by OTLP exporters |
 | --- | --- | --- |
-| `200` | Stored. Spans that can't be stored (an invalid trace or span id, an attribute over a [limit](#ingest-limits)) are left out and counted in `partial_success` (`rejected_spans`, `error_message` naming the first few); the rest of the batch is stored. | no |
+| `200` | Stored. Spans that can't be stored (an invalid trace or span id, a name over 255 characters, an attribute over a [limit](#ingest-limits)) are left out and counted in `partial_success` (`rejected_spans`, `error_message` naming the first few); the rest of the batch is stored. | no |
 | `400` | The body isn't valid OTLP protobuf/JSON, or isn't valid gzip | no |
 | `401` / `403` | Missing or wrong key / a key without `ingest` | no |
 | `413` | Body over `AGENTFLIGHT_MAX_BODY_BYTES`, compressed **or decompressed** (decompression stops at the cap, so a gzip bomb can't use more memory than that), or more than `AGENTFLIGHT_MAX_SPANS_PER_BATCH` spans | no |
@@ -316,8 +316,8 @@ default batch processor sends at most 512 spans per request, so keep payloads we
 - **Distributed traces:** a trace whose root span lives in a service that doesn't export
   to AgentFlight never closes, and shows as `abandoned` after the stale threshold. A trace
   with several parentless spans takes its name and status from the last one received.
-- Span and span event names over 255 characters are truncated (not rejected, as
-  `POST /v1/spans` does).
+- A span whose name, or one of whose span event names, is over 255 characters is
+  rejected (counted in `partial_success`), as `POST /v1/spans` rejects it with `422`.
 - The pre-1.0 `instrumentationLibrarySpans` field is ignored; send `scopeSpans`.
 
 ## Replay and fork

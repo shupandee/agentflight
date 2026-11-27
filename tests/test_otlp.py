@@ -710,3 +710,25 @@ def test_agentflight_sdk_over_otlp_keeps_run_semantics(live_server: str, engine:
     # SDK-recorded outputs travel through OTLP unchanged, so the run stays replayable.
     steps = Recording.from_run(body).steps
     assert len(steps) == 1
+
+
+def test_names_over_255_chars_are_rejected_not_truncated(api: TestClient) -> None:
+    def build(tracer: Any) -> None:
+        with tracer.start_as_current_span("agent"):
+            with tracer.start_as_current_span("n" * 256):
+                pass
+            with tracer.start_as_current_span("event-name") as s:
+                s.add_event("e" * 256)
+            with tracer.start_as_current_span("x" * 255):  # exactly at the limit
+                pass
+
+    spans = _record(build)
+    resp = api.post("/v1/traces", content=_protobuf(spans), headers=PB)
+    assert resp.status_code == 200
+    partial = _response(resp).partial_success
+    assert partial.rejected_spans == 2
+    message = partial.error_message
+    assert ": name: String should have at most 255 characters" in message
+    assert "'event-name': event name: String should have at most 255 characters" in message
+    run = api.get(f"/v1/runs/{_run_id(spans)}").json()
+    assert sorted(len(e["name"]) for e in run["events"]) == [5, 255]

@@ -14,7 +14,8 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   `ingest` key auth and ingest limits as `POST /v1/spans`; the 16 MiB body cap applies to the
   decompressed body too. Responses follow the OTLP spec: `partial_success` for spans that
   can't be stored, `google.rpc.Status` errors with `400`/`401`/`403`/`413`/`415`, and a
-  retryable `503` only when the database is unavailable.
+  retryable `503` only when the database is unavailable. Spans with a name or span event
+  name over 255 characters are rejected that way, as on `/v1/spans`.
 - OTLP spans map onto runs: the trace is the run and its parentless span closes it;
   `gen_ai.*` operations, models, tokens and tool names become `llm` and `tool` events that
   count in run totals and filters; `service.*` and `deployment.environment` become run

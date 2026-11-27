@@ -276,6 +276,13 @@ def convert(request: ExportTraceServiceRequest, settings: Settings) -> Converted
     return out
 
 
+def _validation_message(exc: ValidationError) -> str:
+    error = exc.errors()[0]
+    where = ".".join(str(part) for part in error.get("loc", ()))
+    msg = str(error.get("msg", "invalid"))
+    return f"{where}: {msg}" if where else msg
+
+
 def _convert_span(
     span: Span,
     resource_attrs: dict[str, Any],
@@ -316,27 +323,32 @@ def _convert_span(
         if parent is None and metadata:
             attrs.setdefault(A.RUN_METADATA, dict(metadata))
     try:
+        events = [
+            SpanEventIn(
+                name=event.name,
+                time_ns=event.time_unix_nano,
+                attributes=_attrs(event.attributes),
+            )
+            for event in span.events
+        ]
+    except ValidationError as exc:
+        out.reject(f"{label}: event {_validation_message(exc)}")
+        return
+    try:
         item = SpanIn(
             trace_id=trace_id,
             span_id=span_id,
             parent_span_id=parent,
-            name=span.name[:255],
+            name=span.name,
             start_time_ns=span.start_time_unix_nano,
             end_time_ns=span.end_time_unix_nano or None,
             status=_STATUS.get(span.status.code) or "unset",
             status_message=span.status.message or None,
             attributes=attrs,
-            events=[
-                SpanEventIn(
-                    name=event.name[:255],
-                    time_ns=event.time_unix_nano,
-                    attributes=_attrs(event.attributes),
-                )
-                for event in span.events
-            ],
+            events=events,
         )
     except ValidationError as exc:
-        out.reject(f"{label}: {exc.errors()[0].get('msg', 'invalid')}")
+        out.reject(f"{label}: {_validation_message(exc)}")
         return
     problem = span_problem(item, settings)
     if problem is not None:
