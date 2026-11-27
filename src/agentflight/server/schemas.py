@@ -49,6 +49,8 @@ class EventOut(BaseModel):
     # attribute key -> {original_length, stored_length, reason} for truncated payloads
     truncated: dict[str, Any]
     span_events: list[dict[str, Any]]
+    # With ``payloads=false``: attribute keys (and "span_events") left out of this event
+    omitted: list[str] = Field(default_factory=list)
 
 
 class RunSummary(BaseModel):
@@ -71,6 +73,10 @@ class RunSummary(BaseModel):
 
 class RunDetail(RunSummary):
     events: list[EventOut]
+    # Paging of ``events``; ``event_count`` is the total. ``events_limit`` is null when
+    # every event from ``events_offset`` on is included.
+    events_offset: int = 0
+    events_limit: int | None = None
 
 
 class RunList(BaseModel):

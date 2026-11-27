@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import case, delete, distinct, func, or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import Select, case, delete, distinct, exists, func, or_, select
+from sqlalchemy.orm import Session
 
 from agentflight import attributes as A
 from agentflight.server.models import Event, Run
@@ -232,28 +233,109 @@ def summarize(run: Run) -> RunSummary:
     )
 
 
+META_KEY_PATTERN = r"^[A-Za-z0-9_.-]{1,64}$"
+
+
+@dataclass(frozen=True)
+class RunFilters:
+    """Filters for :func:`list_runs`. Every set field must match (AND)."""
+
+    status: str | None = None
+    name: str | None = None  # case-insensitive substring
+    since_ns: int | None = None  # run started at or after
+    until_ns: int | None = None  # run started before
+    has_errors: bool | None = None
+    model: str | None = None  # some LLM call used this model
+    tool: str | None = None  # some tool call had this name
+    metadata: tuple[tuple[str, str], ...] = ()  # string metadata values, exact match
+
+
+def _filtered(query: Select[Any], f: RunFilters) -> Select[Any]:
+    if f.status:
+        query = query.where(Run.status == f.status)
+    if f.name:
+        query = query.where(Run.name.icontains(f.name, autoescape=True))
+    if f.since_ns is not None:
+        query = query.where(Run.start_time_ns >= f.since_ns)
+    if f.until_ns is not None:
+        query = query.where(Run.start_time_ns < f.until_ns)
+    if f.has_errors is not None:
+        query = query.where(Run.errors > 0 if f.has_errors else Run.errors == 0)
+    if f.model:
+        query = query.where(exists().where(Event.run_id == Run.id, Event.model == f.model))
+    if f.tool:
+        query = query.where(exists().where(Event.run_id == Run.id, Event.tool_name == f.tool))
+    for key, value in f.metadata:
+        query = query.where(Run.metadata_[key].as_string() == value)
+    return query
+
+
 def list_runs(
-    session: Session, *, limit: int, offset: int, status: str | None
+    session: Session,
+    *,
+    limit: int,
+    offset: int,
+    filters: RunFilters | None = None,
 ) -> tuple[list[RunSummary], int]:
-    query = select(Run)
-    count_query = select(func.count()).select_from(Run)
-    if status:
-        query = query.where(Run.status == status)
-        count_query = count_query.where(Run.status == status)
+    f = filters or RunFilters()
+    query = _filtered(select(Run), f)
+    count_query = _filtered(select(func.count()).select_from(Run), f)
     query = query.order_by(Run.start_time_ns.desc(), Run.id).limit(limit).offset(offset)
     runs = session.scalars(query).all()
     total = session.scalar(count_query) or 0
     return [summarize(r) for r in runs], total
 
 
-def get_run(session: Session, run_id: str) -> RunDetail | None:
-    run = session.scalars(
-        select(Run).where(Run.id == run_id).options(selectinload(Run.events))
-    ).first()
+# Attribute suffixes that hold recorded payloads (messages, outputs, args...). Left out of
+# events when a caller asks for ``payloads=False``.
+_PAYLOAD_SUFFIXES = tuple(s for s in _JSON_SUFFIXES if s != ".truncated")
+
+
+def _without_payloads(event: EventOut) -> EventOut:
+    omitted = [k for k in event.attributes if k.endswith(_PAYLOAD_SUFFIXES)]
+    if event.span_events:
+        omitted.append("span_events")
+    attrs = {k: v for k, v in event.attributes.items() if not k.endswith(_PAYLOAD_SUFFIXES)}
+    return event.model_copy(update={"attributes": attrs, "span_events": [], "omitted": omitted})
+
+
+def get_run(
+    session: Session,
+    run_id: str,
+    *,
+    events_limit: int | None = None,
+    events_offset: int = 0,
+    payloads: bool = True,
+) -> RunDetail | None:
+    """One run with its events in start order. By default every event with its payloads
+    (what replay needs); ``events_limit``/``events_offset`` page them and
+    ``payloads=False`` leaves recorded payloads out."""
+    run = session.get(Run, run_id)
     if run is None:
         return None
-    ordered = sorted(run.events, key=lambda e: (e.start_time_ns, e.end_time_ns or 0))
-    return RunDetail(**summarize(run).model_dump(), events=[event_out(e) for e in ordered])
+    query = (
+        select(Event)
+        .where(Event.run_id == run_id)
+        .order_by(Event.start_time_ns, func.coalesce(Event.end_time_ns, 0), Event.span_id)
+        .offset(events_offset)
+    )
+    if events_limit is not None:
+        query = query.limit(events_limit)
+    events = [event_out(e) for e in session.scalars(query)]
+    if not payloads:
+        events = [_without_payloads(e) for e in events]
+    return RunDetail(
+        **summarize(run).model_dump(),
+        events=events,
+        events_offset=events_offset,
+        events_limit=events_limit,
+    )
+
+
+def get_event(session: Session, run_id: str, span_id: str) -> EventOut | None:
+    """One event with all of its payloads."""
+    event = session.get(Event, (span_id, run_id))
+    return None if event is None else event_out(event)
 
 
 def delete_run(session: Session, run_id: str) -> bool:

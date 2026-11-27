@@ -399,8 +399,9 @@ payloads stored on them.
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |
 | `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
-| `GET` | `/v1/runs` | read | List runs, newest first (`limit`, `offset`, `status`) with token/cost/error totals |
-| `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time |
+| `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status`, `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5) |
+| `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time. Every event with payloads by default (what replay uses). `events_limit` (1-1000) and `events_offset` page the events; `payloads=false` leaves recorded payloads (messages, outputs, args, stack traces) out and lists them in each event's `omitted` |
+| `GET` | `/v1/runs/{run_id}/events/{span_id}` | read | One event with all of its payloads |
 | `DELETE` | `/v1/runs/{run_id}` | delete | Delete a run and all its events (`204`, or `404`) |
 | `GET` | `/health` | none | Liveness (process is up) |
 | `GET` | `/ready` | none | Readiness (database reachable and migrated); 503 otherwise |
