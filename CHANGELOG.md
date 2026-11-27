@@ -24,7 +24,7 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   OTLP-only runs).
 - The server depends on `opentelemetry-proto`.
 
-## 0.1.0 (not yet released; dated when it is tagged)
+## 0.1.0 (2026-11-27)
 
 The first release on PyPI, as **`agentflight-sdk`** (the name `agentflight` is too close
 to an existing PyPI project): `pip install agentflight-sdk` for the SDK,

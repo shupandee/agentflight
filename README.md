@@ -63,14 +63,14 @@ export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)
 # 1. Server + Postgres + retention job (applies Alembic migrations on start)
 docker compose up --build
 
-# or without Docker, using SQLite (from a checkout; once 0.1.0 is on PyPI,
-# `pip install "agentflight-sdk[server]"` works too):
+# or without Docker, using SQLite (from a checkout; elsewhere,
+# `pip install "agentflight-sdk[server]"`):
 pip install -e ".[server]"
 agentflight-server migrate      # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
 agentflight-server serve        # http://127.0.0.1:8000
 
 # 2. Record the toy agent (the SDK reads AGENTFLIGHT_API_KEY)
-pip install -e .                # or, once 0.1.0 is on PyPI: pip install agentflight-sdk
+pip install -e .                # elsewhere: pip install agentflight-sdk
                                 # (the package is agentflight-sdk; you import agentflight)
 python examples/toy_agent.py
 
