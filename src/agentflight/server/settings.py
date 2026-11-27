@@ -61,7 +61,7 @@ def _bool(name: str, default: bool) -> bool:
 
 
 DEFAULT_STALE_AFTER_MINUTES = 60.0
-DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024  # 64 MiB per request
+DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024  # 16 MiB per request
 # The SDK's OTel batch processor exports at most 512 spans per request by default.
 DEFAULT_MAX_SPANS_PER_BATCH = 2048
 # The SDK caps each payload at 32,000 characters by default (max_attr_chars).

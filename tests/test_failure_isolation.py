@@ -353,3 +353,48 @@ def test_interpreter_exit_is_clean_when_exporter_breaks(tmp_path: Any) -> None:
     assert proc.returncode == 0
     assert "agent done" in proc.stdout
     assert "Exception ignored" not in proc.stderr
+
+
+def _finished_spans(n: int) -> list[ReadableSpan]:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    memory = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(memory))
+    tracer = provider.get_tracer("test")
+    for i in range(n):
+        with tracer.start_as_current_span(f"s{i}"):
+            pass
+    return list(memory.get_finished_spans())
+
+
+def test_batch_over_the_body_cap_is_split_and_sent() -> None:
+    import json
+
+    received: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        spans = json.loads(request.content)["spans"]
+        if len(spans) > 2:  # pretend the server's cap fits two spans
+            return httpx.Response(413)
+        received.extend(s["name"] for s in spans)
+        return httpx.Response(200, json={"accepted": len(spans)})
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert exporter.export(_finished_spans(7)) is SpanExportResult.SUCCESS
+    assert sorted(received) == sorted(f"s{i}" for i in range(7))
+
+
+def test_single_span_over_the_body_cap_fails_without_looping() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(413)
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert exporter.export(_finished_spans(4)) is SpanExportResult.FAILURE
+    assert calls == 7  # 4 spans -> 2+2 -> 1+1+1+1: every split tried once

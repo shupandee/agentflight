@@ -474,11 +474,15 @@ batch sizes are measured. A request over a limit gets `413` and nothing from it 
 
 | Setting | Default | Limit |
 | --- | --- | --- |
-| `AGENTFLIGHT_MAX_BODY_BYTES` | `67108864` (64 MiB) | Request body size, checked from `Content-Length` and while reading chunked bodies |
+| `AGENTFLIGHT_MAX_BODY_BYTES` | `16777216` (16 MiB) | Request body size, checked from `Content-Length` and while reading chunked bodies |
 | `AGENTFLIGHT_MAX_SPANS_PER_BATCH` | `2048` | Spans in one `POST /v1/spans` (the SDK's batch processor sends at most 512 by default) |
 | `AGENTFLIGHT_MAX_ATTRIBUTE_CHARS` | `262144` | Characters in one attribute value, span event attribute value or status message (the SDK caps payloads at 32,000 by default) |
 | `AGENTFLIGHT_MAX_ATTRIBUTES_PER_SPAN` | `1024` | Attributes on one span or span event (OpenTelemetry's SDK keeps 128 by default) |
 | `AGENTFLIGHT_MAX_EVENTS_PER_SPAN` | `1024` | Events on one span (OpenTelemetry's SDK keeps 128 by default) |
+
+A full SDK batch of payload-heavy spans can be bigger than 16 MiB. When the server answers
+`413`, the SDK's exporter splits the batch in half and retries each half, so only a single
+span over the cap is dropped (with a warning).
 
 Span, span event and attribute names are limited to 255 characters (`422` above that). If
 you turn off the SDK's payload cap (`max_attr_chars=None`), raise

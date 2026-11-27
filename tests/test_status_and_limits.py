@@ -207,3 +207,9 @@ def test_limit_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_bad_limits_stop_startup(kw: dict[str, Any]) -> None:
     with pytest.raises(RuntimeError):
         Settings(auth_disabled=True, **kw).validate()
+
+
+def test_default_body_cap_is_16_mib(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENTFLIGHT_MAX_BODY_BYTES", raising=False)
+    monkeypatch.setenv("AGENTFLIGHT_API_KEY", "k" * 32)
+    assert Settings.from_env().max_body_bytes == 16 * 1024 * 1024

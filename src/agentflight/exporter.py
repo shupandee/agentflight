@@ -83,6 +83,13 @@ class AgentFlightExporter(SpanExporter):
         try:
             payload = {"spans": [span_to_dict(s) for s in spans]}
             response = self._client.post(self._url, json=payload, headers=self._headers)
+            if response.status_code == 413 and len(spans) > 1:
+                # Batch over the server's body cap: send it in halves instead of dropping it.
+                half = len(spans) // 2
+                first = self.export(spans[:half])
+                second = self.export(spans[half:])
+                ok = first is SpanExportResult.SUCCESS and second is SpanExportResult.SUCCESS
+                return SpanExportResult.SUCCESS if ok else SpanExportResult.FAILURE
             if response.status_code in (401, 403):
                 if not self._auth_warned:
                     self._auth_warned = True

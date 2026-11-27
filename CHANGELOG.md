@@ -17,8 +17,9 @@ can break a client is listed under **Behaviour changes**.
 - **Ingest is bounded.** `POST /v1/spans` answers `413` when a request breaks a size limit
   (body size, spans per batch, attribute size or count, events per span) and stores none
   of it. Span and span event names over 255 characters get `422` (on Postgres they used
-  to fail with a database error). The defaults are generous and configurable; see
-  "Ingest limits" in the README.
+  to fail with a database error). The body cap defaults to 16 MiB; all limits are
+  configurable; see "Ingest limits" in the README. The SDK's exporter splits a batch in
+  half and retries when the server answers `413`, so a big batch isn't dropped whole.
 - **Exception messages and stack traces go through the `redact` hook** (keys
   `agentflight.error.message` and `exception.stacktrace`) and are capped at
   `max_attr_chars`. The SDK now builds the OpenTelemetry `exception` span event itself
