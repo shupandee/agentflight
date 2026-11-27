@@ -6,6 +6,12 @@ can break a client is listed under **Behaviour changes**.
 
 ## Unreleased (week 6)
 
+### Added
+
+- **Span tree in the viewer.** The run page nests each span under its parent (siblings in
+  start order) and pages in tree order. Spans whose parent is missing start their own
+  subtree. The `/v1` API's event order is unchanged.
+
 ### Changed
 
 - **Split-on-413 retries are capped per export.** The exporter makes at most

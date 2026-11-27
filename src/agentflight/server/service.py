@@ -374,6 +374,74 @@ def get_run(
     )
 
 
+def span_tree_order(session: Session, run_id: str) -> list[tuple[str, int]]:
+    """Every span of a run as ``(span_id, depth)`` in tree order (depth-first, siblings by
+    start time).
+
+    Reads only ids, parents and start times, so a page of the tree can be fetched without
+    loading every event. Spans whose parent isn't in the run (not received yet, or from
+    another service) start their own subtree at depth 0, as do spans caught in a parent
+    cycle.
+    """
+    rows = session.execute(
+        select(Event.span_id, Event.parent_span_id)
+        .where(Event.run_id == run_id)
+        .order_by(Event.start_time_ns, func.coalesce(Event.end_time_ns, 0), Event.span_id)
+    ).all()
+    ids = {span_id for span_id, _ in rows}
+    children: dict[str | None, list[str]] = {}
+    for span_id, parent in rows:
+        key = parent if parent in ids and parent != span_id else None
+        children.setdefault(key, []).append(span_id)
+    order: list[tuple[str, int]] = []
+    seen: set[str] = set()
+
+    def walk(roots: list[str]) -> None:
+        stack = [(span_id, 0) for span_id in reversed(roots)]
+        while stack:
+            span_id, depth = stack.pop()
+            if span_id in seen:
+                continue
+            seen.add(span_id)
+            order.append((span_id, depth))
+            stack.extend((c, depth + 1) for c in reversed(children.get(span_id, [])))
+
+    walk(children.get(None, []))
+    if len(seen) < len(rows):  # cycles: nothing in them is reachable from a root
+        walk([span_id for span_id, _ in rows if span_id not in seen])
+    return order
+
+
+def get_run_tree_page(
+    session: Session,
+    run_id: str,
+    *,
+    offset: int,
+    limit: int,
+    abandoned_before_ns: int | None = None,
+) -> tuple[RunDetail, list[int]] | None:
+    """A page of a run's events in tree order, without payloads, and each one's depth."""
+    run = session.get(Run, run_id)
+    if run is None:
+        return None
+    page = span_tree_order(session, run_id)[offset : offset + limit]
+    wanted = [span_id for span_id, _ in page]
+    loaded = {
+        e.span_id: e
+        for e in session.scalars(
+            select(Event).where(Event.run_id == run_id, Event.span_id.in_(wanted))
+        )
+    }
+    events = [_without_payloads(event_out(loaded[s])) for s in wanted if s in loaded]
+    detail = RunDetail(
+        **summarize(run, abandoned_before_ns).model_dump(),
+        events=events,
+        events_offset=offset,
+        events_limit=limit,
+    )
+    return detail, [depth for span_id, depth in page if span_id in loaded]
+
+
 def get_event(session: Session, run_id: str, span_id: str) -> EventOut | None:
     """One event with all of its payloads."""
     event = session.get(Event, (span_id, run_id))

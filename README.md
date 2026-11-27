@@ -83,10 +83,14 @@ The server includes a read-only viewer at `/ui`:
 - **Runs:** every run with its status, start time, duration, call counts, failures, tokens
   and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
   time. Filters update the table in place.
-- **Run page:** a timeline of the run's events with a bar per event on the run's time
-  axis, failures highlighted with their messages, and replay/fork runs linked to the run
-  they came from. Events load in pages of 100 without payloads; selecting an event loads
-  its messages, outputs, arguments and stack traces on demand.
+- **Run page:** the run's spans as an indented tree (each span under its parent,
+  siblings in start order) with a bar per span on the run's time axis, failures
+  highlighted with their messages, and replay/fork runs linked to the run they came
+  from. A span whose parent never arrived starts its own subtree at the left. Events load
+  in pages of 100 without payloads, and the next page continues the tree where the last
+  one stopped; selecting an event loads its messages, outputs, arguments and stack traces
+  on demand. (To page in tree order the server reads every span's id and parent for each
+  page, which is cheap next to loading the events themselves.)
 
 It is server-rendered (Jinja2 and [htmx](https://htmx.org), vendored, no build step) and
 reads through the same service functions and JSON shapes as the `/v1` API, so another
@@ -585,9 +589,10 @@ docker compose down --volumes
   htmx, no JavaScript build) with a run list, filters, a run timeline and highlighted
   failures; stored run totals and batched ingest; run filters and paged run detail;
   scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
-  exception messages and stack traces. Deferred to later weeks: an indented span tree in
-  the viewer, README screenshots and a demo, recorder overhead measured on real runs and
-  published with the method used, and a rate limit on failed keys.
+  exception messages and stack traces. Deferred to later weeks: README screenshots and a
+  demo, recorder overhead measured on real runs and published with the method used, and
+  a rate limit on failed keys.
+- **Week 6** (this branch): an indented span tree in the viewer.
 
 ## License
 
