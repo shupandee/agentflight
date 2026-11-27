@@ -82,14 +82,15 @@ The server includes a read-only viewer at `/ui`:
 
 - **Runs:** every run with its status, start time, duration, call counts, failures, tokens
   and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
-  time. Filters update the table in place.
+  time. Filters update the table in place. A run whose recorder dropped spans is marked
+  "incomplete recording: N spans dropped" (see "Dropped spans are counted" below).
 - **Run page:** the run's spans as an indented tree (each span under its parent,
   siblings in start order) with a bar per span on the run's time axis, failures
   highlighted with their messages, and replay/fork runs linked to the run they came
   from. A span whose parent never arrived starts its own subtree at the left. Events load
   in pages of 100 without payloads, and the next page continues the tree where the last
   one stopped; selecting an event loads its messages, outputs, arguments and stack traces
-  on demand. (To page in tree order the server reads every span's id and parent for each
+  on demand. An incomplete recording gets a warning above the timeline. (To page in tree order the server reads every span's id and parent for each
   page, which is cheap next to loading the events themselves.)
 
 ![Run list with filters](docs/screenshots/run-list.png)

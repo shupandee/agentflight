@@ -73,6 +73,9 @@ class RunSummary(BaseModel):
     tokens_in: int
     tokens_out: int
     cost_usd: float | None
+    # Spans the SDK reported dropping (full export queue) before the run ended; the
+    # recording is incomplete when this is above 0. Best effort: see the README.
+    dropped_spans: int = 0
 
 
 class RunDetail(RunSummary):

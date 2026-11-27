@@ -14,6 +14,9 @@
     <div><dt>Cost</dt><dd>{{ run.cost_usd | cost }}</dd></div>
     <div{% if run.errors %} class="bad"{% endif %}><dt>Failures</dt><dd>{{ run.errors | number }} <span class="muted">({{ run.error_events | number }} error events)</span></dd></div>
   </dl>
+  {% if run.dropped_spans %}
+  <p class="incomplete" role="alert">incomplete recording: {{ run.dropped_spans | number }} span{% if run.dropped_spans != 1 %}s{% endif %} dropped by the recorder before the run ended (its export queue was full), so the timeline below is missing them. Replays of this run will warn too.</p>
+  {% endif %}
   {% if replay %}
   <p class="replay">
     {{ replay.mode or "replay" }} of <a href="/ui/runs/{{ replay.source_run }}">{{ replay.source_run }}</a>

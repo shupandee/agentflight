@@ -16,6 +16,9 @@ can break a client is listed under **Behaviour changes**.
   records each run's count on its run span (`agentflight.run.dropped_spans`, best effort:
   spans dropped after the run span ended can't be on it). The total is
   `get_recorder().dropped_spans`.
+- **Incomplete recordings are visible.** Runs have `dropped_spans` (migration `0004`, 0
+  for existing runs) in `/v1/runs` and run detail, and the viewer's run list and run page
+  show "incomplete recording: N spans dropped".
 
 ### Changed
 

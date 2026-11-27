@@ -38,6 +38,9 @@ class Run(Base):
     tokens_in: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     tokens_out: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     cost_usd: Mapped[float | None] = mapped_column(Float)
+    # Spans the SDK dropped from a full export queue before the run ended, as reported on
+    # the run span (agentflight.run.dropped_spans). 0 when none were reported.
+    dropped_spans: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     events: Mapped[list[Event]] = relationship(
         back_populates="run", cascade="all, delete-orphan", order_by="Event.start_time_ns"

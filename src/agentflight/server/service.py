@@ -162,6 +162,8 @@ def ingest_spans(session: Session, spans: list[SpanIn]) -> list[str]:
             run.status = RUN_STATUS[span.status] if span.end_time_ns else "running"
             meta = _loads(span.attributes.get(A.RUN_METADATA, {}))
             run.metadata_ = meta if isinstance(meta, dict) else {"value": meta}
+            dropped = _as_int(span.attributes.get(A.RUN_DROPPED_SPANS)) or 0
+            run.dropped_spans = min(max(dropped, 0), 2**31 - 1)
         elif run.start_time_ns is None or span.start_time_ns < run.start_time_ns:
             run.start_time_ns = span.start_time_ns
 
@@ -259,6 +261,7 @@ def summarize(run: Run, abandoned_before_ns: int | None = None) -> RunSummary:
         tokens_in=run.tokens_in,
         tokens_out=run.tokens_out,
         cost_usd=run.cost_usd,
+        dropped_spans=run.dropped_spans or 0,
     )
 
 
