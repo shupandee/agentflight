@@ -361,8 +361,11 @@ Limitations (known, not yet handled):
 - **Lost spans.** If export fails, those spans are dropped. There's no retry, no disk
   buffer and no dead-letter queue yet. If the server is unreachable, the run is simply
   missing from the recording.
-- **The batch queue is bounded.** OpenTelemetry's default limit is 2048 spans. When the
-  queue is full, new spans are dropped rather than blocking the agent.
+- **The batch queue is bounded.** It holds 2048 finished spans by default; set it with
+  `configure(max_queue_size=...)` or `AGENTFLIGHT_MAX_QUEUE_SIZE` (OpenTelemetry's
+  `OTEL_BSP_MAX_QUEUE_SIZE` also works). When the queue is full, spans are dropped rather
+  than blocking the agent. A bigger queue absorbs longer bursts at the cost of memory
+  (each queued span holds its payloads, up to `max_attr_chars` each).
 - **`batch=False` blocks.** It exports inside the agent's thread, so each span can block
   for up to the HTTP timeout. Use it only for tests or debugging.
 - **A partly broken span processor can mis-parent later spans.** If a processor fails while

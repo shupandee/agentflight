@@ -6,6 +6,12 @@ can break a client is listed under **Behaviour changes**.
 
 ## Unreleased (week 7)
 
+### Added
+
+- **Configurable batch queue:** `configure(max_queue_size=...)` or
+  `AGENTFLIGHT_MAX_QUEUE_SIZE` (then OpenTelemetry's `OTEL_BSP_MAX_QUEUE_SIZE`), passed
+  to the batch span processor. The default is unchanged (2048).
+
 ### Changed
 
 - **Split-on-413 retries stop at the first other failure.** A timeout, transport error,

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     SimpleSpanProcessor,
@@ -292,6 +292,42 @@ def _record_error(span: Span, exc: BaseException) -> None:
     span.set_status(Status(StatusCode.ERROR, f"{error_type}: {message}"))
 
 
+DEFAULT_MAX_QUEUE_SIZE = 2048  # OpenTelemetry's default for the batch span processor
+_DEFAULT_EXPORT_BATCH = 512
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("agentflight: ignoring %s=%r (not a positive integer)", name, raw)
+        return None
+    return value
+
+
+def resolve_queue_size(max_queue_size: int | None = None) -> int:
+    """The batch queue size: the argument, else ``AGENTFLIGHT_MAX_QUEUE_SIZE``, else
+    OpenTelemetry's ``OTEL_BSP_MAX_QUEUE_SIZE``, else 2048."""
+    if max_queue_size is not None:
+        if max_queue_size < 1:
+            raise ValueError("max_queue_size must be at least 1")
+        return max_queue_size
+    return (
+        _env_int("AGENTFLIGHT_MAX_QUEUE_SIZE")
+        or _env_int("OTEL_BSP_MAX_QUEUE_SIZE")
+        or DEFAULT_MAX_QUEUE_SIZE
+    )
+
+
+def _export_batch_size() -> int:
+    return _env_int("OTEL_BSP_MAX_EXPORT_BATCH_SIZE") or _DEFAULT_EXPORT_BATCH
+
+
 class Recorder:
     """Owns a private TracerProvider so AgentFlight never clobbers app-wide OTel config."""
 
@@ -302,14 +338,24 @@ class Recorder:
         batch: bool = True,
         max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
         redact: Redactor | None = None,
+        max_queue_size: int | None = None,
     ) -> None:
         self.max_attr_chars = max_attr_chars
         self.redact = redact
+        self.max_queue_size = resolve_queue_size(max_queue_size)
         # OTel's own atexit hook would let exporter errors escape at interpreter exit;
         # we register a fail-safe one instead.
         self.provider = TracerProvider(shutdown_on_exit=False)
         if exporter is not None:
-            processor = BatchSpanProcessor(exporter) if batch else SimpleSpanProcessor(exporter)
+            processor: SpanProcessor
+            if batch:
+                processor = BatchSpanProcessor(
+                    exporter,
+                    max_queue_size=self.max_queue_size,
+                    max_export_batch_size=min(_export_batch_size(), self.max_queue_size),
+                )
+            else:
+                processor = SimpleSpanProcessor(exporter)
             self.provider.add_span_processor(processor)
         self.tracer = self.provider.get_tracer("agentflight")
 
@@ -340,6 +386,7 @@ def configure(
     max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
     redact: Redactor | None = None,
     max_export_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_queue_size: int | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
@@ -348,7 +395,9 @@ def configure(
     is recorded in ``agentflight.truncated``. ``redact(key, value)`` runs on every payload
     before it is serialized; if it raises, the value is replaced with a placeholder.
     ``max_export_attempts`` caps the HTTP requests one export makes while splitting
-    batches the server rejects as too large (413).
+    batches the server rejects as too large (413). ``max_queue_size`` is how many finished
+    spans ``batch=True`` holds for export (default ``AGENTFLIGHT_MAX_QUEUE_SIZE``, else
+    OpenTelemetry's ``OTEL_BSP_MAX_QUEUE_SIZE``, else 2048); spans beyond it are dropped.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
@@ -363,6 +412,7 @@ def configure(
             batch=batch,
             max_attr_chars=max_attr_chars,
             redact=redact,
+            max_queue_size=max_queue_size,
         )
     except Exception:
         logger.warning("agentflight: configure failed; recording disabled", exc_info=True)
