@@ -11,6 +11,8 @@ can break a client is listed under **Behaviour changes**.
 - **Span tree in the viewer.** The run page nests each span under its parent (siblings in
   start order) and pages in tree order. Spans whose parent is missing start their own
   subtree. The `/v1` API's event order is unchanged.
+- **README screenshots** of the run list, run page, span tree and a fork run, under
+  `docs/screenshots/`, taken by the browser smoke test.
 - **Overhead benchmark.** `scripts/bench_overhead.py` measures what recording adds per
   span (no exporter, serialization only, HTTP with and without batching) and counts what
   the server stored. Results and method are in the README under "Overhead".

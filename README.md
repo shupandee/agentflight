@@ -92,6 +92,17 @@ The server includes a read-only viewer at `/ui`:
   on demand. (To page in tree order the server reads every span's id and parent for each
   page, which is cheap next to loading the events themselves.)
 
+![Run list with filters](docs/screenshots/run-list.png)
+
+![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](docs/screenshots/run-page.png)
+
+![A LangGraph run: model and tool calls nested under graph nodes](docs/screenshots/span-tree.png)
+
+![A fork run, linked to its source run, with cached, overridden and live steps](docs/screenshots/fork-run.png)
+
+The screenshots come from the browser smoke test against the example agents; regenerate
+them with `AGENTFLIGHT_SCREENSHOT_DIR=docs/screenshots pytest tests/test_viewer_browser.py`.
+
 It is server-rendered (Jinja2 and [htmx](https://htmx.org), vendored, no build step) and
 reads through the same service functions and JSON shapes as the `/v1` API, so another
 frontend can be built on the API alone. Everything a run recorded is treated as untrusted:
@@ -638,10 +649,12 @@ docker compose down --volumes
   htmx, no JavaScript build) with a run list, filters, a run timeline and highlighted
   failures; stored run totals and batched ingest; run filters and paged run detail;
   scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
-  exception messages and stack traces. Deferred to later weeks: README screenshots and a
-  demo, recorder overhead measured on real runs and published with the method used, and
-  a rate limit on failed keys.
-- **Week 6** (this branch): an indented span tree in the viewer.
+  exception messages and stack traces.
+- **Week 6: tree, screenshots, overhead** (this branch): an indented span tree in the
+  viewer, README screenshots, an overhead benchmark with its method and measured results,
+  and a cap on the exporter's split-on-413 requests. Deferred: a demo, overhead on real
+  (non-synthetic) agent runs, a setting for the export queue size, and a rate limit on
+  failed keys.
 
 ## License
 
