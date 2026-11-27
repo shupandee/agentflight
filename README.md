@@ -451,11 +451,11 @@ Limitations (known, not yet handled):
 
 ## Overhead
 
-Measured with [`scripts/bench_overhead.py`](https://github.com/shupandee/agentflight/blob/main/scripts/bench_overhead.py) on 2026-11-27:
-**5 repeats**, each against a fresh server. Raw output:
-[`docs/benchmarks/overhead-2026-11-27-5-repeats.md`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-5-repeats.md)
-(and [`.json`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-5-repeats.json)). The numbers
-published with week 6 came from a single run; these replace them.
+Measured with [`scripts/bench_overhead.py`](https://github.com/shupandee/agentflight/blob/main/scripts/bench_overhead.py) on 2026-11-27, with run
+spans on their own lane (0.1.0): **5 repeats**, each against a fresh server. Raw output:
+[`docs/benchmarks/overhead-2026-11-27-run-lane.md`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-run-lane.md)
+(and [`.json`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-run-lane.json)). Earlier numbers (a single run
+for week 6, 5 repeats before run spans had their own lane) are in the git history.
 
 **Method.** The "agent" makes 5 model calls and 5 tool calls that do no work, so a run is
 11 spans and nearly all of its time is recording overhead. In each repeat, each scenario
@@ -464,28 +464,28 @@ the agent thread with `time.perf_counter_ns`. The table gives the median of the 
 per-repeat medians, the spread of those medians (min to max), the median p95, and the
 added time per span versus the same code without AgentFlight. The HTTP scenarios export
 to a real server (uvicorn + SQLite, separate process); the benchmark is pinned to one CPU
-and the server to the other seven, and afterwards the spans the server stored and the
-spans the SDK counted as dropped are added up over all repeats. Messages are about 100
-characters ("small") or 8,000 ("large").
+and the server to the other seven, and afterwards the spans the server stored, the spans
+the SDK counted as dropped and the runs the server has with a final status are added up
+over all repeats. Messages are about 100 characters ("small") or 8,000 ("large").
 
 **Machine.** Linux 6.12 x86_64 VM (KVM), Intel Xeon, 8 vCPUs; CPython 3.13.5,
 opentelemetry-sdk 1.45.2, httpx 0.29.0, uvicorn 0.54.0. The box is shared: the 1-minute
-load average at the start of the repeats ranged from 0.57 to 2.28.
+load average at the start of the repeats ranged from 0.81 to 1.24.
 
-| Payload | Scenario | Median per run | Spread (5 medians) | p95 | Added per span | Spans stored | Dropped (SDK count) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| small | no AgentFlight | 0.7 µs | 0.7 to 0.8 µs | 0.7 µs | — | — | — |
-| small | SDK, no exporter | 380.3 µs | 373.4 to 384.0 µs | 390.3 µs | 34.5 µs | — | — |
-| small | SDK + JSON serialization, no network | 524.6 µs | 518.0 to 533.4 µs | 539.4 µs | 47.6 µs | — | — |
-| small | HTTP, `batch=True` (default), queue drained every 100 runs | 409.8 µs | 403.8 to 417.3 µs | 542.5 µs | 37.2 µs | 121,000 of 121,000 | 0 |
-| small | HTTP, `batch=True`, tight loop | 406.0 µs | 402.5 to 407.4 µs | 480.4 µs | 36.8 µs | 59,828 of 121,000 | 61,172 |
-| small | HTTP, `batch=False` | 60,948.5 µs | 57,785.9 to 62,717.0 µs | 68,115.0 µs | 5,540.7 µs | 12,100 of 12,100 | 0 |
-| large | no AgentFlight | 1.5 µs | 1.4 to 1.5 µs | 1.5 µs | — | — | — |
-| large | SDK, no exporter | 825.1 µs | 815.3 to 825.3 µs | 838.1 µs | 74.9 µs | — | — |
-| large | SDK + JSON serialization, no network | 1,217.8 µs | 1,215.6 to 1,222.0 µs | 1,237.4 µs | 110.6 µs | — | — |
-| large | HTTP, `batch=True` (default), queue drained every 100 runs | 853.2 µs | 851.1 to 862.5 µs | 1,009.1 µs | 77.4 µs | 121,000 of 121,000 | 0 |
-| large | HTTP, `batch=True`, tight loop | 850.1 µs | 847.4 to 875.6 µs | 1,003.0 µs | 77.1 µs | 58,118 of 121,000 | 62,882 |
-| large | HTTP, `batch=False` | 69,894.8 µs | 68,430.0 to 71,938.2 µs | 76,906.6 µs | 6,353.9 µs | 12,100 of 12,100 | 0 |
+| Payload | Scenario | Median per run | Spread (5 medians) | p95 | Added per span | Spans stored | Dropped (SDK count / on runs) | Runs closed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| small | no AgentFlight | 0.7 µs | 0.7 to 0.8 µs | 0.8 µs | — | — | — | — |
+| small | SDK, no exporter | 383.3 µs | 381.3 to 389.8 µs | 458.5 µs | 34.8 µs | — | — | — |
+| small | SDK + JSON serialization, no network | 532.0 µs | 528.4 to 535.9 µs | 623.2 µs | 48.3 µs | — | — | — |
+| small | HTTP, `batch=True` (default), queue drained every 100 runs | 421.4 µs | 413.0 to 457.3 µs | 784.3 µs | 38.2 µs | 121,000 of 121,000 | 0 / 0 | 11,000 of 11,000 |
+| small | HTTP, `batch=True`, tight loop | 420.0 µs | 416.4 to 447.4 µs | 533.9 µs | 38.1 µs | 55,718 of 121,000 | 65,282 / 65,282 | 11,000 of 11,000 |
+| small | HTTP, `batch=False` | 64,347.6 µs | 59,479.7 to 65,389.2 µs | 71,882.5 µs | 5,849.7 µs | 12,100 of 12,100 | 0 / 0 | 1,100 of 1,100 |
+| large | no AgentFlight | 1.5 µs | 1.4 to 1.6 µs | 1.5 µs | — | — | — | — |
+| large | SDK, no exporter | 833.4 µs | 826.0 to 836.4 µs | 946.6 µs | 75.6 µs | — | — | — |
+| large | SDK + JSON serialization, no network | 1,235.4 µs | 1,228.5 to 1,252.0 µs | 1,397.1 µs | 112.2 µs | — | — | — |
+| large | HTTP, `batch=True` (default), queue drained every 100 runs | 875.7 µs | 865.9 to 878.7 µs | 1,640.2 µs | 79.5 µs | 121,000 of 121,000 | 0 / 0 | 11,000 of 11,000 |
+| large | HTTP, `batch=True`, tight loop | 864.9 µs | 861.3 to 928.2 µs | 1,127.0 µs | 78.5 µs | 60,018 of 121,000 | 60,982 / 60,982 | 11,000 of 11,000 |
+| large | HTTP, `batch=False` | 70,389.9 µs | 66,609.9 to 72,645.4 µs | 80,479.0 µs | 6,398.9 µs | 12,100 of 12,100 | 0 / 0 | 1,100 of 1,100 |
 
 **Server ingest rate**, measured by sending already-recorded spans in 512-span batches
 back to back from one thread (20 batches per payload and repeat), next to how fast the
@@ -493,25 +493,23 @@ tight loop makes spans:
 
 | Payload | Server ingest, spans/s (median of 5) | Spread | Tight loop makes, spans/s | Tight loop: stored, spans/s |
 | --- | ---: | ---: | ---: | ---: |
-| small | 10,356 | 10,076 to 10,441 | 27,092 | 8,648 |
-| large | 4,397 | 4,024 to 4,474 | 12,940 | 3,857 |
+| small | 9,604 | 9,211 to 9,773 | 26,189 | 7,162 |
+| large | 4,248 | 3,735 to 4,362 | 12,718 | 3,371 |
 
 What this says:
 
-- With the default `batch=True`, recording costs the agent about **37 µs per span with
-  small payloads and 77 µs with 8,000-character ones**, about 0.4 ms and 0.85 ms for this
-  11-span run. The five repeats agree to within a few percent.
-- **The dropped spans are a rate mismatch.** The tight loop makes spans 2.6 to 2.9 times
-  faster than one exporter thread and this server store them (27,092 vs 10,356 spans/s
-  small, 12,940 vs 4,397 large), and while the loop runs the exporter also shares the
-  agent's CPU, so the server stored only 8,648 and 3,857 spans/s. The 2,048-span queue
-  fills in well under a second, and about half the spans were dropped (51% and 52% over
-  the five repeats; the earlier single run saw 45-48%). The SDK counted every one:
-  stored + dropped = sent over the five repeats. About two thirds of the drops (41,966 of
-  61,172 small, 41,080 of 62,882 large) were recorded on their runs. The rest are run
-  spans that were themselves dropped once even the slots kept for run spans were full,
-  and the counts those run spans would have carried, so they are only in the SDK total
-  (see "Dropped spans are counted").
+- With the default `batch=True`, recording costs the agent about **38 µs per span with
+  small payloads and 79 µs with 8,000-character ones**, about 0.42 ms and 0.87 ms for
+  this 11-span run. In the `batch=True` rows the slowest repeat was up to 8.5% above
+  the median and the fastest within 2% of it (the box is shared).
+- **The dropped spans are a rate mismatch.** The tight loop makes spans 2.7 to 3.0 times
+  faster than one exporter thread and this server store them (26,189 vs 9,604 spans/s
+  small, 12,718 vs 4,248 large), and while the loop runs the exporter also shares the
+  agent's CPU, so the server stored only 7,162 and 3,371 spans/s. The 2,048-span queue
+  fills in well under a second, and about half the spans were dropped (54% and 50% over
+  the five repeats). The SDK counted every one (stored + dropped = sent), **every drop
+  is recorded on its run** (65,282 of 65,282 small, 60,982 of 60,982 large), and **every
+  run closed** (11,000 of 11,000): run spans skip the queue.
 - Real agents spend hundreds of milliseconds on each model call, far below these rates.
   A burst of thousands of spans can still lose some; `max_queue_size` buys headroom.
 - `batch=False` waits for an HTTP round trip and a database commit per span, about 6 ms

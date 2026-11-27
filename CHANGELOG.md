@@ -62,6 +62,10 @@ changes.
 
 ### Changed
 
+- **Benchmark rerun** with run spans on their own lane (5 repeats): every dropped span
+  was recorded on its run and every run closed, also in the tight loop that drops about
+  half the spans. The benchmark now reports how many runs the server has with a final
+  status.
 - **Export errors are reported as `HTTP <status> from <url>`** instead of the httpx
   exception's repr, and other 4xx answers are counted as rejected for good (not spooled).
 - **Run spans skip the batch queue.** A run's root span goes to a small lane of its own,
