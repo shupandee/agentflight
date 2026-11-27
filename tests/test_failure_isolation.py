@@ -10,7 +10,7 @@ import asyncio
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -442,6 +442,7 @@ def test_every_dropped_span_in_one_export_shares_one_warning(
 
 
 def test_one_half_failing_fails_the_export(caplog: pytest.LogCaptureFixture) -> None:
+    # The second half fails after the first was stored: the export is a FAILURE.
     import json
 
     received: list[str] = []
@@ -450,7 +451,7 @@ def test_one_half_failing_fails_the_export(caplog: pytest.LogCaptureFixture) -> 
         names = [s["name"] for s in json.loads(request.content)["spans"]]
         if len(names) > 2:
             return httpx.Response(413)
-        if "s0" in names:  # the first half hits a server error
+        if "s2" in names:
             return httpx.Response(500)
         received.extend(names)
         return httpx.Response(202)
@@ -458,9 +459,79 @@ def test_one_half_failing_fails_the_export(caplog: pytest.LogCaptureFixture) -> 
     exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
     with caplog.at_level("WARNING"):
         assert exporter.export(_finished_spans(4)) is SpanExportResult.FAILURE
-    assert sorted(received) == ["s2", "s3"]  # the other half still went through
+    assert sorted(received) == ["s0", "s1"]
     (warning,) = _export_warnings(caplog)
     assert "2 of 4 spans" in warning and "500" in warning
+
+
+def _split_then(failure: Callable[[httpx.Request], httpx.Response]) -> tuple[list[int], Any]:
+    """A server that answers 413 to batches over 2 spans and ``failure`` to the rest."""
+    import json
+
+    sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        n = len(json.loads(request.content)["spans"])
+        sizes.append(n)
+        return httpx.Response(413) if n > 2 else failure(request)
+
+    return sizes, handler
+
+
+def _timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("timed out", request=request)
+
+
+def _refused(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(_timeout, id="timeout"),
+        pytest.param(_refused, id="transport-error"),
+        pytest.param(lambda r: httpx.Response(503), id="5xx"),
+        pytest.param(lambda r: httpx.Response(500), id="500"),
+    ],
+)
+def test_first_non_413_failure_aborts_the_remaining_halves(
+    failure: Callable[[httpx.Request], httpx.Response], caplog: pytest.LogCaptureFixture
+) -> None:
+    sizes, handler = _split_then(failure)
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with caplog.at_level("WARNING"):
+        assert exporter.export(_finished_spans(8)) is SpanExportResult.FAILURE
+    # 8 -> 413, 4 -> 413, 2 -> fails: the other 2 and the other 4 are never sent.
+    assert sizes == [8, 4, 2]
+    (warning,) = _export_warnings(caplog)
+    assert "8 of 8 spans" in warning
+
+
+def test_abort_does_not_stop_the_next_export() -> None:
+    sizes, handler = _split_then(lambda r: httpx.Response(503))
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    exporter.export(_finished_spans(8))
+    exporter.export(_finished_spans(8))
+    assert sizes == [8, 4, 2, 8, 4, 2]
+
+
+def test_oversized_single_spans_do_not_abort_the_export() -> None:
+    # A 413 on one span is that span's problem; its siblings are still sent.
+    import json
+
+    stored: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        names = [s["name"] for s in json.loads(request.content)["spans"]]
+        if "s0" in names or "s5" in names:
+            return httpx.Response(413)
+        stored.extend(names)
+        return httpx.Response(202)
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert exporter.export(_finished_spans(8)) is SpanExportResult.FAILURE
+    assert sorted(stored) == ["s1", "s2", "s3", "s4", "s6", "s7"]
 
 
 def test_export_attempts_are_capped(caplog: pytest.LogCaptureFixture) -> None:
@@ -515,4 +586,38 @@ def test_configure_passes_max_export_attempts() -> None:
     rec = agentflight.configure("http://x", batch=False, max_export_attempts=3)
     exporter = rec.provider._active_span_processor._span_processors[0].span_exporter
     assert exporter._max_attempts == 3
+    agentflight.shutdown()
+
+
+def test_flush_and_shutdown_are_bounded_with_a_full_queue(
+    hanging_server: _HangingServer,
+) -> None:
+    # Four 512-span batches queued against a server that never answers: OpenTelemetry's
+    # own force_flush would wait for every batch (4 x 1 s here); ours stops at its timeout.
+    exporter = AgentFlightExporter(f"http://127.0.0.1:{hanging_server.port}", timeout=1.0)
+    agentflight.configure(exporter=exporter, batch=True)
+    with agentflight.run("many"):
+        for i in range(2_000):
+            agentflight.decision(f"d{i}", i)
+    start = time.perf_counter()
+    assert agentflight.flush(timeout_millis=300) is False
+    assert time.perf_counter() - start < 0.8
+    start = time.perf_counter()
+    agentflight.shutdown(timeout_millis=300)
+    assert time.perf_counter() - start < 0.8
+
+
+def test_flush_reports_success_when_everything_is_sent() -> None:
+    sent: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(1)
+        return httpx.Response(202)
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    agentflight.configure(exporter=exporter, batch=True)
+    with agentflight.run("r"):
+        pass
+    assert agentflight.flush(timeout_millis=5_000) is True
+    assert sent
     agentflight.shutdown()

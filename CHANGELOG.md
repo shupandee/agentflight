@@ -4,7 +4,18 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 the project is in early development (`0.x`), `/v1` can still change, and every change that
 can break a client is listed under **Behaviour changes**.
 
-## Unreleased (week 6)
+## Unreleased (week 7)
+
+### Changed
+
+- **Split-on-413 retries stop at the first other failure.** A timeout, transport error,
+  5xx or credentials error during an export drops the halves not yet sent instead of
+  trying each of them. The attempt cap stays.
+- **`flush()` and `shutdown()` are bounded by AgentFlight**, not only by OpenTelemetry
+  (whose 1.45 `force_flush` ignores its timeout). `shutdown()` takes `timeout_millis`
+  (default 30 s). `flush()` returns `False` when it runs out of time.
+
+## Week 6 (merged in #4)
 
 ### Added
 

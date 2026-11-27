@@ -346,10 +346,14 @@ Guarantees:
   `__str__` raise. Values are cut off at 32,000 characters.
 - **No blocking in the default mode.** With `batch=True` (the default), spans are exported
   on a background thread, so a hanging server doesn't slow the agent down.
-- **Bounded waits.** `flush(timeout_millis=...)` and `shutdown()` never raise. They wait at
-  most about the given flush timeout plus the exporter's HTTP timeout (`configure(...,
-  timeout=5.0)`). Interpreter exit is also clean: AgentFlight replaces OpenTelemetry's
-  atexit hook with a fail-safe one.
+- **Bounded waits.** `flush(timeout_millis=30_000)` and `shutdown(timeout_millis=30_000)`
+  never raise and return within their timeout. AgentFlight enforces this itself, because
+  OpenTelemetry's isn't reliable: in opentelemetry-sdk 1.45, `force_flush(300)` against a
+  hanging server with four batches queued took 4.0 s (one 1 s HTTP timeout per batch).
+  When the wait runs out, `flush()` returns `False` and export carries on in the
+  background; whatever `shutdown()` hasn't sent by then is lost. Interpreter exit is also
+  clean: AgentFlight replaces OpenTelemetry's atexit hook with a fail-safe one, bounded
+  the same way.
 - **A bad configuration disables recording instead of raising.**
 
 Limitations (known, not yet handled):
@@ -556,13 +560,18 @@ A full SDK batch of payload-heavy spans can be bigger than 16 MiB. When the serv
 over the cap on their own are dropped, with one warning per export.
 
 Splitting is capped at `max_export_attempts` HTTP requests per export (default `32`, set
-it with `configure(max_export_attempts=...)`); whatever is still unsent then is dropped.
-Isolating one oversized span in a full 512-span batch takes 19 requests. Worst case, one
-export takes `max_export_attempts` × `timeout` (32 × 5 s with the defaults) when every
-request is slow. With `batch=True` (the default) that happens on the exporter's background
-thread, though `flush()` and `shutdown()` wait for it. With `batch=False` every span is
-exported on its own as it ends, so there is nothing to split and a span end blocks for at
-most one `timeout`.
+it with `configure(max_export_attempts=...)`), and the first failure that isn't a `413`
+(a timeout, a transport error, a 5xx, rejected credentials) stops the export: the halves
+not yet sent are dropped instead of being tried against a server that is already
+failing. Isolating one oversized span in a full 512-span batch takes 19 requests.
+
+Worst case for one export: a server that is down or hanging costs one `timeout` (5 s by
+default), since the first failure ends the export. Only a server that keeps answering
+`413` slowly can make an export take up to `max_export_attempts` × `timeout`. With
+`batch=True` (the default) exports run on a background thread; `flush()` and
+`shutdown()` stop waiting at their own timeouts (see [Failure isolation](#failure-isolation)).
+With `batch=False` every span is exported on its own as it ends, so there is nothing to
+split and a span end blocks for at most one `timeout`.
 
 Span, span event and attribute names are limited to 255 characters (`422` above that). If
 you turn off the SDK's payload cap (`max_attr_chars=None`), raise

@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 import uuid
@@ -57,6 +58,29 @@ def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     except Exception:
         logger.warning("agentflight: instrumentation error (ignored)", exc_info=True)
         return None
+
+
+DEFAULT_SHUTDOWN_MILLIS = 30_000
+
+
+def _bounded(fn: Callable[..., Any], timeout_millis: float, *args: Any) -> Any:
+    """Run ``fn`` (fail-safe) and wait at most ``timeout_millis`` for it.
+
+    OpenTelemetry's own flush and shutdown timeouts aren't reliable across versions (1.45's
+    ``force_flush`` ignores its timeout and exports the whole queue), so the wait is bounded
+    here. If time runs out, ``fn`` keeps going on a daemon thread and None is returned.
+    """
+    result: list[Any] = []
+    worker = threading.Thread(
+        target=lambda: result.append(_safe(fn, *args)), name="agentflight-wait", daemon=True
+    )
+    try:
+        worker.start()
+        worker.join(max(0.0, timeout_millis / 1000))
+    except Exception:
+        logger.warning("agentflight: could not wait for %r (ignored)", fn, exc_info=True)
+        return None
+    return result[0] if result else None
 
 
 def _safe_repr(value: Any) -> str:
@@ -290,10 +314,10 @@ class Recorder:
         self.tracer = self.provider.get_tracer("agentflight")
 
     def flush(self, timeout_millis: int = 30_000) -> bool:
-        return bool(_safe(self.provider.force_flush, timeout_millis))
+        return bool(_bounded(self.provider.force_flush, timeout_millis, timeout_millis))
 
-    def shutdown(self) -> None:
-        _safe(self.provider.shutdown)
+    def shutdown(self, timeout_millis: int = DEFAULT_SHUTDOWN_MILLIS) -> None:
+        _bounded(self.provider.shutdown, timeout_millis)
 
 
 _recorder: Recorder = Recorder()
@@ -351,12 +375,16 @@ def get_recorder() -> Recorder:
 
 
 def flush(timeout_millis: int = 30_000) -> bool:
-    """Wait (at most ``timeout_millis``) for finished spans to be exported. Never raises."""
+    """Wait at most ``timeout_millis`` for finished spans to be exported. Never raises.
+
+    Returns False if the wait ran out (export goes on in the background) or failed.
+    """
     return _recorder.flush(timeout_millis)
 
 
-def shutdown() -> None:
-    _recorder.shutdown()
+def shutdown(timeout_millis: int = DEFAULT_SHUTDOWN_MILLIS) -> None:
+    """Export what is queued and stop, waiting at most ``timeout_millis``. Never raises."""
+    _recorder.shutdown(timeout_millis)
 
 
 @contextmanager
