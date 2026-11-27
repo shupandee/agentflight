@@ -48,6 +48,13 @@ changes.
 
 ### Added
 
+- **Bounded on-disk spool (opt-in):** `configure(spool_dir=...)` or
+  `AGENTFLIGHT_SPOOL_DIR`. Spans whose export failed in a way that may clear up are kept
+  on disk and sent at the start of later exports (including after a restart), oldest
+  first, within the attempt cap and with the usual 413 splitting. Bounded by size
+  (`spool_max_bytes`, 64 MiB) and age (`spool_max_age_s`, 24 h), private (`0700`/`0600`),
+  fail-open (full disk, unwritable directory, corrupt files) and never on the agent's
+  thread, so it needs `batch=True`.
 - **`agentflight-server migrate [revision]`** applies the database migrations, which now
   ship inside the package (`agentflight/server/migrations`), so a server installed from a
   wheel can create and upgrade its database without a source checkout. `alembic upgrade
@@ -55,6 +62,8 @@ changes.
 
 ### Changed
 
+- **Export errors are reported as `HTTP <status> from <url>`** instead of the httpx
+  exception's repr, and other 4xx answers are counted as rejected for good (not spooled).
 - **Run spans skip the batch queue.** A run's root span goes to a small lane of its own,
   sent by a dedicated thread as soon as the run ends (with a deadline, the exporter's
   `timeout`), so a run whose other spans were dropped still closes with its status and

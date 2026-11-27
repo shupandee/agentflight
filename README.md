@@ -376,11 +376,52 @@ Guarantees:
   the same way.
 - **A bad configuration disables recording instead of raising.**
 
+### On-disk spool (opt-in)
+
+```python
+agentflight.configure("http://localhost:8000", spool_dir="/var/tmp/agentflight-spool")
+# or AGENTFLIGHT_SPOOL_DIR=/var/tmp/agentflight-spool
+```
+
+With a spool directory, spans that weren't stored because of a failure that may clear up
+(server down, transport error, timeout, 5xx, 408/425/429, rejected credentials, the
+attempt cap or the run span deadline) are written to disk, one file per failed batch,
+instead of being dropped. Every later export first sends what is spooled, oldest first,
+then its own batch; when a process restarts (or crashed), its first export sends what the
+last one left behind. Run spans are sent before the spool is replayed.
+
+- **Same rules as any export.** Replay shares the export's attempt cap
+  (`max_export_attempts`), is split on 413 like any batch, and stops at the first other
+  failure; what isn't sent stays on disk for the next export. A file that was partly sent
+  keeps only the spans still unsent, in its place in line. Spans the server rejects for
+  good (a single span over its body cap, other 4xx) are not spooled. The server upserts by
+  span id, so a span that is sent twice (the server stored it, but the response was lost)
+  is harmless.
+- **Bounded.** At most `spool_max_bytes` (`AGENTFLIGHT_SPOOL_MAX_BYTES`, default 64 MiB)
+  and 10,000 files; when a new batch doesn't fit, the oldest files are deleted. Files older
+  than `spool_max_age_s` (`AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS`, default 24 h) are deleted
+  unsent. A batch bigger than the whole spool isn't kept.
+- **Private.** The spool holds recorded payloads (after `redact`) in plain JSON. The
+  directory is created `0700` (an existing one you own is tightened to `0700`) and files
+  are created `0600`; a directory that is a symlink or belongs to another user is not used.
+- **Fail-open.** A full disk, a directory that can't be created or written, or a corrupt
+  file (deleted when found) loses those spans, logs one warning per kind of problem and
+  never raises. Files are written to a temporary name and renamed, so a crash mid-write
+  leaves no half file in line (stale temporary files are cleaned up after an hour).
+  `get_recorder().spool.dropped` counts the spans the spool gave up on.
+- **Never on the agent's thread.** Spool writes and replay run on the export threads
+  (the batch worker and the run-span lane). That's why it needs `batch=True`: with
+  `batch=False` the export runs on the agent's thread, so `spool_dir` is ignored with a
+  warning. It also only works with the built-in exporter.
+- **One process per directory is best.** Two processes sharing one spool can both send
+  the same file; that's safe (ingest is idempotent) but wasted work.
+
 Limitations (known, not yet handled):
 
-- **Lost spans.** If export fails, those spans are dropped. There's no retry, no disk
-  buffer and no dead-letter queue yet. If the server is unreachable, the run is simply
-  missing from the recording.
+- **Lost spans, unless you turn on the spool.** By default, spans whose export fails are
+  dropped, and if the server is unreachable the run is missing from the recording. With
+  the on-disk spool (below), failures that may clear up are retried on later exports;
+  without it there's no retry.
 - **The batch queue is bounded.** It holds 2048 finished spans by default; set it with
   `configure(max_queue_size=...)` or `AGENTFLIGHT_MAX_QUEUE_SIZE` (OpenTelemetry's
   `OTEL_BSP_MAX_QUEUE_SIZE` also works). When the queue is full, spans are dropped rather
@@ -619,12 +660,14 @@ over the cap on their own are dropped, with one warning per export.
 Splitting is capped at `max_export_attempts` HTTP requests per export (default `32`, set
 it with `configure(max_export_attempts=...)`), and the first failure that isn't a `413`
 (a timeout, a transport error, a 5xx, rejected credentials) stops the export: the halves
-not yet sent are dropped instead of being tried against a server that is already
-failing. Isolating one oversized span in a full 512-span batch takes 19 requests.
+not yet sent are dropped (or spooled, with the [on-disk spool](#on-disk-spool-opt-in))
+instead of being tried against a server that is already failing. Isolating one oversized span in a full 512-span batch takes 19 requests.
 
 Worst case for one export: a server that is down or hanging costs one `timeout` (5 s by
 default), since the first failure ends the export. Only a server that keeps answering
-`413` slowly can make an export take up to `max_export_attempts` × `timeout`. With
+`413` slowly can make an export take up to `max_export_attempts` × `timeout`. Replaying
+the spool is part of the same export and shares its attempt cap, so it doesn't change
+these bounds. With
 `batch=True` (the default) exports run on a background thread; `flush()` and
 `shutdown()` stop waiting at their own timeouts (see [Failure isolation](#failure-isolation)).
 With `batch=False` every span is exported on its own as it ends, so there is nothing to

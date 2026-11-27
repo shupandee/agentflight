@@ -33,6 +33,7 @@ from opentelemetry.trace import Span, Status, StatusCode
 
 from agentflight import attributes as A
 from agentflight._queue import DropCountingBatchProcessor
+from agentflight._spool import DEFAULT_SPOOL_MAX_AGE_SECONDS, DEFAULT_SPOOL_MAX_BYTES, Spool
 from agentflight.exporter import DEFAULT_MAX_ATTEMPTS, AgentFlightExporter
 
 logger = logging.getLogger("agentflight")
@@ -364,6 +365,13 @@ class Recorder:
         self.tracer = self.provider.get_tracer("agentflight")
 
     @property
+    def spool(self) -> Spool | None:
+        """The exporter's on-disk spool, if it has one (see ``configure(spool_dir=...)``)."""
+        exporter = getattr(self._queue, "_exporter", None)
+        spool = getattr(exporter, "spool", None)
+        return spool if isinstance(spool, Spool) else None
+
+    @property
     def dropped_spans(self) -> int:
         """Spans dropped because the export queue was full, since this recorder started."""
         return self._queue.dropped_total if self._queue is not None else 0
@@ -407,6 +415,9 @@ def configure(
     redact: Redactor | None = None,
     max_export_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_queue_size: int | None = None,
+    spool_dir: str | os.PathLike[str] | None = None,
+    spool_max_bytes: int | None = None,
+    spool_max_age_s: float | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
@@ -418,16 +429,28 @@ def configure(
     batches the server rejects as too large (413). ``max_queue_size`` is how many finished
     spans ``batch=True`` holds for export (default ``AGENTFLIGHT_MAX_QUEUE_SIZE``, else
     OpenTelemetry's ``OTEL_BSP_MAX_QUEUE_SIZE``, else 2048); spans beyond it are dropped.
+    ``spool_dir`` (default ``AGENTFLIGHT_SPOOL_DIR``; off when unset) keeps spans that
+    failed to export on disk and retries them on later exports, up to ``spool_max_bytes``
+    (``AGENTFLIGHT_SPOOL_MAX_BYTES``, 64 MiB) and ``spool_max_age_s``
+    (``AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS``, 24 h); it needs ``batch=True`` and the
+    built-in exporter.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
     _recorder.shutdown()
     try:
         key = api_key if api_key is not None else os.environ.get("AGENTFLIGHT_API_KEY")
+        spool = _make_spool(
+            spool_dir, spool_max_bytes, spool_max_age_s, batch=batch, custom=exporter is not None
+        )
         _recorder = Recorder(
             exporter
             or AgentFlightExporter(
-                endpoint, timeout=timeout, api_key=key, max_attempts=max_export_attempts
+                endpoint,
+                timeout=timeout,
+                api_key=key,
+                max_attempts=max_export_attempts,
+                spool=spool,
             ),
             batch=batch,
             max_attr_chars=max_attr_chars,
@@ -439,6 +462,31 @@ def configure(
         logger.warning("agentflight: configure failed; recording disabled", exc_info=True)
         _recorder = Recorder()
     return _recorder
+
+
+def _make_spool(
+    directory: str | os.PathLike[str] | None,
+    max_bytes: int | None,
+    max_age_s: float | None,
+    *,
+    batch: bool,
+    custom: bool,
+) -> Spool | None:
+    if directory is None:
+        directory = os.environ.get("AGENTFLIGHT_SPOOL_DIR") or None
+    if directory is None:
+        return None
+    if not batch or custom:
+        # batch=False exports on the agent's thread, and the spool must never run there.
+        logger.warning(
+            "agentflight: the spool needs batch=True and the built-in exporter; not spooling"
+        )
+        return None
+    if max_bytes is None:
+        max_bytes = _env_int("AGENTFLIGHT_SPOOL_MAX_BYTES") or DEFAULT_SPOOL_MAX_BYTES
+    if max_age_s is None:
+        max_age_s = _env_int("AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS") or DEFAULT_SPOOL_MAX_AGE_SECONDS
+    return Spool(directory, max_bytes=max_bytes, max_age_s=max_age_s)
 
 
 def get_recorder() -> Recorder:
