@@ -215,7 +215,11 @@ def test_viewer_needs_read_permission_only(engine: Engine) -> None:
     keys = parse_api_keys("viewer-key-0123456789abcdef0123456789:read")
     c = TestClient(create_app(engine, Settings(scoped_keys=keys)), follow_redirects=False)
     assert (
-        c.post("/ui/login", data={"key": "viewer-key-0123456789abcdef0123456789"}).status_code
+        c.post(
+            "/ui/login",
+            data={"key": "viewer-key-0123456789abcdef0123456789"},
+            headers={"Origin": "http://testserver"},
+        ).status_code
         == 303
     )
     assert c.get("/ui").status_code == 200

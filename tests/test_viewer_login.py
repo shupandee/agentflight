@@ -17,6 +17,7 @@ from agentflight.server.viewer.session import COOKIE_NAME, SessionSigner, derive
 from tests.conftest import TEST_KEY
 
 READ_KEY = "viewer-read-key-0123456789abcdef0123456789"
+SAME_ORIGIN = {"Origin": "http://testserver"}  # what a browser sends from the login page
 INGEST_KEY = "viewer-ingest-key-0123456789abcdef0123456789"
 SECRET = "s" * 40
 TEMPLATES = Path(__file__).resolve().parents[1] / "src/agentflight/server/viewer/templates"
@@ -38,7 +39,7 @@ def ui(engine: Engine) -> TestClient:
 
 
 def sign_in(c: TestClient, key: str = READ_KEY) -> str:
-    resp = c.post("/ui/login", data={"key": key})
+    resp = c.post("/ui/login", data={"key": key}, headers=SAME_ORIGIN)
     assert resp.status_code == 303, resp.text
     assert resp.headers["location"] == "/ui"
     return resp.headers["set-cookie"]
@@ -87,7 +88,7 @@ def test_cookie_is_secure_on_https_or_when_forced(engine: Engine, https: bool) -
     [("wrong", "is not valid"), (INGEST_KEY, "has no read permission"), ("", "is not valid")],
 )
 def test_bad_keys_are_refused(ui: TestClient, key: str, message: str) -> None:
-    resp = ui.post("/ui/login", data={"key": key})
+    resp = ui.post("/ui/login", data={"key": key}, headers=SAME_ORIGIN)
     assert resp.status_code == 401
     assert message in resp.text
     assert "set-cookie" not in resp.headers
@@ -139,10 +140,41 @@ def test_sessions_need_the_same_secret(engine: Engine) -> None:
 
 def test_sign_out_clears_the_cookie(ui: TestClient) -> None:
     sign_in(ui)
-    resp = ui.post("/ui/logout")
+    resp = ui.post("/ui/logout", headers=SAME_ORIGIN)
     assert (resp.status_code, resp.headers["location"]) == (303, "/ui/login")
     assert f'{COOKIE_NAME}=""' in resp.headers["set-cookie"]
     assert ui.get("/ui").status_code == 303
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},  # no Origin at all: fail closed
+        {"Origin": "null"},
+        {"Origin": ""},
+        {"Origin": "http://testserver.evil.test"},
+        {"Origin": "file://testserver"},
+        {"Referer": "http://testserver/ui/login"},  # Referer alone isn't enough
+    ],
+)
+def test_sign_in_without_a_matching_origin_is_refused(
+    ui: TestClient, headers: dict[str, str]
+) -> None:
+    resp = ui.post("/ui/login", data={"key": READ_KEY}, headers=headers)
+    assert resp.status_code == 403
+    assert "set-cookie" not in resp.headers
+
+
+def test_https_origin_behind_a_tls_proxy_is_accepted(ui: TestClient) -> None:
+    # TLS ends at the proxy, so the app sees http while the browser's Origin says https.
+    resp = ui.post("/ui/login", data={"key": READ_KEY}, headers={"Origin": "https://testserver"})
+    assert resp.status_code == 303
+
+
+def test_sign_out_without_origin_is_refused(ui: TestClient) -> None:
+    sign_in(ui)
+    assert ui.post("/ui/logout").status_code == 403
+    assert ui.get("/ui").status_code == 200
 
 
 def test_cross_origin_sign_in_is_refused(ui: TestClient) -> None:

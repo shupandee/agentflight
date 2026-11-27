@@ -39,7 +39,8 @@ can break a client is listed under **Behaviour changes**.
   read-only session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` on HTTPS). The
   signing secret is derived from the configured API keys (so it works across workers
   with no setup, and changing a key ends all sessions) unless
-  `AGENTFLIGHT_SESSION_SECRET` is set. Other new settings: `AGENTFLIGHT_SESSION_HOURS`,
+  `AGENTFLIGHT_SESSION_SECRET` is set. Sign-in and sign-out posts without a same-host
+  `Origin` header are refused. Other new settings: `AGENTFLIGHT_SESSION_HOURS`,
   `AGENTFLIGHT_COOKIE_SECURE`.
 - **Scoped API keys:** `AGENTFLIGHT_API_KEYS="<key>:ingest,<key>:read,<key>:read+delete"`
   next to the all-permission `AGENTFLIGHT_API_KEY`.

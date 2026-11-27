@@ -86,12 +86,19 @@ def require_viewer(request: Request) -> None:
 
 
 def _same_origin(request: Request) -> bool:
+    """CSRF check for the sign-in and sign-out posts. Fails closed.
+
+    Current browsers send ``Origin`` on every form POST, same-origin ones included, so a
+    request without it (or with ``Origin: null``, e.g. from a sandboxed frame or a
+    ``no-referrer`` page) is refused rather than trusted. A proxy in front must pass the
+    original ``Host`` through.
+    """
     origin = request.headers.get("origin")
-    if origin is None or origin == "null":
-        # Browsers send Origin on cross-site POSTs; a missing one is a same-origin form or
-        # a non-browser client, which can't ride on a victim's cookie anyway.
-        return origin is None
-    return urlparse(origin).netloc == request.headers.get("host")
+    host = request.headers.get("host")
+    if not origin or origin == "null" or not host:
+        return False
+    parsed = urlparse(origin)
+    return parsed.scheme in ("http", "https") and parsed.netloc == host
 
 
 router = APIRouter(prefix="/ui", include_in_schema=False)

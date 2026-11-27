@@ -458,7 +458,9 @@ works too) and then keeps a **signed session** in a cookie:
   set `AGENTFLIGHT_COOKIE_SECURE=true`).
 - Sessions are **read-only**. The `/v1` API never accepts the cookie, and the viewer has
   no delete or ingest actions.
-- Cross-origin sign-in and sign-out posts are refused.
+- Sign-in and sign-out posts must carry an `Origin` header whose host matches `Host`;
+  a cross-site, `null` or **missing** `Origin` gets `403` (current browsers always send
+  it on form posts). A reverse proxy must pass the original `Host` through.
 - With `AGENTFLIGHT_AUTH_DISABLED=true` there is no sign-in page.
 - By default the signing secret is an HMAC of all configured API keys, so every worker
   and replica with the same keys accepts the same sessions and restarts don't sign anyone
