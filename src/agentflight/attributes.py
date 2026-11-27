@@ -31,6 +31,11 @@ STATE_KEY = "agentflight.state.key"
 STATE_OLD = "agentflight.state.old"
 STATE_NEW = "agentflight.state.new"
 
+NODE_NAME = "agentflight.node.name"
+NODE_STEP = "agentflight.node.step"
+NODE_INPUT = "agentflight.node.input"
+NODE_OUTPUT = "agentflight.node.output"
+
 ERROR_TYPE = "agentflight.error.type"
 ERROR_MESSAGE = "agentflight.error.message"
 # Same id on every event caused by one underlying exception (tool span, agent log, run).
@@ -46,3 +51,4 @@ TOOL = "tool"
 DECISION = "decision"
 STATE = "state"
 ERROR = "error"
+NODE = "node"  # a graph or graph node (LangGraph)
