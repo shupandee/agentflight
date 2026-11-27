@@ -6,8 +6,10 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 
 ## 0.1.0 (not yet released; dated when it is tagged)
 
-The first release on PyPI: `pip install agentflight` for the SDK,
-`pip install "agentflight[server]"` for the server and viewer. It contains everything
+The first release on PyPI, as **`agentflight-sdk`** (the name `agentflight` is too close
+to an existing PyPI project): `pip install agentflight-sdk` for the SDK,
+`pip install "agentflight-sdk[server]"` for the server and viewer. The import name is
+still `agentflight`. It contains everything
 below (weeks 1-7) plus the changes in this section.
 
 ### HTTP API versioning
@@ -41,10 +43,11 @@ changes.
   now has classifiers, keywords, project URLs and the license file; README links and
   images are absolute so they work on PyPI; the sdist holds the source, tests, examples
   and scripts only.
-- **Release workflow** (`.github/workflows/release.yml`): pushing a tag `v*` builds the
-  sdist and wheel, checks the tag matches the version, runs `twine check --strict`,
-  smoke-tests the wheel in a clean venv (`scripts/smoke_installed.py`) and publishes to
-  PyPI with Trusted Publishing (environment `pypi`, no stored token).
+- **Release workflow** (`.github/workflows/release.yml`): pushing a tag `v*` runs the
+  full CI suite (`ci.yml`, reused), then builds the sdist and wheel, checks the tag
+  matches the version, runs `twine check --strict`, smoke-tests the wheel in a clean venv
+  (`scripts/smoke_installed.py`) and only then publishes to PyPI as `agentflight-sdk` with
+  Trusted Publishing (environment `pypi`, no stored token).
 
 ### Added
 

@@ -1,4 +1,5 @@
-# Publishes to PyPI when a version tag (v*) is pushed, using PyPI Trusted Publishing:
+# Publishes agentflight-sdk to PyPI when a version tag (v*) is pushed, only after the
+# full CI suite passes, using PyPI Trusted Publishing:
 # PyPI trusts this workflow's OIDC token, so no API token is stored anywhere. The
 # publisher must be registered on PyPI first (repository shupandee/agentflight, workflow
 # release.yml, environment pypi).
@@ -11,7 +12,13 @@ on:
 permissions: {}
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/agentflight
+      url: https://pypi.org/p/agentflight-sdk
     permissions:
       id-token: write  # Trusted Publishing; nothing else
     steps:

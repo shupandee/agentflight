@@ -1,6 +1,6 @@
 """LangGraph instrumentation through LangChain callbacks.
 
-Needs ``langchain-core`` (installed with ``langgraph``; ``pip install agentflight[langgraph]``).
+Needs ``langchain-core`` (installed with ``langgraph``; ``pip install agentflight-sdk[langgraph]``).
 Pass the handler in the run config; nothing in your graph changes::
 
     from agentflight.integrations.langgraph import AgentFlightCallbackHandler

@@ -1,6 +1,6 @@
 """Smoke test for an installed AgentFlight (e.g. a freshly built wheel in a clean venv).
 
-Run it from outside the source tree, with ``agentflight[server]`` installed::
+Run it from outside the source tree, with ``agentflight-sdk[server]`` installed::
 
     python scripts/smoke_installed.py
 
@@ -54,7 +54,8 @@ def main() -> int:
 
     here = Path(agentflight.__file__).resolve().parent
     check("site-packages" in str(here), f"agentflight imported from an install ({here})")
-    check(agentflight.__version__ == metadata.version("agentflight"), "version matches metadata")
+    dist = metadata.version("agentflight-sdk")
+    check(agentflight.__version__ == dist, "version matches the agentflight-sdk metadata")
     print(f"   version {agentflight.__version__}")
     server = resources.files("agentflight.server")
     for path in (

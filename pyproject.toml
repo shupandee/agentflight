@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentflight"
+name = "agentflight-sdk"
 dynamic = ["version"]
 description = "Black box recorder for AI agents: record, replay and debug agent runs"
 readme = "README.md"
@@ -54,7 +54,7 @@ server = [
 openai = ["openai>=1.0"]
 langgraph = ["langgraph>=1.0"]
 dev = [
-    "agentflight[server,openai,langgraph]",
+    "agentflight-sdk[server,openai,langgraph]",
     "pytest>=8.0",
     "ruff>=0.5",
     "mypy>=1.10",

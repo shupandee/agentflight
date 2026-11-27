@@ -63,13 +63,14 @@ export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)
 docker compose up --build
 
 # or without Docker, using SQLite (from a checkout; once 0.1.0 is on PyPI,
-# `pip install "agentflight[server]"` works too):
+# `pip install "agentflight-sdk[server]"` works too):
 pip install -e ".[server]"
 agentflight-server migrate      # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
 agentflight-server serve        # http://127.0.0.1:8000
 
 # 2. Record the toy agent (the SDK reads AGENTFLIGHT_API_KEY)
-pip install -e .
+pip install -e .                # or, once 0.1.0 is on PyPI: pip install agentflight-sdk
+                                # (the package is agentflight-sdk; you import agentflight)
 python examples/toy_agent.py
 
 # 3. Inspect: open http://localhost:8000/ui and sign in with the key, or use the API
@@ -152,7 +153,7 @@ Optional extras; the core SDK depends on neither package.
 ### OpenAI-style chat clients
 
 ```bash
-pip install "agentflight[openai]"
+pip install "agentflight-sdk[openai]"
 ```
 
 ```python
@@ -183,7 +184,7 @@ with agentflight.run("support-agent"):
 ### LangGraph
 
 ```bash
-pip install "agentflight[langgraph]"
+pip install "agentflight-sdk[langgraph]"
 ```
 
 ```python

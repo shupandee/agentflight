@@ -353,7 +353,7 @@ def machine_info() -> list[str]:
                 virt = f", VM ({line.split(':', 1)[1].strip()})"
     versions = ", ".join(
         f"{p} {metadata.version(p)}"
-        for p in ("agentflight", "opentelemetry-sdk", "httpx", "fastapi", "uvicorn")
+        for p in ("agentflight-sdk", "opentelemetry-sdk", "httpx", "fastapi", "uvicorn")
     )
     return [
         f"- Machine: {platform.system()} {platform.release()} ({platform.machine()}), {cpu}, "
