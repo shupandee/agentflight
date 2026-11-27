@@ -366,6 +366,17 @@ Limitations (known, not yet handled):
   `OTEL_BSP_MAX_QUEUE_SIZE` also works). When the queue is full, spans are dropped rather
   than blocking the agent. A bigger queue absorbs longer bursts at the cost of memory
   (each queued span holds its payloads, up to `max_attr_chars` each).
+- **Dropped spans are counted, on a best-effort basis.** AgentFlight checks the queue
+  itself before handing a span to OpenTelemetry, so it knows every span it drops (on its
+  own, OpenTelemetry 1.45 drops the *oldest* queued span, which can belong to another
+  run). When a run ends, the spans of that run dropped so far go on the run span as
+  `agentflight.run.dropped_spans`, and the viewer and replay warn about it. A few queue
+  slots are kept for run spans so the span carrying the count is rarely the one dropped.
+  What this can't cover: spans of the run that end *after* the run span (background
+  threads or tasks still running), a run span that is itself dropped, and spans lost
+  later in export (server down, see "Lost spans"). Those are only in the recorder's
+  total, `agentflight.get_recorder().dropped_spans`, and a warning is logged on the first
+  drop. `batch=False` has no queue and never drops this way.
 - **`batch=False` blocks.** It exports inside the agent's thread, so each span can block
   for up to the HTTP timeout. Use it only for tests or debugging.
 - **A partly broken span processor can mis-parent later spans.** If a processor fails while

@@ -26,13 +26,13 @@ from typing import Any, ParamSpec, TypeVar, overload
 from opentelemetry import trace
 from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import (
-    BatchSpanProcessor,
     SimpleSpanProcessor,
     SpanExporter,
 )
 from opentelemetry.trace import Span, Status, StatusCode
 
 from agentflight import attributes as A
+from agentflight._queue import DropCountingBatchProcessor
 from agentflight.exporter import DEFAULT_MAX_ATTEMPTS, AgentFlightExporter
 
 logger = logging.getLogger("agentflight")
@@ -343,21 +343,39 @@ class Recorder:
         self.max_attr_chars = max_attr_chars
         self.redact = redact
         self.max_queue_size = resolve_queue_size(max_queue_size)
+        self._queue: DropCountingBatchProcessor | None = None
         # OTel's own atexit hook would let exporter errors escape at interpreter exit;
         # we register a fail-safe one instead.
         self.provider = TracerProvider(shutdown_on_exit=False)
         if exporter is not None:
             processor: SpanProcessor
             if batch:
-                processor = BatchSpanProcessor(
+                self._queue = DropCountingBatchProcessor(
                     exporter,
                     max_queue_size=self.max_queue_size,
                     max_export_batch_size=min(_export_batch_size(), self.max_queue_size),
                 )
+                processor = self._queue
             else:
                 processor = SimpleSpanProcessor(exporter)
             self.provider.add_span_processor(processor)
         self.tracer = self.provider.get_tracer("agentflight")
+
+    @property
+    def dropped_spans(self) -> int:
+        """Spans dropped because the export queue was full, since this recorder started."""
+        return self._queue.dropped_total if self._queue is not None else 0
+
+    def open_run(self, span: Span) -> None:
+        if self._queue is not None:
+            self._queue.open_run(span.get_span_context().trace_id)
+
+    def close_run(self, span: Span) -> None:
+        """Record on the run span how many of its spans were dropped (before it ends)."""
+        if self._queue is not None:
+            dropped = self._queue.close_run(span.get_span_context().trace_id)
+            if dropped:
+                span.set_attribute(A.RUN_DROPPED_SPANS, dropped)
 
     def flush(self, timeout_millis: int = 30_000) -> bool:
         return bool(_bounded(self.provider.force_flush, timeout_millis, timeout_millis))
@@ -519,6 +537,8 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
         return out
 
     with _span(f"run:{name}", attrs, new_trace=True) as span:
+        recorder = _recorder
+        _safe(recorder.open_run, span)
         session = _replay_session.get()
         if session is not None:
             _safe(session.bind_run, span)
@@ -527,6 +547,8 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
         finally:
             if session is not None:
                 _safe(session.unbind_run, span)
+            # Before the run span ends, so the count travels with it.
+            _safe(recorder.close_run, span)
 
 
 @dataclass

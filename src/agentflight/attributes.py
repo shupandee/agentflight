@@ -7,6 +7,9 @@ PREFIX = "agentflight."
 KIND = "agentflight.kind"
 RUN_NAME = "agentflight.run.name"
 RUN_METADATA = "agentflight.run.metadata"
+# On the run span: spans of this run the SDK dropped because its export queue was full,
+# counted up to the moment the run ended (best effort; see the README).
+RUN_DROPPED_SPANS = "agentflight.run.dropped_spans"
 
 LLM_MODEL = "agentflight.llm.model"
 LLM_MESSAGES = "agentflight.llm.messages"

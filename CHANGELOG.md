@@ -11,6 +11,11 @@ can break a client is listed under **Behaviour changes**.
 - **Configurable batch queue:** `configure(max_queue_size=...)` or
   `AGENTFLIGHT_MAX_QUEUE_SIZE` (then OpenTelemetry's `OTEL_BSP_MAX_QUEUE_SIZE`), passed
   to the batch span processor. The default is unchanged (2048).
+- **Dropped spans are counted.** The SDK refuses spans itself when the queue is full
+  (instead of OpenTelemetry silently dropping the oldest queued span), counts them, and
+  records each run's count on its run span (`agentflight.run.dropped_spans`, best effort:
+  spans dropped after the run span ended can't be on it). The total is
+  `get_recorder().dropped_spans`.
 
 ### Changed
 
