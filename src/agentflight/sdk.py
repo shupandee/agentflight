@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 import uuid
@@ -23,15 +24,15 @@ from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import (
-    BatchSpanProcessor,
     SimpleSpanProcessor,
     SpanExporter,
 )
 from opentelemetry.trace import Span, Status, StatusCode
 
 from agentflight import attributes as A
+from agentflight._queue import DropCountingBatchProcessor
 from agentflight.exporter import DEFAULT_MAX_ATTEMPTS, AgentFlightExporter
 
 logger = logging.getLogger("agentflight")
@@ -57,6 +58,29 @@ def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     except Exception:
         logger.warning("agentflight: instrumentation error (ignored)", exc_info=True)
         return None
+
+
+DEFAULT_SHUTDOWN_MILLIS = 30_000
+
+
+def _bounded(fn: Callable[..., Any], timeout_millis: float, *args: Any) -> Any:
+    """Run ``fn`` (fail-safe) and wait at most ``timeout_millis`` for it.
+
+    OpenTelemetry's own flush and shutdown timeouts aren't reliable across versions (1.45's
+    ``force_flush`` ignores its timeout and exports the whole queue), so the wait is bounded
+    here. If time runs out, ``fn`` keeps going on a daemon thread and None is returned.
+    """
+    result: list[Any] = []
+    worker = threading.Thread(
+        target=lambda: result.append(_safe(fn, *args)), name="agentflight-wait", daemon=True
+    )
+    try:
+        worker.start()
+        worker.join(max(0.0, timeout_millis / 1000))
+    except Exception:
+        logger.warning("agentflight: could not wait for %r (ignored)", fn, exc_info=True)
+        return None
+    return result[0] if result else None
 
 
 def _safe_repr(value: Any) -> str:
@@ -268,6 +292,42 @@ def _record_error(span: Span, exc: BaseException) -> None:
     span.set_status(Status(StatusCode.ERROR, f"{error_type}: {message}"))
 
 
+DEFAULT_MAX_QUEUE_SIZE = 2048  # OpenTelemetry's default for the batch span processor
+_DEFAULT_EXPORT_BATCH = 512
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("agentflight: ignoring %s=%r (not a positive integer)", name, raw)
+        return None
+    return value
+
+
+def resolve_queue_size(max_queue_size: int | None = None) -> int:
+    """The batch queue size: the argument, else ``AGENTFLIGHT_MAX_QUEUE_SIZE``, else
+    OpenTelemetry's ``OTEL_BSP_MAX_QUEUE_SIZE``, else 2048."""
+    if max_queue_size is not None:
+        if max_queue_size < 1:
+            raise ValueError("max_queue_size must be at least 1")
+        return max_queue_size
+    return (
+        _env_int("AGENTFLIGHT_MAX_QUEUE_SIZE")
+        or _env_int("OTEL_BSP_MAX_QUEUE_SIZE")
+        or DEFAULT_MAX_QUEUE_SIZE
+    )
+
+
+def _export_batch_size() -> int:
+    return _env_int("OTEL_BSP_MAX_EXPORT_BATCH_SIZE") or _DEFAULT_EXPORT_BATCH
+
+
 class Recorder:
     """Owns a private TracerProvider so AgentFlight never clobbers app-wide OTel config."""
 
@@ -278,22 +338,50 @@ class Recorder:
         batch: bool = True,
         max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
         redact: Redactor | None = None,
+        max_queue_size: int | None = None,
     ) -> None:
         self.max_attr_chars = max_attr_chars
         self.redact = redact
+        self.max_queue_size = resolve_queue_size(max_queue_size)
+        self._queue: DropCountingBatchProcessor | None = None
         # OTel's own atexit hook would let exporter errors escape at interpreter exit;
         # we register a fail-safe one instead.
         self.provider = TracerProvider(shutdown_on_exit=False)
         if exporter is not None:
-            processor = BatchSpanProcessor(exporter) if batch else SimpleSpanProcessor(exporter)
+            processor: SpanProcessor
+            if batch:
+                self._queue = DropCountingBatchProcessor(
+                    exporter,
+                    max_queue_size=self.max_queue_size,
+                    max_export_batch_size=min(_export_batch_size(), self.max_queue_size),
+                )
+                processor = self._queue
+            else:
+                processor = SimpleSpanProcessor(exporter)
             self.provider.add_span_processor(processor)
         self.tracer = self.provider.get_tracer("agentflight")
 
-    def flush(self, timeout_millis: int = 30_000) -> bool:
-        return bool(_safe(self.provider.force_flush, timeout_millis))
+    @property
+    def dropped_spans(self) -> int:
+        """Spans dropped because the export queue was full, since this recorder started."""
+        return self._queue.dropped_total if self._queue is not None else 0
 
-    def shutdown(self) -> None:
-        _safe(self.provider.shutdown)
+    def open_run(self, span: Span) -> None:
+        if self._queue is not None:
+            self._queue.open_run(span.get_span_context().trace_id)
+
+    def close_run(self, span: Span) -> None:
+        """Record on the run span how many of its spans were dropped (before it ends)."""
+        if self._queue is not None:
+            dropped = self._queue.close_run(span.get_span_context().trace_id)
+            if dropped:
+                span.set_attribute(A.RUN_DROPPED_SPANS, dropped)
+
+    def flush(self, timeout_millis: int = 30_000) -> bool:
+        return bool(_bounded(self.provider.force_flush, timeout_millis, timeout_millis))
+
+    def shutdown(self, timeout_millis: int = DEFAULT_SHUTDOWN_MILLIS) -> None:
+        _bounded(self.provider.shutdown, timeout_millis)
 
 
 _recorder: Recorder = Recorder()
@@ -316,6 +404,7 @@ def configure(
     max_attr_chars: int | None = DEFAULT_MAX_ATTR_CHARS,
     redact: Redactor | None = None,
     max_export_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_queue_size: int | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
@@ -324,7 +413,9 @@ def configure(
     is recorded in ``agentflight.truncated``. ``redact(key, value)`` runs on every payload
     before it is serialized; if it raises, the value is replaced with a placeholder.
     ``max_export_attempts`` caps the HTTP requests one export makes while splitting
-    batches the server rejects as too large (413).
+    batches the server rejects as too large (413). ``max_queue_size`` is how many finished
+    spans ``batch=True`` holds for export (default ``AGENTFLIGHT_MAX_QUEUE_SIZE``, else
+    OpenTelemetry's ``OTEL_BSP_MAX_QUEUE_SIZE``, else 2048); spans beyond it are dropped.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
@@ -339,6 +430,7 @@ def configure(
             batch=batch,
             max_attr_chars=max_attr_chars,
             redact=redact,
+            max_queue_size=max_queue_size,
         )
     except Exception:
         logger.warning("agentflight: configure failed; recording disabled", exc_info=True)
@@ -351,12 +443,16 @@ def get_recorder() -> Recorder:
 
 
 def flush(timeout_millis: int = 30_000) -> bool:
-    """Wait (at most ``timeout_millis``) for finished spans to be exported. Never raises."""
+    """Wait at most ``timeout_millis`` for finished spans to be exported. Never raises.
+
+    Returns False if the wait ran out (export goes on in the background) or failed.
+    """
     return _recorder.flush(timeout_millis)
 
 
-def shutdown() -> None:
-    _recorder.shutdown()
+def shutdown(timeout_millis: int = DEFAULT_SHUTDOWN_MILLIS) -> None:
+    """Export what is queued and stop, waiting at most ``timeout_millis``. Never raises."""
+    _recorder.shutdown(timeout_millis)
 
 
 @contextmanager
@@ -441,6 +537,8 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
         return out
 
     with _span(f"run:{name}", attrs, new_trace=True) as span:
+        recorder = _recorder
+        _safe(recorder.open_run, span)
         session = _replay_session.get()
         if session is not None:
             _safe(session.bind_run, span)
@@ -449,6 +547,8 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
         finally:
             if session is not None:
                 _safe(session.unbind_run, span)
+            # Before the run span ends, so the count travels with it.
+            _safe(recorder.close_run, span)
 
 
 @dataclass

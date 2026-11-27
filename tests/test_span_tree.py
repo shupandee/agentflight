@@ -131,3 +131,37 @@ def test_tree_names_stay_escaped(engine: Engine) -> None:
     assert c.post("/v1/spans", json={"spans": spans}).status_code == 202
     page = c.get(f"/ui/runs/{T}")
     assert xss not in page.text and "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
+
+
+def test_span_with_a_missing_parent_is_shown_with_its_children(engine: Engine) -> None:
+    c = TestClient(create_app(engine, Settings(auth_disabled=True)), follow_redirects=False)
+    spans = [
+        span("run", "0", None, 0, attributes={"agentflight.kind": "run"}),
+        span("child-of-missing", "1", "9", 5),  # its parent never arrived
+        span("grandchild", "2", "1", 6),
+        span("normal", "3", "0", 7),
+    ]
+    assert c.post("/v1/spans", json={"spans": spans}).status_code == 202
+    rows = _rows(c.get(f"/ui/runs/{T}").text)
+    # Shown, at the left, with its own subtree nested under it.
+    assert rows == [("run", 0), ("normal", 1), ("child-of-missing", 0), ("grandchild", 1)]
+
+
+def test_child_on_a_later_page_than_its_parent_keeps_its_depth(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(routes, "EVENTS_PAGE", 2)
+    c = TestClient(create_app(engine, Settings(auth_disabled=True)), follow_redirects=False)
+    spans = [
+        span("run", "0", None, 0, attributes={"agentflight.kind": "run"}),
+        span("parent", "1", "0", 1),
+        span("child", "2", "1", 2),
+        span("grandchild", "3", "2", 3),
+    ]
+    assert c.post("/v1/spans", json={"spans": spans}).status_code == 202
+    first = _rows(c.get(f"/ui/runs/{T}").text)
+    assert first == [("run", 0), ("parent", 1)]
+    more = c.get(f"/ui/runs/{T}/events", params={"offset": 2})
+    # The parent is on page 1; its child and grandchild on page 2 keep their depths.
+    assert _rows(more.text) == [("child", 2), ("grandchild", 3)]
+    assert more.text.count('class="elbow"') == 2

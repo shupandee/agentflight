@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -53,6 +54,18 @@ DEFAULT_MAX_ATTEMPTS = 32
 with 413. Isolating one oversized span in a 512-span batch takes 19."""
 
 
+@dataclass
+class _ExportState:
+    """Shared by the requests of one ``export()`` call."""
+
+    remaining: int
+    aborted: str | None = None
+
+    def abort(self, reason: str) -> str:
+        self.aborted = reason
+        return reason
+
+
 class AgentFlightExporter(SpanExporter):
     """POSTs batches of spans as JSON to ``{endpoint}/v1/spans``.
 
@@ -61,8 +74,9 @@ class AgentFlightExporter(SpanExporter):
 
     If the server answers ``413`` (batch over its body cap), the batch is split in half
     and each half retried, so only spans that are too big on their own are dropped. One
-    ``export()`` makes at most ``max_attempts`` requests; what is left unsent when they
-    run out is dropped. Each export that drops spans logs one warning.
+    ``export()`` makes at most ``max_attempts`` requests, and stops at the first failure
+    that isn't a 413; what is left unsent is dropped. Each export that drops spans logs one
+    warning.
 
     An ``httpx.Client`` can be injected (useful for tests or custom auth/TLS).
     """
@@ -95,8 +109,8 @@ class AgentFlightExporter(SpanExporter):
         # Never raise: OTel processors log exporter exceptions, but a custom processor might
         # not, and export failures must never reach agent code.
         try:
-            attempts = [self._max_attempts]
-            dropped, reason = self._send(list(spans), attempts)
+            state = _ExportState(remaining=self._max_attempts)
+            dropped, reason = self._send(list(spans), state)
         except Exception as exc:
             logger.warning("agentflight: failed to export %d spans: %r", len(spans), exc)
             return SpanExportResult.FAILURE
@@ -108,20 +122,24 @@ class AgentFlightExporter(SpanExporter):
             )
         return SpanExportResult.FAILURE
 
-    def _send(self, spans: list[ReadableSpan], attempts: list[int]) -> tuple[int, str | None]:
+    def _send(self, spans: list[ReadableSpan], state: _ExportState) -> tuple[int, str | None]:
         """POST ``spans``, splitting on 413.
 
         Returns (spans dropped, why): ``why`` is None on success and ``""`` when the failure
-        was already logged.
+        was already logged. The first failure other than 413 (timeout, transport error,
+        5xx, credentials, ...) aborts the rest of the export: the halves still waiting are
+        dropped without being sent, since they would most likely fail the same way.
         """
-        if attempts[0] <= 0:
+        if state.aborted is not None:
+            return len(spans), state.aborted
+        if state.remaining <= 0:
             return len(spans), f"gave up after {self._max_attempts} requests"
-        attempts[0] -= 1
+        state.remaining -= 1
         try:
             payload = {"spans": [span_to_dict(s) for s in spans]}
             response = self._client.post(self._url, json=payload, headers=self._headers)
         except Exception as exc:
-            return len(spans), repr(exc)
+            return len(spans), state.abort(repr(exc))
         if response.status_code in (401, 403):
             if not self._auth_warned:
                 self._auth_warned = True
@@ -130,18 +148,18 @@ class AgentFlightExporter(SpanExporter):
                     "dropped. Check AGENTFLIGHT_API_KEY.",
                     response.status_code,
                 )
-            return len(spans), ""
+            return len(spans), state.abort("")
         if response.status_code == 413:
             if len(spans) == 1:
                 return 1, "span is larger than the server's body cap (HTTP 413)"
             half = len(spans) // 2
-            first, why_first = self._send(spans[:half], attempts)
-            second, why_second = self._send(spans[half:], attempts)
+            first, why_first = self._send(spans[:half], state)
+            second, why_second = self._send(spans[half:], state)
             return first + second, why_first if why_first is not None else why_second
         try:
             response.raise_for_status()
         except Exception as exc:
-            return len(spans), repr(exc)
+            return len(spans), state.abort(repr(exc))
         return 0, None
 
     def shutdown(self) -> None:

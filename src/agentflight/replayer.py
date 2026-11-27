@@ -134,6 +134,29 @@ class Recording:
     steps: list[Step]
     run: dict[str, Any] = field(repr=False)
 
+    @property
+    def dropped_spans(self) -> int:
+        """Spans the recorder reported dropping before the run ended (0 if none).
+
+        Read from the run summary, or from the run span for documents saved by older
+        servers. Best effort: drops after the run ended aren't known.
+        """
+        value = self.run.get("dropped_spans")
+        if value is None:
+            for event in self.run.get("events") or []:
+                if (event.get("attributes") or {}).get(A.KIND) == A.RUN:
+                    value = (event.get("attributes") or {}).get(A.RUN_DROPPED_SPANS)
+                    break
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def incomplete(self) -> bool:
+        """True when spans of this run were dropped, so steps may be missing."""
+        return self.dropped_spans > 0
+
     @classmethod
     def from_run(cls, run: dict[str, Any]) -> Recording:
         try:
@@ -208,6 +231,15 @@ class ReplaySession:
             raise ValueError(f"on_divergence must be 'raise' or 'live', not {on_divergence!r}")
         self.recording = recording
         self.on_divergence = on_divergence
+        if recording.incomplete:
+            # Said up front: missing steps show up later as divergences or live calls.
+            logger.warning(
+                "agentflight: run %s is an incomplete recording (%d spans dropped by the "
+                "recorder); steps may be missing, so this %s can diverge or run calls live",
+                recording.run_id,
+                recording.dropped_spans,
+                self.mode,
+            )
         self.cursor = 0  # number of model/tool calls seen so far
         # With on_divergence="live": the first step that didn't match, and why.
         self.diverged_at: int | None = None

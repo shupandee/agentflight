@@ -98,3 +98,7 @@ tr.more td { text-align: center; }
 .tree.d10 { padding-left: 162px; }
 .tree.d11 { padding-left: 180px; }
 .tree.d12 { padding-left: 198px; }
+
+/* A run the recorder couldn't fully record (spans dropped from a full export queue). */
+.incomplete { color: #8a4b00; background: #fff4e5; border: 1px solid #ffd8a8; border-radius: 4px; padding: 2px 6px; font-size: 12.5px; display: inline-block; margin-top: 3px; }
+p.incomplete { display: block; padding: 6px 10px; margin: 10px 0 0; }

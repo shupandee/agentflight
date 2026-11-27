@@ -1,0 +1,263 @@
+{
+  "machine": [
+    "- Machine: Linux 6.12.113+ (x86_64), Intel(R) Xeon(R) Processor, 8 CPUs, VM (KVM)",
+    "- Python: CPython 3.13.5",
+    "- Packages: agentflight 0.1.0.dev0, opentelemetry-sdk 1.45.2, httpx 0.29.0, fastapi 0.165.0, uvicorn 0.54.0"
+  ],
+  "repeats": 5,
+  "runs": 2000,
+  "sync_runs": 200,
+  "warmup": 200,
+  "spans_per_run": 11,
+  "rows": [
+    {
+      "payload": "small (~100 chars)",
+      "scenario": "baseline",
+      "median_us": 0.696,
+      "repeat_medians_us": [
+        0.716,
+        0.777,
+        0.696,
+        0.683,
+        0.693
+      ],
+      "p95_us": 0.742,
+      "added_per_span_us": null,
+      "spans_sent": 0,
+      "spans_stored": null,
+      "sdk_dropped": null,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "small (~100 chars)",
+      "scenario": "sdk, no exporter",
+      "median_us": 380.2665,
+      "repeat_medians_us": [
+        373.399,
+        380.767,
+        384.0365,
+        379.93,
+        380.2665
+      ],
+      "p95_us": 390.28884999999997,
+      "added_per_span_us": 34.50640909090909,
+      "spans_sent": 0,
+      "spans_stored": null,
+      "sdk_dropped": null,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "small (~100 chars)",
+      "scenario": "sdk, serialize only",
+      "median_us": 524.5665,
+      "repeat_medians_us": [
+        518.0295,
+        533.3765,
+        530.596,
+        524.5665,
+        523.832
+      ],
+      "p95_us": 539.4249,
+      "added_per_span_us": 47.624590909090905,
+      "spans_sent": 0,
+      "spans_stored": null,
+      "sdk_dropped": null,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "small (~100 chars)",
+      "scenario": "sdk, HTTP, batch=True, queue drained every 100 runs",
+      "median_us": 409.7725,
+      "repeat_medians_us": [
+        403.7645,
+        417.343,
+        409.7725,
+        407.9715,
+        410.161
+      ],
+      "p95_us": 542.4618,
+      "added_per_span_us": 37.18877272727272,
+      "spans_sent": 121000,
+      "spans_stored": 121000,
+      "sdk_dropped": 0,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "small (~100 chars)",
+      "scenario": "sdk, HTTP, batch=True, unpaced",
+      "median_us": 406.0305,
+      "repeat_medians_us": [
+        402.487,
+        407.3775,
+        405.8045,
+        406.0305,
+        407.172
+      ],
+      "p95_us": 480.3687,
+      "added_per_span_us": 36.84859090909091,
+      "spans_sent": 121000,
+      "spans_stored": 59828,
+      "sdk_dropped": 61172,
+      "dropped_on_runs": 41966
+    },
+    {
+      "payload": "small (~100 chars)",
+      "scenario": "sdk, HTTP, batch=False",
+      "median_us": 60948.5215,
+      "repeat_medians_us": [
+        61806.577,
+        59740.4305,
+        57785.896,
+        62716.999,
+        60948.5215
+      ],
+      "p95_us": 68115.0034,
+      "added_per_span_us": 5540.711409090909,
+      "spans_sent": 12100,
+      "spans_stored": 12100,
+      "sdk_dropped": 0,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "large (8,000 chars)",
+      "scenario": "baseline",
+      "median_us": 1.463,
+      "repeat_medians_us": [
+        1.4515,
+        1.529,
+        1.444,
+        1.488,
+        1.463
+      ],
+      "p95_us": 1.54695,
+      "added_per_span_us": null,
+      "spans_sent": 0,
+      "spans_stored": null,
+      "sdk_dropped": null,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "large (8,000 chars)",
+      "scenario": "sdk, no exporter",
+      "median_us": 825.1405,
+      "repeat_medians_us": [
+        815.347,
+        825.319,
+        825.2625,
+        825.1405,
+        822.4225
+      ],
+      "p95_us": 838.11175,
+      "added_per_span_us": 74.87977272727272,
+      "spans_sent": 0,
+      "spans_stored": null,
+      "sdk_dropped": null,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "large (8,000 chars)",
+      "scenario": "sdk, serialize only",
+      "median_us": 1217.7705,
+      "repeat_medians_us": [
+        1215.5575,
+        1221.985,
+        1217.7705,
+        1217.3335,
+        1217.7845
+      ],
+      "p95_us": 1237.3869,
+      "added_per_span_us": 110.5734090909091,
+      "spans_sent": 0,
+      "spans_stored": null,
+      "sdk_dropped": null,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "large (8,000 chars)",
+      "scenario": "sdk, HTTP, batch=True, queue drained every 100 runs",
+      "median_us": 853.1785,
+      "repeat_medians_us": [
+        851.425,
+        855.132,
+        862.454,
+        853.1785,
+        851.0985
+      ],
+      "p95_us": 1009.0595,
+      "added_per_span_us": 77.42868181818181,
+      "spans_sent": 121000,
+      "spans_stored": 121000,
+      "sdk_dropped": 0,
+      "dropped_on_runs": 0
+    },
+    {
+      "payload": "large (8,000 chars)",
+      "scenario": "sdk, HTTP, batch=True, unpaced",
+      "median_us": 850.0985,
+      "repeat_medians_us": [
+        851.2285,
+        850.0985,
+        875.647,
+        847.3955,
+        849.717
+      ],
+      "p95_us": 1003.02665,
+      "added_per_span_us": 77.14868181818181,
+      "spans_sent": 121000,
+      "spans_stored": 58118,
+      "sdk_dropped": 62882,
+      "dropped_on_runs": 41080
+    },
+    {
+      "payload": "large (8,000 chars)",
+      "scenario": "sdk, HTTP, batch=False",
+      "median_us": 69894.8275,
+      "repeat_medians_us": [
+        69894.8275,
+        68429.958,
+        70769.0235,
+        71938.1665,
+        68694.338
+      ],
+      "p95_us": 76906.57745,
+      "added_per_span_us": 6353.942227272727,
+      "spans_sent": 12100,
+      "spans_stored": 12100,
+      "sdk_dropped": 0,
+      "dropped_on_runs": 0
+    }
+  ],
+  "ingest": {
+    "small (~100 chars)": {
+      "median_spans_per_s": 10356.329343749449,
+      "repeat_rates": [
+        10196.267251214202,
+        10440.94084511454,
+        10364.681228115029,
+        10076.143150505242,
+        10356.329343749449
+      ],
+      "unpaced_spans_made_per_s": 27091.56085565001,
+      "unpaced_spans_stored_per_s": 8647.730356142962
+    },
+    "large (8,000 chars)": {
+      "median_spans_per_s": 4397.093841314326,
+      "repeat_rates": [
+        4023.995655106813,
+        4458.052642410275,
+        4473.782066486087,
+        4397.093841314326,
+        4385.903776525636
+      ],
+      "unpaced_spans_made_per_s": 12939.676990372292,
+      "unpaced_spans_stored_per_s": 3856.668799875184
+    }
+  },
+  "loads": [
+    0.57470703125,
+    0.93310546875,
+    1.27490234375,
+    2.017578125,
+    2.28369140625
+  ]
+}

@@ -4,7 +4,38 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 the project is in early development (`0.x`), `/v1` can still change, and every change that
 can break a client is listed under **Behaviour changes**.
 
-## Unreleased (week 6)
+## Unreleased (week 7)
+
+### Added
+
+- **Configurable batch queue:** `configure(max_queue_size=...)` or
+  `AGENTFLIGHT_MAX_QUEUE_SIZE` (then OpenTelemetry's `OTEL_BSP_MAX_QUEUE_SIZE`), passed
+  to the batch span processor. The default is unchanged (2048).
+- **Dropped spans are counted.** The SDK refuses spans itself when the queue is full
+  (instead of OpenTelemetry silently dropping the oldest queued span), counts them, and
+  records each run's count on its run span (`agentflight.run.dropped_spans`, best effort:
+  spans dropped after the run span ended can't be on it). The total is
+  `get_recorder().dropped_spans`.
+- **Incomplete recordings are visible.** Runs have `dropped_spans` (migration `0004`, 0
+  for existing runs) in `/v1/runs` and run detail, and the viewer's run list and run page
+  show "incomplete recording: N spans dropped".
+- **Benchmark repeats and ingest rate.** `scripts/bench_overhead.py` now repeats the
+  whole benchmark (`--repeats`, default 5) and reports the spread, measures the server's
+  ingest rate in spans/s, and counts the spans the SDK dropped. The README's numbers are
+  from 5 repeats; the week-6 numbers were a single run.
+- **Replay warns about incomplete recordings** as `replay()`/`fork()` start, and
+  `Recording` has `dropped_spans` and `incomplete`.
+
+### Changed
+
+- **Split-on-413 retries stop at the first other failure.** A timeout, transport error,
+  5xx or credentials error during an export drops the halves not yet sent instead of
+  trying each of them. The attempt cap stays.
+- **`flush()` and `shutdown()` are bounded by AgentFlight**, not only by OpenTelemetry
+  (whose 1.45 `force_flush` ignores its timeout). `shutdown()` takes `timeout_millis`
+  (default 30 s). `flush()` returns `False` when it runs out of time.
+
+## Week 6 (merged in #4)
 
 ### Added
 

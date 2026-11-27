@@ -82,14 +82,15 @@ The server includes a read-only viewer at `/ui`:
 
 - **Runs:** every run with its status, start time, duration, call counts, failures, tokens
   and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
-  time. Filters update the table in place.
+  time. Filters update the table in place. A run whose recorder dropped spans is marked
+  "incomplete recording: N spans dropped" (see "Dropped spans are counted" below).
 - **Run page:** the run's spans as an indented tree (each span under its parent,
   siblings in start order) with a bar per span on the run's time axis, failures
   highlighted with their messages, and replay/fork runs linked to the run they came
   from. A span whose parent never arrived starts its own subtree at the left. Events load
   in pages of 100 without payloads, and the next page continues the tree where the last
   one stopped; selecting an event loads its messages, outputs, arguments and stack traces
-  on demand. (To page in tree order the server reads every span's id and parent for each
+  on demand. An incomplete recording gets a warning above the timeline. (To page in tree order the server reads every span's id and parent for each
   page, which is cheap next to loading the events themselves.)
 
 ![Run list with filters](docs/screenshots/run-list.png)
@@ -228,6 +229,10 @@ a step, then runs live from there.
   tools. File writes, database queries, raw HTTP, the clock and randomness inside your
   agent still run live during a replay. Replay only notices them indirectly, when they
   change the input of a later step and that step diverges.
+- **An incomplete recording can't replay faithfully.** If the recorder dropped spans of
+  the run (full export queue), `replay()` and `fork()` log a warning as they start, before
+  any step runs, and `Recording.incomplete` / `Recording.dropped_spans` say so. Missing
+  steps then show up as divergences, or as live calls with `on_divergence="live"`.
 - **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
   which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
   this) and streamed OpenAI calls (`stream=True`).
@@ -346,10 +351,14 @@ Guarantees:
   `__str__` raise. Values are cut off at 32,000 characters.
 - **No blocking in the default mode.** With `batch=True` (the default), spans are exported
   on a background thread, so a hanging server doesn't slow the agent down.
-- **Bounded waits.** `flush(timeout_millis=...)` and `shutdown()` never raise. They wait at
-  most about the given flush timeout plus the exporter's HTTP timeout (`configure(...,
-  timeout=5.0)`). Interpreter exit is also clean: AgentFlight replaces OpenTelemetry's
-  atexit hook with a fail-safe one.
+- **Bounded waits.** `flush(timeout_millis=30_000)` and `shutdown(timeout_millis=30_000)`
+  never raise and return within their timeout. AgentFlight enforces this itself, because
+  OpenTelemetry's isn't reliable: in opentelemetry-sdk 1.45, `force_flush(300)` against a
+  hanging server with four batches queued took 4.0 s (one 1 s HTTP timeout per batch).
+  When the wait runs out, `flush()` returns `False` and export carries on in the
+  background; whatever `shutdown()` hasn't sent by then is lost. Interpreter exit is also
+  clean: AgentFlight replaces OpenTelemetry's atexit hook with a fail-safe one, bounded
+  the same way.
 - **A bad configuration disables recording instead of raising.**
 
 Limitations (known, not yet handled):
@@ -357,8 +366,22 @@ Limitations (known, not yet handled):
 - **Lost spans.** If export fails, those spans are dropped. There's no retry, no disk
   buffer and no dead-letter queue yet. If the server is unreachable, the run is simply
   missing from the recording.
-- **The batch queue is bounded.** OpenTelemetry's default limit is 2048 spans. When the
-  queue is full, new spans are dropped rather than blocking the agent.
+- **The batch queue is bounded.** It holds 2048 finished spans by default; set it with
+  `configure(max_queue_size=...)` or `AGENTFLIGHT_MAX_QUEUE_SIZE` (OpenTelemetry's
+  `OTEL_BSP_MAX_QUEUE_SIZE` also works). When the queue is full, spans are dropped rather
+  than blocking the agent. A bigger queue absorbs longer bursts at the cost of memory
+  (each queued span holds its payloads, up to `max_attr_chars` each).
+- **Dropped spans are counted, on a best-effort basis.** AgentFlight checks the queue
+  itself before handing a span to OpenTelemetry, so it knows every span it drops (on its
+  own, OpenTelemetry 1.45 drops the *oldest* queued span, which can belong to another
+  run). When a run ends, the spans of that run dropped so far go on the run span as
+  `agentflight.run.dropped_spans`, and the viewer and replay warn about it. A few queue
+  slots are kept for run spans so the span carrying the count is rarely the one dropped.
+  What this can't cover: spans of the run that end *after* the run span (background
+  threads or tasks still running), a run span that is itself dropped, and spans lost
+  later in export (server down, see "Lost spans"). Those are only in the recorder's
+  total, `agentflight.get_recorder().dropped_spans`, and a warning is logged on the first
+  drop. `batch=False` has no queue and never drops this way.
 - **`batch=False` blocks.** It exports inside the agent's thread, so each span can block
   for up to the HTTP timeout. Use it only for tests or debugging.
 - **A partly broken span processor can mis-parent later spans.** If a processor fails while
@@ -371,47 +394,69 @@ Limitations (known, not yet handled):
 
 ## Overhead
 
-Measured with [`scripts/bench_overhead.py`](scripts/bench_overhead.py) on 2026-11-27.
-Raw output: [`docs/benchmarks/overhead-2026-11-27.md`](docs/benchmarks/overhead-2026-11-27.md)
-(and [`.json`](docs/benchmarks/overhead-2026-11-27.json)).
+Measured with [`scripts/bench_overhead.py`](scripts/bench_overhead.py) on 2026-11-27:
+**5 repeats**, each against a fresh server. Raw output:
+[`docs/benchmarks/overhead-2026-11-27-5-repeats.md`](docs/benchmarks/overhead-2026-11-27-5-repeats.md)
+(and [`.json`](docs/benchmarks/overhead-2026-11-27-5-repeats.json)). The numbers
+published with week 6 came from a single run; these replace them.
 
 **Method.** The "agent" makes 5 model calls and 5 tool calls that do no work, so a run is
-11 spans and nearly all of its time is recording overhead. Each scenario runs it 2,000
-times after 200 warm-up runs, timing each run on the agent thread with
-`time.perf_counter_ns`; the table shows the median and 95th percentile per run, and the
-median added per span versus the same code without AgentFlight. The HTTP scenarios
-export to a real server (uvicorn + SQLite, separate process); the benchmark is pinned to
-one CPU and the server to the other seven, and afterwards it counts the spans the server
-stored. Messages are about 100 characters ("small") or 8,000 ("large").
+11 spans and nearly all of its time is recording overhead. In each repeat, each scenario
+runs it 2,000 times (200 for `batch=False`) after 200 warm-up runs, timing each run on
+the agent thread with `time.perf_counter_ns`. The table gives the median of the five
+per-repeat medians, the spread of those medians (min to max), the median p95, and the
+added time per span versus the same code without AgentFlight. The HTTP scenarios export
+to a real server (uvicorn + SQLite, separate process); the benchmark is pinned to one CPU
+and the server to the other seven, and afterwards the spans the server stored and the
+spans the SDK counted as dropped are added up over all repeats. Messages are about 100
+characters ("small") or 8,000 ("large").
 
-**Machine.** Linux 6.12 x86_64 VM, Intel Xeon (8 vCPUs, KVM), load average 0.66 at the
-start; CPython 3.13.5, opentelemetry-sdk 1.45.2, httpx 0.29.0, uvicorn 0.54.0.
+**Machine.** Linux 6.12 x86_64 VM (KVM), Intel Xeon, 8 vCPUs; CPython 3.13.5,
+opentelemetry-sdk 1.45.2, httpx 0.29.0, uvicorn 0.54.0. The box is shared: the 1-minute
+load average at the start of the repeats ranged from 0.57 to 2.28.
 
-| Payload | Scenario | Median per run | p95 per run | Added per span | Spans stored |
-| --- | --- | ---: | ---: | ---: | ---: |
-| small | no AgentFlight | 0.7 µs | 0.8 µs | — | — |
-| small | SDK, no exporter | 378.8 µs | 421.6 µs | 34.4 µs | — |
-| small | SDK + JSON serialization, no network | 524.4 µs | 571.3 µs | 47.6 µs | — |
-| small | HTTP, `batch=True` (default), queue drained every 100 runs | 391.5 µs | 501.6 µs | 35.5 µs | 24,200 of 24,200 |
-| small | HTTP, `batch=True`, tight loop | 508.7 µs | 927.5 µs | 46.2 µs | 13,231 of 24,200 |
-| small | HTTP, `batch=False` | 63,637.1 µs | 70,917.7 µs | 5,785.1 µs | 24,200 of 24,200 |
-| large | no AgentFlight | 2.8 µs | 3.2 µs | — | — |
-| large | SDK, no exporter | 837.2 µs | 963.2 µs | 75.9 µs | — |
-| large | SDK + JSON serialization, no network | 1,248.2 µs | 1,353.5 µs | 113.2 µs | — |
-| large | HTTP, `batch=True` (default), queue drained every 100 runs | 839.3 µs | 1,124.4 µs | 76.0 µs | 24,200 of 24,200 |
-| large | HTTP, `batch=True`, tight loop | 961.9 µs | 2,167.6 µs | 87.2 µs | 12,690 of 24,200 |
-| large | HTTP, `batch=False` | 68,088.9 µs | 76,418.2 µs | 6,189.6 µs | 24,200 of 24,200 |
+| Payload | Scenario | Median per run | Spread (5 medians) | p95 | Added per span | Spans stored | Dropped (SDK count) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| small | no AgentFlight | 0.7 µs | 0.7 to 0.8 µs | 0.7 µs | — | — | — |
+| small | SDK, no exporter | 380.3 µs | 373.4 to 384.0 µs | 390.3 µs | 34.5 µs | — | — |
+| small | SDK + JSON serialization, no network | 524.6 µs | 518.0 to 533.4 µs | 539.4 µs | 47.6 µs | — | — |
+| small | HTTP, `batch=True` (default), queue drained every 100 runs | 409.8 µs | 403.8 to 417.3 µs | 542.5 µs | 37.2 µs | 121,000 of 121,000 | 0 |
+| small | HTTP, `batch=True`, tight loop | 406.0 µs | 402.5 to 407.4 µs | 480.4 µs | 36.8 µs | 59,828 of 121,000 | 61,172 |
+| small | HTTP, `batch=False` | 60,948.5 µs | 57,785.9 to 62,717.0 µs | 68,115.0 µs | 5,540.7 µs | 12,100 of 12,100 | 0 |
+| large | no AgentFlight | 1.5 µs | 1.4 to 1.5 µs | 1.5 µs | — | — | — |
+| large | SDK, no exporter | 825.1 µs | 815.3 to 825.3 µs | 838.1 µs | 74.9 µs | — | — |
+| large | SDK + JSON serialization, no network | 1,217.8 µs | 1,215.6 to 1,222.0 µs | 1,237.4 µs | 110.6 µs | — | — |
+| large | HTTP, `batch=True` (default), queue drained every 100 runs | 853.2 µs | 851.1 to 862.5 µs | 1,009.1 µs | 77.4 µs | 121,000 of 121,000 | 0 |
+| large | HTTP, `batch=True`, tight loop | 850.1 µs | 847.4 to 875.6 µs | 1,003.0 µs | 77.1 µs | 58,118 of 121,000 | 62,882 |
+| large | HTTP, `batch=False` | 69,894.8 µs | 68,430.0 to 71,938.2 µs | 76,906.6 µs | 6,353.9 µs | 12,100 of 12,100 | 0 |
+
+**Server ingest rate**, measured by sending already-recorded spans in 512-span batches
+back to back from one thread (20 batches per payload and repeat), next to how fast the
+tight loop makes spans:
+
+| Payload | Server ingest, spans/s (median of 5) | Spread | Tight loop makes, spans/s | Tight loop: stored, spans/s |
+| --- | ---: | ---: | ---: | ---: |
+| small | 10,356 | 10,076 to 10,441 | 27,092 | 8,648 |
+| large | 4,397 | 4,024 to 4,474 | 12,940 | 3,857 |
 
 What this says:
 
-- With the default `batch=True`, recording costs the agent about **35 µs per span with
-  small payloads and 76 µs with 8,000-character ones**, about 0.4 ms and 0.8 ms for this
-  11-span run. Export runs on a background thread and adds little on top while the queue
-  keeps up.
-- **A loop that makes spans with no real work in between outruns the exporter.**
-  OpenTelemetry's queue (2,048 spans) filled and it dropped 45-48% of the spans
-  (OpenTelemetry logs "Queue full, dropping Span"). Real agents wait hundreds of
-  milliseconds on model calls, but a burst of thousands of spans can lose some.
+- With the default `batch=True`, recording costs the agent about **37 µs per span with
+  small payloads and 77 µs with 8,000-character ones**, about 0.4 ms and 0.85 ms for this
+  11-span run. The five repeats agree to within a few percent.
+- **The dropped spans are a rate mismatch.** The tight loop makes spans 2.6 to 2.9 times
+  faster than one exporter thread and this server store them (27,092 vs 10,356 spans/s
+  small, 12,940 vs 4,397 large), and while the loop runs the exporter also shares the
+  agent's CPU, so the server stored only 8,648 and 3,857 spans/s. The 2,048-span queue
+  fills in well under a second, and about half the spans were dropped (51% and 52% over
+  the five repeats; the earlier single run saw 45-48%). The SDK counted every one:
+  stored + dropped = sent over the five repeats. About two thirds of the drops (41,966 of
+  61,172 small, 41,080 of 62,882 large) were recorded on their runs. The rest are run
+  spans that were themselves dropped once even the slots kept for run spans were full,
+  and the counts those run spans would have carried, so they are only in the SDK total
+  (see "Dropped spans are counted").
+- Real agents spend hundreds of milliseconds on each model call, far below these rates.
+  A burst of thousands of spans can still lose some; `max_queue_size` buys headroom.
 - `batch=False` waits for an HTTP round trip and a database commit per span, about 6 ms
   each here. Use it for short scripts and debugging, not in a loop.
 
@@ -556,13 +601,18 @@ A full SDK batch of payload-heavy spans can be bigger than 16 MiB. When the serv
 over the cap on their own are dropped, with one warning per export.
 
 Splitting is capped at `max_export_attempts` HTTP requests per export (default `32`, set
-it with `configure(max_export_attempts=...)`); whatever is still unsent then is dropped.
-Isolating one oversized span in a full 512-span batch takes 19 requests. Worst case, one
-export takes `max_export_attempts` × `timeout` (32 × 5 s with the defaults) when every
-request is slow. With `batch=True` (the default) that happens on the exporter's background
-thread, though `flush()` and `shutdown()` wait for it. With `batch=False` every span is
-exported on its own as it ends, so there is nothing to split and a span end blocks for at
-most one `timeout`.
+it with `configure(max_export_attempts=...)`), and the first failure that isn't a `413`
+(a timeout, a transport error, a 5xx, rejected credentials) stops the export: the halves
+not yet sent are dropped instead of being tried against a server that is already
+failing. Isolating one oversized span in a full 512-span batch takes 19 requests.
+
+Worst case for one export: a server that is down or hanging costs one `timeout` (5 s by
+default), since the first failure ends the export. Only a server that keeps answering
+`413` slowly can make an export take up to `max_export_attempts` × `timeout`. With
+`batch=True` (the default) exports run on a background thread; `flush()` and
+`shutdown()` stop waiting at their own timeouts (see [Failure isolation](#failure-isolation)).
+With `batch=False` every span is exported on its own as it ends, so there is nothing to
+split and a span end blocks for at most one `timeout`.
 
 Span, span event and attribute names are limited to 255 characters (`422` above that). If
 you turn off the SDK's payload cap (`max_attr_chars=None`), raise
@@ -650,11 +700,14 @@ docker compose down --volumes
   failures; stored run totals and batched ingest; run filters and paged run detail;
   scoped API keys; `unknown` and `abandoned` run status; ingest limits; redacted
   exception messages and stack traces.
-- **Week 6: tree, screenshots, overhead** (this branch): an indented span tree in the
-  viewer, README screenshots, an overhead benchmark with its method and measured results,
-  and a cap on the exporter's split-on-413 requests. Deferred: a demo, overhead on real
-  (non-synthetic) agent runs, a setting for the export queue size, and a rate limit on
-  failed keys.
+- **Week 6: tree, screenshots, overhead** (done): an indented span tree in the viewer,
+  README screenshots, an overhead benchmark with its method and measured results, and a
+  cap on the exporter's split-on-413 requests.
+- **Week 7: dropped spans** (this branch): spans dropped from a full export queue are
+  counted and shown as incomplete recordings in the viewer and replay; a configurable
+  queue size; split retries stop at the first non-413 failure; bounded `flush()` and
+  `shutdown()`; benchmark repeats and the server's ingest rate. Deferred: a demo,
+  overhead on real (non-synthetic) agent runs, and a rate limit on failed keys.
 
 ## License
 

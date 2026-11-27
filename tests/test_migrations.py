@@ -301,3 +301,29 @@ def test_sqlite_table_rebuild_keeps_existing_events(tmp_path: Path) -> None:
         left = conn.execute(text("SELECT DISTINCT run_id FROM events")).scalars().all()
     engine.dispose()
     assert left == ["b" * 32]
+
+
+def test_0004_adds_dropped_spans_with_zero_for_existing_runs(db_url: str) -> None:
+    cfg = _config(db_url)
+    command.upgrade(cfg, "0003")
+    engine = make_engine(db_url)
+    with engine.begin() as conn:
+        _insert(
+            conn,
+            "INSERT INTO runs (id, name, status, metadata) VALUES (:id, 'r', 'ok', '{}')",
+            id="a" * 32,
+        )
+    engine.dispose()
+    command.upgrade(cfg, "0004")
+    engine = make_engine(db_url)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT dropped_spans FROM runs")).scalar_one() == 0
+    engine.dispose()
+    command.downgrade(cfg, "0003")
+    engine = make_engine(db_url)
+    with engine.connect() as conn:
+        names = {c["name"] for c in inspect(conn).get_columns("runs")}
+        assert conn.execute(text("SELECT count(*) FROM runs")).scalar_one() == 1
+    engine.dispose()
+    assert "dropped_spans" not in names
+    command.downgrade(cfg, "base")
