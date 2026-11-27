@@ -350,17 +350,22 @@ The server **requires an API key by default** and refuses to start without one.
 
 | Setting | Meaning |
 | --- | --- |
-| `AGENTFLIGHT_API_KEY` | The key. Clients send `Authorization: Bearer <key>` (or `X-AgentFlight-Key`). |
+| `AGENTFLIGHT_API_KEY` | A key with every permission. Clients send `Authorization: Bearer <key>` (or `X-AgentFlight-Key`). |
+| `AGENTFLIGHT_API_KEYS` | Scoped keys: comma-separated `<key>:<permission>[+<permission>...]`, e.g. `k1:ingest,k2:read,k3:read+delete`. |
 | `AGENTFLIGHT_AUTH_DISABLED=true` | Explicit opt-out for local development only. A warning is logged at startup. |
+
+The server starts if at least one of `AGENTFLIGHT_API_KEY` and `AGENTFLIGHT_API_KEYS` is
+set. Give recorders an `ingest`-only key, so a leaked agent key can't read or delete
+history, and give people and dashboards a `read` key.
 
 - Keys are compared in constant time (`hmac.compare_digest`). Wrong or missing keys get
   `401`, and the response never echoes the key.
-- Endpoints require an `ingest`, `read` or `delete` permission. Today the single key grants
-  all three. The permission check already takes a key-to-permissions map, so ingest-only and
-  read-only keys can be added later without changing the endpoints.
+- Endpoints require an `ingest`, `read` or `delete` permission. A valid key without the
+  needed permission gets `403`. A malformed `AGENTFLIGHT_API_KEYS` (unknown permission,
+  duplicate key) stops the server at startup, and the error never includes the key.
 - `Authorization` and `X-AgentFlight-Key` are never logged. `redact_headers()` is the
   helper for anything that logs headers, and a log filter on the server's loggers scrubs the
-  configured key from any message as a backstop.
+  configured keys from any message as a backstop.
 - **SDK:** `configure(api_key=...)`, or the `AGENTFLIGHT_API_KEY` environment variable.
   If the server rejects the key, the SDK logs one warning (without the key) and drops the
   spans. The agent keeps running.

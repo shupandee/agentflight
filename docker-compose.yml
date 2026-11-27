@@ -21,6 +21,8 @@ services:
       AGENTFLIGHT_DATABASE_URL: postgresql+psycopg://agentflight:agentflight@postgres:5432/agentflight
       # Required. Generate one, e.g. `export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)`.
       AGENTFLIGHT_API_KEY: ${AGENTFLIGHT_API_KEY:?set AGENTFLIGHT_API_KEY}
+      # Optional scoped keys, e.g. "<key>:ingest,<key>:read".
+      AGENTFLIGHT_API_KEYS: ${AGENTFLIGHT_API_KEYS:-}
     ports:
       - "8000:8000"
     depends_on:
