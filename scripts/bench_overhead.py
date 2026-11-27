@@ -1,7 +1,8 @@
-"""Measure how much time AgentFlight's recorder adds to an agent run.
+"""Measure how much time AgentFlight's recorder adds to an agent run, and how fast the
+server ingests spans.
 
-    python scripts/bench_overhead.py              # full run, prints a Markdown report
-    python scripts/bench_overhead.py --quick      # fewer runs, for a smoke check
+    python scripts/bench_overhead.py               # 5 repeats, prints a Markdown report
+    python scripts/bench_overhead.py --quick       # 1 short repeat, for a smoke check
 
 Method
 ------
@@ -9,32 +10,35 @@ The "agent" is a loop of ``STEPS`` model calls and ``STEPS`` tool calls that do 
 work (they return a canned string), so the measured time is almost all recording
 overhead rather than agent work. One run is 1 run span + ``2 * STEPS`` child spans.
 
-Each scenario runs the same agent ``--runs`` times after ``--warmup`` untimed runs and
-times every run with ``time.perf_counter_ns`` on the agent thread. Reported: median and
-95th percentile per run, and the median added time per span versus the uninstrumented
-baseline. Scenarios:
+Everything is repeated ``--repeats`` times, each repeat against a fresh server (uvicorn +
+SQLite in a temp dir, its own process). In each repeat every scenario runs the agent
+``--runs`` times (``--sync-runs`` for ``batch=False``, which is slow) after
+``--warmup`` untimed runs, timing each run on the agent thread with
+``time.perf_counter_ns``. The report gives, per scenario, the median of the per-repeat
+medians, the spread of those medians (min-max), the median p95, and the median added per
+span versus the uninstrumented baseline. Scenarios:
 
 * ``baseline``: the same functions with no AgentFlight code at all.
 * ``sdk, no exporter``: spans are built (attributes, payload capture, truncation) and
   dropped. The cost of the instrumentation itself.
 * ``sdk, serialize only``: plus converting every span to the ingest JSON on the agent
   thread (``span_to_dict`` and ``json.dumps``), without network.
-* ``sdk, HTTP, batch=True, queue drained every 100 runs``: the default setup, exporting to
-  a real AgentFlight server (uvicorn + SQLite in a temp dir) from OpenTelemetry's
-  background thread. Every 100 runs the benchmark waits, untimed, for the queue to drain,
-  as it would between real model calls, so no span is dropped. Agent-thread time only.
-* ``sdk, HTTP, batch=True, unpaced``: the same with no pauses. A loop with no real work
-  makes spans faster than the server stores them, OpenTelemetry's queue (2,048 spans)
-  fills, and spans are dropped; the "spans stored" column shows how many.
+* ``sdk, HTTP, batch=True, queue drained every 100 runs``: the default setup, exporting
+  from OpenTelemetry's background thread. Every 100 runs the benchmark waits, untimed,
+  for the queue to drain, as it would between real model calls. Agent-thread time only.
+* ``sdk, HTTP, batch=True, unpaced``: the same with no pauses, so the loop makes spans
+  faster than the server stores them and the queue (2,048 spans) fills.
 * ``sdk, HTTP, batch=False``: every span is POSTed synchronously when it ends.
 
 For the HTTP scenarios the benchmark counts the spans the server stored (warm-up runs
-included) by reading its database at the end.
+included) by reading its database, and the spans the SDK reported dropping.
 
-Each scenario is measured with small payloads (about 100 characters per message) and
-large ones (8,000 characters). The server runs in its own process; on Linux, the
-benchmark and the server are pinned to different CPUs. The machine, Python version,
-package versions and load average are printed with the results; nothing is estimated.
+Ingest rate: spans recorded in advance are sent to the server in 512-span batches (the
+batch processor's size), one after another from one thread, as the batch processor does;
+the rate is spans stored per second of wall time.
+
+The machine, Python and package versions and load average are printed with the results;
+nothing is estimated.
 """
 
 from __future__ import annotations
@@ -52,9 +56,10 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
+from typing import Any
 
 import httpx
 from opentelemetry.sdk.trace import ReadableSpan
@@ -66,7 +71,13 @@ from agentflight.exporter import AgentFlightExporter, span_to_dict
 
 ROOT = Path(__file__).resolve().parents[1]
 STEPS = 5
+SPANS_PER_RUN = 1 + 2 * STEPS
 KEY = "bench-" + "k" * 40
+INGEST_BATCH = 512
+PAYLOADS = {"small (~100 chars)": "p" * 100, "large (8,000 chars)": "p" * 8_000}
+DRAINED = "sdk, HTTP, batch=True, queue drained every 100 runs"
+UNPACED = "sdk, HTTP, batch=True, unpaced"
+SYNC = "sdk, HTTP, batch=False"
 
 
 class SerializeOnly(SpanExporter):
@@ -74,6 +85,17 @@ class SerializeOnly(SpanExporter):
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         json.dumps({"spans": [span_to_dict(s) for s in spans]}).encode()
+        return SpanExportResult.SUCCESS
+
+
+class Collect(SpanExporter):
+    """Keeps finished spans, to send them to the server later at full speed."""
+
+    def __init__(self) -> None:
+        self.spans: list[ReadableSpan] = []
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        self.spans.extend(spans)
         return SpanExportResult.SUCCESS
 
 
@@ -104,22 +126,23 @@ def recorded_run(payload: str, name: str = "bench") -> None:
 
 
 @dataclass
-class Result:
-    scenario: str
-    payload: str
-    times_ns: list[int]
-    flush_ms: float | None = None
-    run_name: str | None = None  # HTTP scenarios: the run name, to count what arrived
+class Sample:
+    """One scenario in one repeat."""
+
+    median_us: float
+    p95_us: float
     spans_sent: int = 0
     spans_stored: int | None = None
+    sdk_dropped: int | None = None  # spans the SDK counted as dropped
+    on_runs: int | None = None  # of those, recorded on the runs' run spans
+    wall_s: float = 0.0  # warm-up + timed runs + final flush
 
-    @property
-    def median_us(self) -> float:
-        return statistics.median(self.times_ns) / 1000
 
-    @property
-    def p95_us(self) -> float:
-        return statistics.quantiles(self.times_ns, n=20)[18] / 1000
+@dataclass
+class Repeat:
+    samples: dict[tuple[str, str], Sample] = field(default_factory=dict)
+    ingest_rate: dict[str, float] = field(default_factory=dict)  # payload -> spans/s
+    load: tuple[float, float, float] | None = None
 
 
 def measure(
@@ -143,6 +166,13 @@ def measure(
         if flush_every and (i + 1) % flush_every == 0:
             agentflight.flush()
     return out
+
+
+def _sample(times: list[int]) -> Sample:
+    return Sample(
+        median_us=statistics.median(times) / 1000,
+        p95_us=statistics.quantiles(times, n=20)[18] / 1000,
+    )
 
 
 def _free_port() -> int:
@@ -200,47 +230,45 @@ def _no_exporter() -> None:
     agentflight.sdk._recorder = agentflight.sdk.Recorder()
 
 
-def machine_info() -> list[str]:
-    cpu = platform.processor() or platform.machine()
-    with contextlib.suppress(OSError):
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
-            if line.startswith("model name"):
-                cpu = line.split(":", 1)[1].strip()
-                break
-    load = os.getloadavg() if hasattr(os, "getloadavg") else None
-    versions = ", ".join(
-        f"{p} {metadata.version(p)}"
-        for p in ("agentflight", "opentelemetry-sdk", "httpx", "fastapi", "uvicorn")
-    )
-    return [
-        f"- Machine: {platform.system()} {platform.release()} ({platform.machine()}), {cpu}, "
-        f"{os.cpu_count()} CPUs",
-        f"- Python: {platform.python_implementation()} {platform.python_version()}",
-        f"- Packages: {versions}",
-        "- Load average at start (1/5/15 min): "
-        + (" / ".join(f"{x:.2f}" for x in load) if load else "n/a"),
-    ]
+def _stored(db: Path) -> dict[str, tuple[int, int]]:
+    """run name -> (spans stored, dropped spans recorded on its run spans)."""
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.connect() as conn:
+        spans: dict[str, int] = dict(
+            conn.execute(
+                text(
+                    "SELECT runs.name, count(*) FROM events "
+                    "JOIN runs ON runs.id = events.run_id GROUP BY runs.name"
+                )
+            ).all()
+        )
+        dropped: dict[str, int | None] = dict(
+            conn.execute(text("SELECT name, sum(dropped_spans) FROM runs GROUP BY name")).all()
+        )
+    engine.dispose()
+    return {name: (int(spans.get(name, 0)), int(dropped.get(name) or 0)) for name in dropped}
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--runs", type=int, default=2000, help="timed runs per scenario")
-    parser.add_argument("--warmup", type=int, default=200, help="untimed runs first")
-    parser.add_argument("--quick", action="store_true", help="--runs 200 --warmup 20")
-    parser.add_argument("--json", type=Path, help="also write raw results here")
-    args = parser.parse_args()
-    if args.quick:
-        args.runs, args.warmup = 200, 20
+def ingest_rate(url: str, payload: str, batches: int) -> float:
+    """Spans per second the server stores from back-to-back 512-span batches."""
+    collect = Collect()
+    agentflight.configure(exporter=collect, batch=False)
+    while len(collect.spans) < batches * INGEST_BATCH:
+        recorded_run(payload, "ingest")
+    agentflight.shutdown()
+    spans = collect.spans[: batches * INGEST_BATCH]
+    exporter = AgentFlightExporter(url, api_key=KEY, timeout=60)
+    start = time.perf_counter()
+    for i in range(0, len(spans), INGEST_BATCH):
+        if exporter.export(spans[i : i + INGEST_BATCH]) is not SpanExportResult.SUCCESS:
+            raise RuntimeError("ingest batch failed")
+    elapsed = time.perf_counter() - start
+    exporter.shutdown()
+    return len(spans) / elapsed
 
-    cpus = _cpus()
-    bench_cpus, server_cpus = (cpus[:1], cpus[1:]) if len(cpus) > 1 else (cpus, cpus)
-    if bench_cpus and hasattr(os, "sched_setaffinity"):
-        os.sched_setaffinity(0, bench_cpus)
 
-    info = machine_info()
-    payloads = {"small (~100 chars)": "p" * 100, "large (8,000 chars)": "p" * 8_000}
-    results: list[Result] = []
-    spans_per_run = 1 + 2 * STEPS
+def one_repeat(args: argparse.Namespace, server_cpus: list[int]) -> Repeat:
+    rep = Repeat(load=os.getloadavg() if hasattr(os, "getloadavg") else None)
     with server(server_cpus) as (url, db):
 
         def http(batch: bool) -> Callable[[], object]:
@@ -248,118 +276,221 @@ def main() -> int:
                 exporter=AgentFlightExporter(url, api_key=KEY), batch=batch
             )
 
-        # (name, setup, flush_every): flush_every drains the batch queue between runs,
-        # untimed, so it never overflows; None lets a tight loop outrun the exporter.
-        setups: list[tuple[str, Callable[[], object], int | None]] = [
-            ("sdk, no exporter", _no_exporter, None),
+        # (name, setup, flush_every, runs, warmup)
+        setups: list[tuple[str, Callable[[], object], int | None, int, int]] = [
+            ("sdk, no exporter", _no_exporter, None, args.runs, args.warmup),
             (
                 "sdk, serialize only",
                 lambda: agentflight.configure(exporter=SerializeOnly(), batch=False),
                 None,
+                args.runs,
+                args.warmup,
             ),
-            ("sdk, HTTP, batch=True, queue drained every 100 runs", http(True), 100),
-            ("sdk, HTTP, batch=True, unpaced", http(True), None),
-            ("sdk, HTTP, batch=False", http(False), None),
+            (DRAINED, http(True), 100, args.runs, args.warmup),
+            (UNPACED, http(True), None, args.runs, args.warmup),
+            (SYNC, http(False), None, args.sync_runs, max(1, args.warmup // 10)),
         ]
-        for p_index, (label, payload) in enumerate(payloads.items()):
-            results.append(
-                Result("baseline", label, measure(baseline_run, payload, args.runs, args.warmup))
+        names: dict[tuple[str, str], tuple[str, int]] = {}
+        for p_index, (label, payload) in enumerate(PAYLOADS.items()):
+            rep.samples[(label, "baseline")] = _sample(
+                measure(baseline_run, payload, args.runs, args.warmup)
             )
-            for s_index, (name, setup, flush_every) in enumerate(setups):
+            for s_index, (name, setup, flush_every, runs, warmup) in enumerate(setups):
                 run_name = f"bench-{p_index}-{s_index}"
                 setup()
+                wall = time.perf_counter()
                 times = measure(
                     functools.partial(recorded_run, name=run_name),
                     payload,
-                    args.runs,
-                    args.warmup,
+                    runs,
+                    warmup,
                     flush_every=flush_every,
                 )
-                start = time.perf_counter()
                 agentflight.flush()
-                flush_ms = (time.perf_counter() - start) * 1000
+                sample = _sample(times)
+                sample.wall_s = time.perf_counter() - wall
+                if "HTTP" in name:
+                    sample.spans_sent = (runs + warmup) * SPANS_PER_RUN
+                    sample.sdk_dropped = agentflight.get_recorder().dropped_spans
+                    names[(label, name)] = (run_name, 0)
                 agentflight.shutdown()
-                is_http = "HTTP" in name
-                results.append(
-                    Result(
-                        name,
-                        label,
-                        times,
-                        flush_ms if "batch=True" in name else None,
-                        run_name if is_http else None,
-                        (args.runs + args.warmup) * spans_per_run if is_http else 0,
-                    )
-                )
+                rep.samples[(label, name)] = sample
+            rep.ingest_rate[label] = ingest_rate(url, payload, args.ingest_batches)
         time.sleep(0.5)
-        engine = create_engine(f"sqlite:///{db}")
-        with engine.connect() as conn:
-            counts: dict[str, int] = dict(
-                conn.execute(
-                    text(
-                        "SELECT runs.name, count(*) FROM events "
-                        "JOIN runs ON runs.id = events.run_id GROUP BY runs.name"
-                    )
-                ).all()
-            )
-        engine.dispose()
-        for r in results:
-            if r.run_name is not None:
-                r.spans_stored = int(counts.get(r.run_name, 0))
+        stored = _stored(db)
+        for key, (run_name, _) in names.items():
+            spans, on_runs = stored.get(run_name, (0, 0))
+            rep.samples[key].spans_stored = spans
+            rep.samples[key].on_runs = on_runs
+    return rep
 
+
+def machine_info() -> list[str]:
+    cpu = platform.processor() or platform.machine()
+    with contextlib.suppress(OSError):
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    virt = ""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("Hypervisor vendor:"):
+                virt = f", VM ({line.split(':', 1)[1].strip()})"
+    versions = ", ".join(
+        f"{p} {metadata.version(p)}"
+        for p in ("agentflight", "opentelemetry-sdk", "httpx", "fastapi", "uvicorn")
+    )
+    return [
+        f"- Machine: {platform.system()} {platform.release()} ({platform.machine()}), {cpu}, "
+        f"{os.cpu_count()} CPUs{virt}",
+        f"- Python: {platform.python_implementation()} {platform.python_version()}",
+        f"- Packages: {versions}",
+    ]
+
+
+def _range(values: list[float], fmt: str = "{:,.1f}") -> str:
+    return f"{fmt.format(min(values))} to {fmt.format(max(values))}"
+
+
+def report(args: argparse.Namespace, info: list[str], repeats: list[Repeat], cpus: str) -> Any:
+    loads = [r.load[0] for r in repeats if r.load]
     print("## AgentFlight recorder overhead\n")
     print(*info, sep="\n")
+    if loads:
+        print(f"- Load average (1 min) at the start of each repeat: {_range(loads, '{:.2f}')}")
     print(
-        f"- Runs: {args.runs} timed per scenario after {args.warmup} warm-up runs; "
-        f"{spans_per_run} spans per run ({STEPS} model calls, {STEPS} tool calls)"
+        f"- {len(repeats)} repeat(s), each on a fresh server. Per repeat and scenario: "
+        f"{args.runs} timed runs after {args.warmup} warm-up runs ({args.sync_runs} for "
+        f"batch=False); {SPANS_PER_RUN} spans per run ({STEPS} model calls, {STEPS} tool "
+        "calls)"
     )
-    print(f"- CPUs: benchmark pinned to {bench_cpus or 'any'}, server to {server_cpus or 'any'}")
-    print()
+    print(f"- CPUs: {cpus}\n")
     print(
-        "| Payload | Scenario | Median per run | p95 per run | Added per span (median) "
-        "| Spans stored |"
+        "| Payload | Scenario | Median per run | Spread of medians | p95 per run "
+        "| Added per span | Spans stored | Dropped (SDK count / on runs) |"
     )
-    print("| --- | --- | ---: | ---: | ---: | ---: |")
-    for label in payloads:
-        base = next(r for r in results if r.payload == label and r.scenario == "baseline")
-        for r in (r for r in results if r.payload == label):
-            added = (
-                "—"
-                if r.scenario == "baseline"
-                else f"{(r.median_us - base.median_us) / spans_per_run:.1f} µs"
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    rows: list[dict[str, Any]] = []
+    scenarios = list(dict.fromkeys(name for (_, name) in repeats[0].samples))
+    for label in PAYLOADS:
+        base = statistics.median(r.samples[(label, "baseline")].median_us for r in repeats)
+        for name in scenarios:
+            samples = [r.samples[(label, name)] for r in repeats]
+            medians = [s.median_us for s in samples]
+            median = statistics.median(medians)
+            p95 = statistics.median(s.p95_us for s in samples)
+            added = None if name == "baseline" else (median - base) / SPANS_PER_RUN
+            sent = sum(s.spans_sent for s in samples)
+            stored = (
+                sum(s.spans_stored or 0 for s in samples)
+                if samples[0].spans_stored is not None
+                else None
             )
-            stored = "—" if r.spans_stored is None else f"{r.spans_stored:,} of {r.spans_sent:,}"
+            dropped = (
+                sum(s.sdk_dropped or 0 for s in samples)
+                if samples[0].sdk_dropped is not None
+                else None
+            )
+            on_runs = sum(s.on_runs or 0 for s in samples)
             print(
-                f"| {label} | {r.scenario} | {r.median_us:,.1f} µs | {r.p95_us:,.1f} µs "
-                f"| {added} | {stored} |"
+                f"| {label} | {name} | {median:,.1f} µs | {_range(medians)} µs "
+                f"| {p95:,.1f} µs | {'—' if added is None else f'{added:,.1f} µs'} "
+                f"| {'—' if stored is None else f'{stored:,} of {sent:,}'} "
+                f"| {'—' if dropped is None else f'{dropped:,} / {on_runs:,}'} |"
             )
-    flushes = [r for r in results if r.flush_ms is not None]
-    if flushes:
-        print()
-        for r in flushes:
-            print(
-                f"- {r.payload}, {r.scenario}: flushing the queue after the last run took "
-                f"{r.flush_ms:,.1f} ms."
+            rows.append(
+                {
+                    "payload": label,
+                    "scenario": name,
+                    "median_us": median,
+                    "repeat_medians_us": medians,
+                    "p95_us": p95,
+                    "added_per_span_us": added,
+                    "spans_sent": sent,
+                    "spans_stored": stored,
+                    "sdk_dropped": dropped,
+                    "dropped_on_runs": on_runs,
+                }
             )
+    print("\n### Server ingest rate\n")
+    print(
+        "| Payload | Ingest, spans/s (median) | Spread | Unpaced loop: spans made/s "
+        "| Unpaced loop: spans stored/s |"
+    )
+    print("| --- | ---: | ---: | ---: | ---: |")
+    ingest: dict[str, Any] = {}
+    for label in PAYLOADS:
+        rates = [r.ingest_rate[label] for r in repeats]
+        unpaced = statistics.median(r.samples[(label, UNPACED)].median_us for r in repeats)
+        agent_rate = SPANS_PER_RUN / (unpaced / 1e6)
+        delivered = statistics.median(
+            (r.samples[(label, UNPACED)].spans_stored or 0) / r.samples[(label, UNPACED)].wall_s
+            for r in repeats
+        )
+        print(
+            f"| {label} | {statistics.median(rates):,.0f} | {_range(rates, '{:,.0f}')} "
+            f"| {agent_rate:,.0f} | {delivered:,.0f} |"
+        )
+        ingest[label] = {
+            "median_spans_per_s": statistics.median(rates),
+            "repeat_rates": rates,
+            "unpaced_spans_made_per_s": agent_rate,
+            "unpaced_spans_stored_per_s": delivered,
+        }
+    print(
+        f"\n(Ingest: {args.ingest_batches} batches of {INGEST_BATCH} spans per payload and "
+        "repeat, sent back to back from one thread with nothing else running in the "
+        "process. Unpaced loop: spans made per second on the agent thread (median run "
+        "time), and spans the server stored per second of the scenario's wall time, "
+        "while the exporter thread shared the benchmark's one CPU with the agent.)"
+    )
+    return {"rows": rows, "ingest": ingest, "loads": loads}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    parser.add_argument("--repeats", type=int, default=5, help="whole-benchmark repeats")
+    parser.add_argument("--runs", type=int, default=2000, help="timed runs per scenario")
+    parser.add_argument("--sync-runs", type=int, default=200, help="timed runs, batch=False")
+    parser.add_argument("--warmup", type=int, default=200, help="untimed runs first")
+    parser.add_argument("--ingest-batches", type=int, default=20, help="512-span batches")
+    parser.add_argument("--quick", action="store_true", help="1 short repeat")
+    parser.add_argument("--json", type=Path, help="also write raw results here")
+    args = parser.parse_args()
+    if args.quick:
+        args.repeats, args.runs, args.sync_runs, args.warmup, args.ingest_batches = (
+            1,
+            200,
+            20,
+            20,
+            4,
+        )
+
+    cpus = _cpus()
+    bench_cpus, server_cpus = (cpus[:1], cpus[1:]) if len(cpus) > 1 else (cpus, cpus)
+    if bench_cpus and hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, bench_cpus)
+    pinning = f"benchmark pinned to {bench_cpus or 'any'}, server to {server_cpus or 'any'}"
+
+    info = machine_info()
+    repeats = []
+    for i in range(args.repeats):
+        print(f"repeat {i + 1}/{args.repeats}...", file=sys.stderr, flush=True)
+        repeats.append(one_repeat(args, server_cpus))
+    data = report(args, info, repeats, pinning)
     if args.json:
         args.json.write_text(
             json.dumps(
                 {
                     "machine": info,
+                    "repeats": args.repeats,
                     "runs": args.runs,
+                    "sync_runs": args.sync_runs,
                     "warmup": args.warmup,
-                    "spans_per_run": spans_per_run,
-                    "results": [
-                        {
-                            "scenario": r.scenario,
-                            "payload": r.payload,
-                            "median_us": r.median_us,
-                            "p95_us": r.p95_us,
-                            "flush_ms": r.flush_ms,
-                            "spans_sent": r.spans_sent,
-                            "spans_stored": r.spans_stored,
-                        }
-                        for r in results
-                    ],
+                    "spans_per_run": SPANS_PER_RUN,
+                    **data,
                 },
                 indent=2,
             )

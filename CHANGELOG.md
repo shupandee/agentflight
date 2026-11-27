@@ -19,6 +19,10 @@ can break a client is listed under **Behaviour changes**.
 - **Incomplete recordings are visible.** Runs have `dropped_spans` (migration `0004`, 0
   for existing runs) in `/v1/runs` and run detail, and the viewer's run list and run page
   show "incomplete recording: N spans dropped".
+- **Benchmark repeats and ingest rate.** `scripts/bench_overhead.py` now repeats the
+  whole benchmark (`--repeats`, default 5) and reports the spread, measures the server's
+  ingest rate in spans/s, and counts the spans the SDK dropped. The README's numbers are
+  from 5 repeats; the week-6 numbers were a single run.
 - **Replay warns about incomplete recordings** as `replay()`/`fork()` start, and
   `Recording` has `dropped_spans` and `incomplete`.
 
