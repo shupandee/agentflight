@@ -16,8 +16,8 @@ from agentflight.server.viewer.routes import CONTENT_SECURITY_POLICY
 from agentflight.server.viewer.session import COOKIE_NAME, SessionSigner, derive_session_secret
 from tests.conftest import TEST_KEY
 
-READ_KEY = "viewer-read-key-0123456789"
-INGEST_KEY = "viewer-ingest-key-0123456789"
+READ_KEY = "viewer-read-key-0123456789abcdef0123456789"
+INGEST_KEY = "viewer-ingest-key-0123456789abcdef0123456789"
 SECRET = "s" * 40
 TEMPLATES = Path(__file__).resolve().parents[1] / "src/agentflight/server/viewer/templates"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,9 +11,9 @@ from agentflight.server import create_app
 from agentflight.server.settings import Permission, Settings, parse_api_keys
 from tests.conftest import TEST_KEY
 
-INGEST_KEY = "ingest-key-0123456789"
-READ_KEY = "read-key-0123456789"
-READ_DELETE_KEY = "read-delete-key-0123456789"
+INGEST_KEY = "ingest-key-0123456789abcdef0123456789"
+READ_KEY = "read-key-0123456789abcdef0123456789"
+READ_DELETE_KEY = "read-delete-key-0123456789abcdef0123456789"
 RUN_ID = "e" * 32
 SPAN = {
     "trace_id": RUN_ID,
@@ -110,3 +111,36 @@ def test_scoped_keys_are_scrubbed_from_logs(
     logging.getLogger("agentflight").warning("leak %s %s", INGEST_KEY, READ_KEY)
     assert INGEST_KEY not in caplog.text
     assert READ_KEY not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "setting"),
+    [
+        ({"api_key": "short-secret-key"}, "AGENTFLIGHT_API_KEY"),
+        ({"api_key": "x" * 31}, "AGENTFLIGHT_API_KEY"),
+        (
+            {"scoped_keys": parse_api_keys(f"{READ_KEY}:read,short-secret-key:ingest")},
+            "AGENTFLIGHT_API_KEYS key #2",
+        ),
+    ],
+)
+def test_short_keys_stop_startup_without_echoing_them(
+    engine: Engine, kwargs: dict[str, Any], setting: str
+) -> None:
+    with pytest.raises(RuntimeError) as err:
+        create_app(engine, Settings(**kwargs))
+    message = str(err.value)
+    assert setting in message and "32 characters" in message
+    assert "short-secret-key" not in message and "x" * 31 not in message
+
+
+def test_keys_of_exactly_32_characters_are_accepted(engine: Engine) -> None:
+    create_app(engine, Settings(api_key="a" * 32, scoped_keys=parse_api_keys("b" * 32 + ":read")))
+
+
+def test_short_key_from_env_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENTFLIGHT_API_KEYS", "tiny:read")
+    monkeypatch.delenv("AGENTFLIGHT_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="shorter than 32") as err:
+        Settings.from_env().validate()
+    assert "tiny" not in str(err.value)

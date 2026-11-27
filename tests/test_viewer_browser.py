@@ -23,8 +23,8 @@ import pytest
 sync_api = pytest.importorskip("playwright.sync_api")
 
 ROOT = Path(__file__).resolve().parents[1]
-FULL_KEY = "browser-full-key-0123456789abcdef"
-READ_KEY = "browser-read-key-0123456789abcdef"
+FULL_KEY = "browser-full-key-0123456789abcdef0123456789"
+READ_KEY = "browser-read-key-0123456789abcdef0123456789"
 
 
 def _free_port() -> int:

@@ -61,6 +61,7 @@ def _bool(name: str, default: bool) -> bool:
 
 
 DEFAULT_STALE_AFTER_MINUTES = 60.0
+MIN_KEY_CHARS = 32  # API keys shorter than this are refused at startup
 DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024  # 16 MiB per request
 # The SDK's OTel batch processor exports at most 512 spans per request by default.
 DEFAULT_MAX_SPANS_PER_BATCH = 2048
@@ -122,6 +123,19 @@ class Settings:
                 "local development only, set AGENTFLIGHT_AUTH_DISABLED=true to run without "
                 "authentication."
             )
+        # Short keys are guessable, and there is no login rate limit yet, so refuse them.
+        # Never include the key in the message.
+        if self.api_key is not None and len(self.api_key) < MIN_KEY_CHARS:
+            raise RuntimeError(
+                f"AGENTFLIGHT_API_KEY is shorter than {MIN_KEY_CHARS} characters; "
+                "generate one with: openssl rand -hex 32"
+            )
+        for n, (key, _) in enumerate(self.scoped_keys, start=1):
+            if len(key) < MIN_KEY_CHARS:
+                raise RuntimeError(
+                    f"AGENTFLIGHT_API_KEYS key #{n} is shorter than {MIN_KEY_CHARS} "
+                    "characters; generate one with: openssl rand -hex 32"
+                )
         if self.api_key and any(k == self.api_key for k, _ in self.scoped_keys):
             raise RuntimeError("AGENTFLIGHT_API_KEYS repeats AGENTFLIGHT_API_KEY")
         if any(not perms for _, perms in self.scoped_keys):

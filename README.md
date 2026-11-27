@@ -427,6 +427,11 @@ The server starts if at least one of `AGENTFLIGHT_API_KEY` and `AGENTFLIGHT_API_
 set. Give recorders an `ingest`-only key, so a leaked agent key can't read or delete
 history, and give people and dashboards a `read` key.
 
+- Every configured key must be at least 32 characters (`openssl rand -hex 32` gives 64);
+  a shorter one stops the server at startup, and the error names the setting, not the
+  key. That is what makes guessing impractical: **the sign-in page and the API have no
+  rate limit on failed keys yet** (deferred; put a rate-limiting proxy in front if you
+  need one now).
 - Keys are compared in constant time (`hmac.compare_digest`). Wrong or missing keys get
   `401`, and the response never echoes the key.
 - Endpoints require an `ingest`, `read` or `delete` permission. A valid key without the

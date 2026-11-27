@@ -212,9 +212,12 @@ def test_recorded_content_is_escaped_everywhere(ui: TestClient) -> None:
 def test_viewer_needs_read_permission_only(engine: Engine) -> None:
     from agentflight.server.settings import parse_api_keys
 
-    keys = parse_api_keys("viewer-key-0123456789:read")
+    keys = parse_api_keys("viewer-key-0123456789abcdef0123456789:read")
     c = TestClient(create_app(engine, Settings(scoped_keys=keys)), follow_redirects=False)
-    assert c.post("/ui/login", data={"key": "viewer-key-0123456789"}).status_code == 303
+    assert (
+        c.post("/ui/login", data={"key": "viewer-key-0123456789abcdef0123456789"}).status_code
+        == 303
+    )
     assert c.get("/ui").status_code == 200
     for method in ("post", "put", "delete"):
         assert getattr(c, method)(f"/ui/runs/{'a' * 32}").status_code == 405

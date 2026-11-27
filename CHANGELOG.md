@@ -12,6 +12,10 @@ can break a client is listed under **Behaviour changes**.
   reported success, so it no longer looks successful. Migration `0003` updates runs stored
   earlier (its downgrade maps them back to `ok`). Runs recorded with the SDK are not
   affected: the SDK always sets `ok` or `error`.
+- **API keys must be at least 32 characters.** The server refuses to start if
+  `AGENTFLIGHT_API_KEY` or any `AGENTFLIGHT_API_KEYS` key is shorter (the error names the
+  setting, never the key). There is still no rate limit on failed keys; long random keys
+  are what keep guessing impractical until there is.
 - **`GET /v1/runs?status=` is validated.** Allowed values are `running`, `ok`, `error`,
   `unknown` and `abandoned`; anything else gets `422` instead of an empty list.
 - **Ingest is bounded.** `POST /v1/spans` answers `413` when a request breaks a size limit
