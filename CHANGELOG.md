@@ -19,6 +19,8 @@ can break a client is listed under **Behaviour changes**.
 - **Incomplete recordings are visible.** Runs have `dropped_spans` (migration `0004`, 0
   for existing runs) in `/v1/runs` and run detail, and the viewer's run list and run page
   show "incomplete recording: N spans dropped".
+- **Replay warns about incomplete recordings** as `replay()`/`fork()` start, and
+  `Recording` has `dropped_spans` and `incomplete`.
 
 ### Changed
 

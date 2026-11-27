@@ -340,3 +340,72 @@ def test_on_divergence_is_validated(recorded: TestClient) -> None:
         ),
     ):
         pass
+
+
+def _doc(dropped: int | None, *, on_root: bool = False) -> dict[str, Any]:
+    root_attrs: dict[str, Any] = {A.KIND: A.RUN}
+    doc: dict[str, Any] = {"id": "ab" * 16, "name": "bursty", "events": []}
+    if on_root:
+        root_attrs[A.RUN_DROPPED_SPANS] = dropped
+    elif dropped is not None:
+        doc["dropped_spans"] = dropped
+    doc["events"] = [
+        {"span_id": "1" * 16, "kind": "run", "attributes": root_attrs, "start_time_ns": 1}
+    ]
+    return doc
+
+
+def _replay_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "incomplete recording" in r.getMessage()]
+
+
+def test_replaying_an_incomplete_recording_warns_up_front(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from agentflight.replayer import fork, replay
+
+    rec = Recording.from_run(_doc(12))
+    assert (rec.incomplete, rec.dropped_spans) == (True, 12)
+    with caplog.at_level("WARNING"), replay(rec) as session:
+        # Before any step has run, the warning is already out.
+        assert session.cursor == 0
+        (warning,) = _replay_warnings(caplog)
+    assert "12 spans dropped" in warning and "ab" * 16 in warning and "replay" in warning
+    caplog.clear()
+    with caplog.at_level("WARNING"), fork(rec, 0):
+        (warning,) = _replay_warnings(caplog)
+    assert "fork" in warning
+
+
+def test_complete_recordings_replay_without_the_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from agentflight.replayer import replay
+
+    rec = Recording.from_run(_doc(0))
+    assert not rec.incomplete
+    with caplog.at_level("WARNING"), replay(rec):
+        pass
+    assert _replay_warnings(caplog) == []
+
+
+def test_saved_documents_fall_back_to_the_run_span() -> None:
+    assert Recording.from_run(_doc(3, on_root=True)).dropped_spans == 3
+    assert Recording.from_run(_doc(None)).dropped_spans == 0
+    assert Recording.from_run({**_doc(None), "dropped_spans": "junk"}).dropped_spans == 0
+
+
+def test_fetched_recording_knows_it_is_incomplete(recorded: TestClient) -> None:
+    span = {
+        "trace_id": "ee" * 16,
+        "span_id": "2" * 16,
+        "name": "run:bursty",
+        "start_time_ns": 1,
+        "end_time_ns": 2,
+        "status": "ok",
+        "attributes": {A.KIND: A.RUN, A.RUN_DROPPED_SPANS: 4},
+    }
+    auth = {"Authorization": f"Bearer {TEST_KEY}"}
+    assert recorded.post("/v1/spans", json={"spans": [span]}, headers=auth).status_code == 202
+    rec = Recording.fetch("ee" * 16, "http://testserver", api_key=TEST_KEY, client=recorded)
+    assert rec.dropped_spans == 4

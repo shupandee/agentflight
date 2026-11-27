@@ -229,6 +229,10 @@ a step, then runs live from there.
   tools. File writes, database queries, raw HTTP, the clock and randomness inside your
   agent still run live during a replay. Replay only notices them indirectly, when they
   change the input of a later step and that step diverges.
+- **An incomplete recording can't replay faithfully.** If the recorder dropped spans of
+  the run (full export queue), `replay()` and `fork()` log a warning as they start, before
+  any step runs, and `Recording.incomplete` / `Recording.dropped_spans` say so. Missing
+  steps then show up as divergences, or as live calls with `on_divergence="live"`.
 - **Not covered yet:** LangGraph runs (their model and tool calls go through LangChain,
   which can't be intercepted yet; LangGraph's own checkpointer time travel covers some of
   this) and streamed OpenAI calls (`stream=True`).
