@@ -16,6 +16,9 @@ LLM_TOKENS_OUT = "agentflight.llm.tokens_out"
 LLM_COST_USD = "agentflight.llm.cost_usd"
 LLM_PARAMS = "agentflight.llm.params"
 
+# Which integration produced a span (e.g. "openai", "langgraph"); unset for manual calls.
+INTEGRATION = "agentflight.integration"
+
 TOOL_NAME = "agentflight.tool.name"
 TOOL_ARGS = "agentflight.tool.args"
 TOOL_RESULT = "agentflight.tool.result"
