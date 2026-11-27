@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _config(url: str) -> Config:
     cfg = Config(str(ROOT / "alembic.ini"))
-    cfg.set_main_option("script_location", str(ROOT / "migrations"))
+    cfg.set_main_option("script_location", "agentflight.server:migrations")
     cfg.attributes["url"] = url
     return cfg
 
@@ -327,3 +327,22 @@ def test_0004_adds_dropped_spans_with_zero_for_existing_runs(db_url: str) -> Non
     engine.dispose()
     assert "dropped_spans" not in names
     command.downgrade(cfg, "base")
+
+
+def test_migrate_command_uses_the_packaged_migrations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentflight.server import cli
+
+    url = f"sqlite:///{tmp_path / 'cli.db'}"
+    monkeypatch.setenv("AGENTFLIGHT_DATABASE_URL", url)
+    monkeypatch.chdir(tmp_path)  # no alembic.ini or source checkout needed
+    assert cli.main(["migrate"]) == 0
+    engine = make_engine(url)
+    try:
+        assert {"runs", "events", "alembic_version"} <= set(inspect(engine).get_table_names())
+        with engine.connect() as conn:
+            head = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+        assert head.startswith("0004")
+    finally:
+        engine.dispose()

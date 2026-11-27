@@ -64,8 +64,8 @@ docker compose up --build
 
 # or without Docker, using SQLite:
 pip install -e ".[server]"
-alembic upgrade head            # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
-uvicorn agentflight.server.main:app
+agentflight-server migrate      # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
+agentflight-server serve        # http://127.0.0.1:8000
 
 # 2. Record the toy agent (the SDK reads AGENTFLIGHT_API_KEY)
 pip install -e .

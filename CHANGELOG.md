@@ -6,6 +6,13 @@ can break a client is listed under **Behaviour changes**.
 
 ## Unreleased
 
+### Added
+
+- **`agentflight-server migrate [revision]`** applies the database migrations, which now
+  ship inside the package (`agentflight/server/migrations`), so a server installed from a
+  wheel can create and upgrade its database without a source checkout. `alembic upgrade
+  head` from a checkout still works. The Docker image uses the new command.
+
 ### Changed
 
 - **Run spans skip the batch queue.** A run's root span goes to a small lane of its own,

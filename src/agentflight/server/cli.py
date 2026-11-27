@@ -30,6 +30,21 @@ def cleanup_once(settings: Settings, *, days: float | None, dry_run: bool) -> in
     return count
 
 
+def migrate(revision: str = "head", url: str | None = None) -> None:
+    """Upgrade the database (``AGENTFLIGHT_DATABASE_URL`` unless ``url``) to ``revision``.
+
+    Uses the migrations shipped in the package, so it works without a source checkout.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config()
+    cfg.set_main_option("script_location", "agentflight.server:migrations")
+    if url is not None:
+        cfg.attributes["url"] = url
+    command.upgrade(cfg, revision)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agentflight-server")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -37,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     serve = sub.add_parser("serve", help="run the HTTP server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+
+    mig = sub.add_parser("migrate", help="apply database migrations (AGENTFLIGHT_DATABASE_URL)")
+    mig.add_argument("revision", nargs="?", default="head", help="target revision (default head)")
 
     clean = sub.add_parser("cleanup", help="delete runs older than the retention period")
     clean.add_argument("--days", type=float, help="override AGENTFLIGHT_RETENTION_DAYS")
@@ -54,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         uvicorn.run("agentflight.server.main:app", host=args.host, port=args.port)
+        return 0
+
+    if args.command == "migrate":
+        migrate(args.revision)
         return 0
 
     settings = Settings.from_env()
