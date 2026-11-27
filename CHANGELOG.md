@@ -1,10 +1,85 @@
 # Changelog
 
-All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefix; while
-the project is in early development (`0.x`), `/v1` can still change, and every change that
-can break a client is listed under **Behaviour changes**.
+All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefix (see
+"HTTP API versioning" under 0.1.0); every change that can break a client is listed under
+**Behaviour changes**.
 
-## Unreleased (week 7)
+## 0.1.0 (not yet released; dated when it is tagged)
+
+The first release on PyPI, as **`agentflight-sdk`** (the name `agentflight` is too close
+to an existing PyPI project): `pip install agentflight-sdk` for the SDK,
+`pip install "agentflight-sdk[server]"` for the server and viewer. The import name is
+still `agentflight`. It contains everything
+below (weeks 1-7) plus the changes in this section.
+
+### HTTP API versioning
+
+Every endpoint a client uses is under `/v1`: `POST /v1/spans` (ingest),
+`GET /v1/runs`, `GET /v1/runs/{run_id}`, `GET /v1/runs/{run_id}/events/{span_id}` and
+`DELETE /v1/runs/{run_id}`. `/health` and `/ready` are unversioned, and the viewer's
+`/ui` pages are not an API. From 0.1.0 on, `/v1` is stable:
+
+- **Only additive changes within `/v1`:** new endpoints, new optional request fields or
+  query parameters, new response fields and new values where a field is documented as
+  open-ended. Clients must ignore response fields they don't know.
+- **Nothing is removed, renamed or given a new meaning within `/v1`:** paths, methods,
+  required fields, field types, status codes, auth scopes, paging and the span JSON that
+  `POST /v1/spans` accepts (including the `agentflight.*` attributes the server reads).
+- **A breaking change means `/v2`.** `/v2` would be served next to `/v1` for at least one
+  minor release after it ships, and `/v1`'s removal would be announced here under
+  Behaviour changes first.
+- **Any SDK 0.1+ works with any server 0.1+** as long as both speak `/v1`; the SDK only
+  uses `POST /v1/spans`, and the replayer the read endpoints.
+- Security fixes are the one exception: if a `/v1` behaviour is unsafe it can change in
+  a patch release, and the change is listed here.
+
+The Python API is not covered by this: while AgentFlight is `0.x`, a minor release
+(0.2, 0.3, ...) can still change it, and every such change is listed under Behaviour
+changes.
+
+### Packaging
+
+- **Version 0.1.0**, read by the build from `agentflight.__version__`. Package metadata
+  now has classifiers, keywords, project URLs and the license file; README links and
+  images are absolute so they work on PyPI; the sdist holds the source, tests, examples
+  and scripts only.
+- **Release workflow** (`.github/workflows/release.yml`): pushing a tag `v*` runs the
+  full CI suite (`ci.yml`, reused), then builds the sdist and wheel, checks the tag
+  matches the version, runs `twine check --strict`, smoke-tests the wheel in a clean venv
+  (`scripts/smoke_installed.py`) and only then publishes to PyPI as `agentflight-sdk` with
+  Trusted Publishing (environment `pypi`, no stored token).
+
+### Added
+
+- **Bounded on-disk spool (opt-in):** `configure(spool_dir=...)` or
+  `AGENTFLIGHT_SPOOL_DIR`. Spans whose export failed in a way that may clear up are kept
+  on disk and sent at the start of later exports (including after a restart), oldest
+  first, within the attempt cap and with the usual 413 splitting. Bounded by size
+  (`spool_max_bytes`, 64 MiB) and age (`spool_max_age_s`, 24 h), private (`0700`/`0600`),
+  fail-open (full disk, unwritable directory, corrupt files) and never on the agent's
+  thread, so it needs `batch=True`.
+- **`agentflight-server migrate [revision]`** applies the database migrations, which now
+  ship inside the package (`agentflight/server/migrations`), so a server installed from a
+  wheel can create and upgrade its database without a source checkout. `alembic upgrade
+  head` from a checkout still works. The Docker image uses the new command.
+
+### Changed
+
+- **Benchmark rerun** with run spans on their own lane (5 repeats): every dropped span
+  was recorded on its run and every run closed, also in the tight loop that drops about
+  half the spans. The benchmark now reports how many runs the server has with a final
+  status.
+- **Export errors are reported as `HTTP <status> from <url>`** instead of the httpx
+  exception's repr, and other 4xx answers are counted as rejected for good (not spooled).
+- **Run spans skip the batch queue.** A run's root span goes to a small lane of its own,
+  sent by a dedicated thread as soon as the run ends (with a deadline, the exporter's
+  `timeout`), so a run whose other spans were dropped still closes with its status and
+  `dropped_spans` instead of showing as `abandoned`. Ending a run never waits on the
+  network; `flush()`/`shutdown()` wait for the lane within their timeouts. The queue
+  slots that used to be kept for run spans are gone. New:
+  `AgentFlightExporter.export_within(spans, deadline_s)`.
+
+## Week 7 (merged in #5)
 
 ### Added
 

@@ -135,6 +135,8 @@ class Sample:
     spans_stored: int | None = None
     sdk_dropped: int | None = None  # spans the SDK counted as dropped
     on_runs: int | None = None  # of those, recorded on the runs' run spans
+    runs_sent: int = 0
+    runs_closed: int | None = None  # runs the server has with a final status
     wall_s: float = 0.0  # warm-up + timed runs + final flush
 
 
@@ -230,8 +232,8 @@ def _no_exporter() -> None:
     agentflight.sdk._recorder = agentflight.sdk.Recorder()
 
 
-def _stored(db: Path) -> dict[str, tuple[int, int]]:
-    """run name -> (spans stored, dropped spans recorded on its run spans)."""
+def _stored(db: Path) -> dict[str, tuple[int, int, int]]:
+    """run name -> (spans stored, dropped spans recorded on its run spans, runs closed)."""
     engine = create_engine(f"sqlite:///{db}")
     with engine.connect() as conn:
         spans: dict[str, int] = dict(
@@ -245,8 +247,17 @@ def _stored(db: Path) -> dict[str, tuple[int, int]]:
         dropped: dict[str, int | None] = dict(
             conn.execute(text("SELECT name, sum(dropped_spans) FROM runs GROUP BY name")).all()
         )
+        closed: dict[str, int] = dict(
+            conn.execute(
+                text("SELECT name, count(*) FROM runs WHERE status != 'running' GROUP BY name")
+            ).all()
+        )
     engine.dispose()
-    return {name: (int(spans.get(name, 0)), int(dropped.get(name) or 0)) for name in dropped}
+    return {
+        name: (int(spans.get(name, 0)), int(dropped.get(name) or 0), int(closed.get(name, 0)))
+        for name in dropped
+        if name is not None
+    }
 
 
 def ingest_rate(url: str, payload: str, batches: int) -> float:
@@ -311,6 +322,7 @@ def one_repeat(args: argparse.Namespace, server_cpus: list[int]) -> Repeat:
                 sample.wall_s = time.perf_counter() - wall
                 if "HTTP" in name:
                     sample.spans_sent = (runs + warmup) * SPANS_PER_RUN
+                    sample.runs_sent = runs + warmup
                     sample.sdk_dropped = agentflight.get_recorder().dropped_spans
                     names[(label, name)] = (run_name, 0)
                 agentflight.shutdown()
@@ -319,9 +331,10 @@ def one_repeat(args: argparse.Namespace, server_cpus: list[int]) -> Repeat:
         time.sleep(0.5)
         stored = _stored(db)
         for key, (run_name, _) in names.items():
-            spans, on_runs = stored.get(run_name, (0, 0))
+            spans, on_runs, closed = stored.get(run_name, (0, 0, 0))
             rep.samples[key].spans_stored = spans
             rep.samples[key].on_runs = on_runs
+            rep.samples[key].runs_closed = closed
     return rep
 
 
@@ -340,7 +353,7 @@ def machine_info() -> list[str]:
                 virt = f", VM ({line.split(':', 1)[1].strip()})"
     versions = ", ".join(
         f"{p} {metadata.version(p)}"
-        for p in ("agentflight", "opentelemetry-sdk", "httpx", "fastapi", "uvicorn")
+        for p in ("agentflight-sdk", "opentelemetry-sdk", "httpx", "fastapi", "uvicorn")
     )
     return [
         f"- Machine: {platform.system()} {platform.release()} ({platform.machine()}), {cpu}, "
@@ -369,9 +382,9 @@ def report(args: argparse.Namespace, info: list[str], repeats: list[Repeat], cpu
     print(f"- CPUs: {cpus}\n")
     print(
         "| Payload | Scenario | Median per run | Spread of medians | p95 per run "
-        "| Added per span | Spans stored | Dropped (SDK count / on runs) |"
+        "| Added per span | Spans stored | Dropped (SDK count / on runs) | Runs closed |"
     )
-    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     rows: list[dict[str, Any]] = []
     scenarios = list(dict.fromkeys(name for (_, name) in repeats[0].samples))
     for label in PAYLOADS:
@@ -394,11 +407,18 @@ def report(args: argparse.Namespace, info: list[str], repeats: list[Repeat], cpu
                 else None
             )
             on_runs = sum(s.on_runs or 0 for s in samples)
+            runs_sent = sum(s.runs_sent for s in samples)
+            closed = (
+                sum(s.runs_closed or 0 for s in samples)
+                if samples[0].runs_closed is not None
+                else None
+            )
             print(
                 f"| {label} | {name} | {median:,.1f} µs | {_range(medians)} µs "
                 f"| {p95:,.1f} µs | {'—' if added is None else f'{added:,.1f} µs'} "
                 f"| {'—' if stored is None else f'{stored:,} of {sent:,}'} "
-                f"| {'—' if dropped is None else f'{dropped:,} / {on_runs:,}'} |"
+                f"| {'—' if dropped is None else f'{dropped:,} / {on_runs:,}'} "
+                f"| {'—' if closed is None else f'{closed:,} of {runs_sent:,}'} |"
             )
             rows.append(
                 {
@@ -412,6 +432,8 @@ def report(args: argparse.Namespace, info: list[str], repeats: list[Repeat], cpu
                     "spans_stored": stored,
                     "sdk_dropped": dropped,
                     "dropped_on_runs": on_runs,
+                    "runs_sent": runs_sent,
+                    "runs_closed": closed,
                 }
             )
     print("\n### Server ingest rate\n")

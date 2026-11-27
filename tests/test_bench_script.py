@@ -32,5 +32,6 @@ def test_overhead_benchmark_runs(tmp_path: Path) -> None:
     assert len(http) == 6
     # A handful of runs can't fill the queue: everything sent is stored, nothing dropped.
     assert all(r["spans_stored"] == r["spans_sent"] and r["sdk_dropped"] == 0 for r in http)
+    assert all(r["runs_closed"] == r["runs_sent"] > 0 for r in http)
     assert all(v["median_spans_per_s"] > 0 for v in data["ingest"].values())
     assert "spans/s" in proc.stdout

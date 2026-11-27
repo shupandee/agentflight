@@ -4,7 +4,7 @@ A black box recorder for AI agents. AgentFlight records what an agent does durin
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
 is stored as an ordered timeline you can query, replay and fork.
 
-> Status: early development (week 5, viewer). APIs may change; see [CHANGELOG.md](CHANGELOG.md).
+> Status: early development (week 5, viewer). APIs may change; see [CHANGELOG.md](https://github.com/shupandee/agentflight/blob/main/CHANGELOG.md).
 
 ## AgentFlight, Langfuse, LangSmith or Phoenix?
 
@@ -62,13 +62,15 @@ export AGENTFLIGHT_API_KEY=$(openssl rand -hex 32)
 # 1. Server + Postgres + retention job (applies Alembic migrations on start)
 docker compose up --build
 
-# or without Docker, using SQLite:
+# or without Docker, using SQLite (from a checkout; once 0.1.0 is on PyPI,
+# `pip install "agentflight-sdk[server]"` works too):
 pip install -e ".[server]"
-alembic upgrade head            # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
-uvicorn agentflight.server.main:app
+agentflight-server migrate      # uses AGENTFLIGHT_DATABASE_URL, default sqlite:///./agentflight.db
+agentflight-server serve        # http://127.0.0.1:8000
 
 # 2. Record the toy agent (the SDK reads AGENTFLIGHT_API_KEY)
-pip install -e .
+pip install -e .                # or, once 0.1.0 is on PyPI: pip install agentflight-sdk
+                                # (the package is agentflight-sdk; you import agentflight)
 python examples/toy_agent.py
 
 # 3. Inspect: open http://localhost:8000/ui and sign in with the key, or use the API
@@ -93,13 +95,13 @@ The server includes a read-only viewer at `/ui`:
   on demand. An incomplete recording gets a warning above the timeline. (To page in tree order the server reads every span's id and parent for each
   page, which is cheap next to loading the events themselves.)
 
-![Run list with filters](docs/screenshots/run-list.png)
+![Run list with filters](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-list.png)
 
-![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](docs/screenshots/run-page.png)
+![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-page.png)
 
-![A LangGraph run: model and tool calls nested under graph nodes](docs/screenshots/span-tree.png)
+![A LangGraph run: model and tool calls nested under graph nodes](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/span-tree.png)
 
-![A fork run, linked to its source run, with cached, overridden and live steps](docs/screenshots/fork-run.png)
+![A fork run, linked to its source run, with cached, overridden and live steps](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/fork-run.png)
 
 The screenshots come from the browser smoke test against the example agents; regenerate
 them with `AGENTFLIGHT_SCREENSHOT_DIR=docs/screenshots pytest tests/test_viewer_browser.py`.
@@ -151,7 +153,7 @@ Optional extras; the core SDK depends on neither package.
 ### OpenAI-style chat clients
 
 ```bash
-pip install "agentflight[openai]"
+pip install "agentflight-sdk[openai]"
 ```
 
 ```python
@@ -182,7 +184,7 @@ with agentflight.run("support-agent"):
 ### LangGraph
 
 ```bash
-pip install "agentflight[langgraph]"
+pip install "agentflight-sdk[langgraph]"
 ```
 
 ```python
@@ -351,6 +353,20 @@ Guarantees:
   `__str__` raise. Values are cut off at 32,000 characters.
 - **No blocking in the default mode.** With `batch=True` (the default), spans are exported
   on a background thread, so a hanging server doesn't slow the agent down.
+- **Run spans skip the queue.** A run's root span (the one that closes the run and
+  carries its status and drop count) doesn't go through the bounded batch queue. It goes
+  to a lane of its own, which a dedicated thread sends as soon as the run ends, several at
+  a time if runs end together. So a run whose other spans were dropped still closes on
+  the server instead of staying `running` and later showing as `abandoned`. Ending a run
+  only appends the span to that lane under a lock; the agent thread never waits on the
+  network. Each send has a deadline: no request starts after it, and each request's
+  timeouts are capped to what is left of it (the exporter's `timeout`, 5 s by default).
+  It's still best effort and fail-open: if the send fails or runs out of time, the run
+  span is lost like any failed export (and the run can end up `abandoned`), and if more
+  than 1,024 run spans are waiting, new ones are dropped and counted. Each run span is
+  handed to the exporter once, never to both the lane and the queue. The exporter is
+  only ever called by one thread at a time, so a run span can wait for a batch that is
+  being sent. `flush()` and `shutdown()` wait for the lane too, within their timeouts.
 - **Bounded waits.** `flush(timeout_millis=30_000)` and `shutdown(timeout_millis=30_000)`
   never raise and return within their timeout. AgentFlight enforces this itself, because
   OpenTelemetry's isn't reliable: in opentelemetry-sdk 1.45, `force_flush(300)` against a
@@ -361,11 +377,52 @@ Guarantees:
   the same way.
 - **A bad configuration disables recording instead of raising.**
 
+### On-disk spool (opt-in)
+
+```python
+agentflight.configure("http://localhost:8000", spool_dir="/var/tmp/agentflight-spool")
+# or AGENTFLIGHT_SPOOL_DIR=/var/tmp/agentflight-spool
+```
+
+With a spool directory, spans that weren't stored because of a failure that may clear up
+(server down, transport error, timeout, 5xx, 408/425/429, rejected credentials, the
+attempt cap or the run span deadline) are written to disk, one file per failed batch,
+instead of being dropped. Every later export first sends what is spooled, oldest first,
+then its own batch; when a process restarts (or crashed), its first export sends what the
+last one left behind. Run spans are sent before the spool is replayed.
+
+- **Same rules as any export.** Replay shares the export's attempt cap
+  (`max_export_attempts`), is split on 413 like any batch, and stops at the first other
+  failure; what isn't sent stays on disk for the next export. A file that was partly sent
+  keeps only the spans still unsent, in its place in line. Spans the server rejects for
+  good (a single span over its body cap, other 4xx) are not spooled. The server upserts by
+  span id, so a span that is sent twice (the server stored it, but the response was lost)
+  is harmless.
+- **Bounded.** At most `spool_max_bytes` (`AGENTFLIGHT_SPOOL_MAX_BYTES`, default 64 MiB)
+  and 10,000 files; when a new batch doesn't fit, the oldest files are deleted. Files older
+  than `spool_max_age_s` (`AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS`, default 24 h) are deleted
+  unsent. A batch bigger than the whole spool isn't kept.
+- **Private.** The spool holds recorded payloads (after `redact`) in plain JSON. The
+  directory is created `0700` (an existing one you own is tightened to `0700`) and files
+  are created `0600`; a directory that is a symlink or belongs to another user is not used.
+- **Fail-open.** A full disk, a directory that can't be created or written, or a corrupt
+  file (deleted when found) loses those spans, logs one warning per kind of problem and
+  never raises. Files are written to a temporary name and renamed, so a crash mid-write
+  leaves no half file in line (stale temporary files are cleaned up after an hour).
+  `get_recorder().spool.dropped` counts the spans the spool gave up on.
+- **Never on the agent's thread.** Spool writes and replay run on the export threads
+  (the batch worker and the run-span lane). That's why it needs `batch=True`: with
+  `batch=False` the export runs on the agent's thread, so `spool_dir` is ignored with a
+  warning. It also only works with the built-in exporter.
+- **One process per directory is best.** Two processes sharing one spool can both send
+  the same file; that's safe (ingest is idempotent) but wasted work.
+
 Limitations (known, not yet handled):
 
-- **Lost spans.** If export fails, those spans are dropped. There's no retry, no disk
-  buffer and no dead-letter queue yet. If the server is unreachable, the run is simply
-  missing from the recording.
+- **Lost spans, unless you turn on the spool.** By default, spans whose export fails are
+  dropped, and if the server is unreachable the run is missing from the recording. With
+  the on-disk spool (below), failures that may clear up are retried on later exports;
+  without it there's no retry.
 - **The batch queue is bounded.** It holds 2048 finished spans by default; set it with
   `configure(max_queue_size=...)` or `AGENTFLIGHT_MAX_QUEUE_SIZE` (OpenTelemetry's
   `OTEL_BSP_MAX_QUEUE_SIZE` also works). When the queue is full, spans are dropped rather
@@ -375,11 +432,12 @@ Limitations (known, not yet handled):
   itself before handing a span to OpenTelemetry, so it knows every span it drops (on its
   own, OpenTelemetry 1.45 drops the *oldest* queued span, which can belong to another
   run). When a run ends, the spans of that run dropped so far go on the run span as
-  `agentflight.run.dropped_spans`, and the viewer and replay warn about it. A few queue
-  slots are kept for run spans so the span carrying the count is rarely the one dropped.
-  What this can't cover: spans of the run that end *after* the run span (background
-  threads or tasks still running), a run span that is itself dropped, and spans lost
-  later in export (server down, see "Lost spans"). Those are only in the recorder's
+  `agentflight.run.dropped_spans`, and the viewer and replay warn about it. Run spans
+  skip the queue (see "Run spans skip the queue"), so the span carrying the count isn't
+  competing with the spans it counts. What this can't cover: spans of the run that end
+  *after* the run span (background threads or tasks still running), a run span dropped
+  because more than 1,024 were waiting to be sent, and spans lost later in export
+  (server down, see "Lost spans"). Those are only in the recorder's
   total, `agentflight.get_recorder().dropped_spans`, and a warning is logged on the first
   drop. `batch=False` has no queue and never drops this way.
 - **`batch=False` blocks.** It exports inside the agent's thread, so each span can block
@@ -394,11 +452,11 @@ Limitations (known, not yet handled):
 
 ## Overhead
 
-Measured with [`scripts/bench_overhead.py`](scripts/bench_overhead.py) on 2026-11-27:
-**5 repeats**, each against a fresh server. Raw output:
-[`docs/benchmarks/overhead-2026-11-27-5-repeats.md`](docs/benchmarks/overhead-2026-11-27-5-repeats.md)
-(and [`.json`](docs/benchmarks/overhead-2026-11-27-5-repeats.json)). The numbers
-published with week 6 came from a single run; these replace them.
+Measured with [`scripts/bench_overhead.py`](https://github.com/shupandee/agentflight/blob/main/scripts/bench_overhead.py) on 2026-11-27, with run
+spans on their own lane (0.1.0): **5 repeats**, each against a fresh server. Raw output:
+[`docs/benchmarks/overhead-2026-11-27-run-lane.md`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-run-lane.md)
+(and [`.json`](https://github.com/shupandee/agentflight/blob/main/docs/benchmarks/overhead-2026-11-27-run-lane.json)). Earlier numbers (a single run
+for week 6, 5 repeats before run spans had their own lane) are in the git history.
 
 **Method.** The "agent" makes 5 model calls and 5 tool calls that do no work, so a run is
 11 spans and nearly all of its time is recording overhead. In each repeat, each scenario
@@ -407,28 +465,28 @@ the agent thread with `time.perf_counter_ns`. The table gives the median of the 
 per-repeat medians, the spread of those medians (min to max), the median p95, and the
 added time per span versus the same code without AgentFlight. The HTTP scenarios export
 to a real server (uvicorn + SQLite, separate process); the benchmark is pinned to one CPU
-and the server to the other seven, and afterwards the spans the server stored and the
-spans the SDK counted as dropped are added up over all repeats. Messages are about 100
-characters ("small") or 8,000 ("large").
+and the server to the other seven, and afterwards the spans the server stored, the spans
+the SDK counted as dropped and the runs the server has with a final status are added up
+over all repeats. Messages are about 100 characters ("small") or 8,000 ("large").
 
 **Machine.** Linux 6.12 x86_64 VM (KVM), Intel Xeon, 8 vCPUs; CPython 3.13.5,
 opentelemetry-sdk 1.45.2, httpx 0.29.0, uvicorn 0.54.0. The box is shared: the 1-minute
-load average at the start of the repeats ranged from 0.57 to 2.28.
+load average at the start of the repeats ranged from 0.81 to 1.24.
 
-| Payload | Scenario | Median per run | Spread (5 medians) | p95 | Added per span | Spans stored | Dropped (SDK count) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| small | no AgentFlight | 0.7 µs | 0.7 to 0.8 µs | 0.7 µs | — | — | — |
-| small | SDK, no exporter | 380.3 µs | 373.4 to 384.0 µs | 390.3 µs | 34.5 µs | — | — |
-| small | SDK + JSON serialization, no network | 524.6 µs | 518.0 to 533.4 µs | 539.4 µs | 47.6 µs | — | — |
-| small | HTTP, `batch=True` (default), queue drained every 100 runs | 409.8 µs | 403.8 to 417.3 µs | 542.5 µs | 37.2 µs | 121,000 of 121,000 | 0 |
-| small | HTTP, `batch=True`, tight loop | 406.0 µs | 402.5 to 407.4 µs | 480.4 µs | 36.8 µs | 59,828 of 121,000 | 61,172 |
-| small | HTTP, `batch=False` | 60,948.5 µs | 57,785.9 to 62,717.0 µs | 68,115.0 µs | 5,540.7 µs | 12,100 of 12,100 | 0 |
-| large | no AgentFlight | 1.5 µs | 1.4 to 1.5 µs | 1.5 µs | — | — | — |
-| large | SDK, no exporter | 825.1 µs | 815.3 to 825.3 µs | 838.1 µs | 74.9 µs | — | — |
-| large | SDK + JSON serialization, no network | 1,217.8 µs | 1,215.6 to 1,222.0 µs | 1,237.4 µs | 110.6 µs | — | — |
-| large | HTTP, `batch=True` (default), queue drained every 100 runs | 853.2 µs | 851.1 to 862.5 µs | 1,009.1 µs | 77.4 µs | 121,000 of 121,000 | 0 |
-| large | HTTP, `batch=True`, tight loop | 850.1 µs | 847.4 to 875.6 µs | 1,003.0 µs | 77.1 µs | 58,118 of 121,000 | 62,882 |
-| large | HTTP, `batch=False` | 69,894.8 µs | 68,430.0 to 71,938.2 µs | 76,906.6 µs | 6,353.9 µs | 12,100 of 12,100 | 0 |
+| Payload | Scenario | Median per run | Spread (5 medians) | p95 | Added per span | Spans stored | Dropped (SDK count / on runs) | Runs closed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| small | no AgentFlight | 0.7 µs | 0.7 to 0.8 µs | 0.8 µs | — | — | — | — |
+| small | SDK, no exporter | 383.3 µs | 381.3 to 389.8 µs | 458.5 µs | 34.8 µs | — | — | — |
+| small | SDK + JSON serialization, no network | 532.0 µs | 528.4 to 535.9 µs | 623.2 µs | 48.3 µs | — | — | — |
+| small | HTTP, `batch=True` (default), queue drained every 100 runs | 421.4 µs | 413.0 to 457.3 µs | 784.3 µs | 38.2 µs | 121,000 of 121,000 | 0 / 0 | 11,000 of 11,000 |
+| small | HTTP, `batch=True`, tight loop | 420.0 µs | 416.4 to 447.4 µs | 533.9 µs | 38.1 µs | 55,718 of 121,000 | 65,282 / 65,282 | 11,000 of 11,000 |
+| small | HTTP, `batch=False` | 64,347.6 µs | 59,479.7 to 65,389.2 µs | 71,882.5 µs | 5,849.7 µs | 12,100 of 12,100 | 0 / 0 | 1,100 of 1,100 |
+| large | no AgentFlight | 1.5 µs | 1.4 to 1.6 µs | 1.5 µs | — | — | — | — |
+| large | SDK, no exporter | 833.4 µs | 826.0 to 836.4 µs | 946.6 µs | 75.6 µs | — | — | — |
+| large | SDK + JSON serialization, no network | 1,235.4 µs | 1,228.5 to 1,252.0 µs | 1,397.1 µs | 112.2 µs | — | — | — |
+| large | HTTP, `batch=True` (default), queue drained every 100 runs | 875.7 µs | 865.9 to 878.7 µs | 1,640.2 µs | 79.5 µs | 121,000 of 121,000 | 0 / 0 | 11,000 of 11,000 |
+| large | HTTP, `batch=True`, tight loop | 864.9 µs | 861.3 to 928.2 µs | 1,127.0 µs | 78.5 µs | 60,018 of 121,000 | 60,982 / 60,982 | 11,000 of 11,000 |
+| large | HTTP, `batch=False` | 70,389.9 µs | 66,609.9 to 72,645.4 µs | 80,479.0 µs | 6,398.9 µs | 12,100 of 12,100 | 0 / 0 | 1,100 of 1,100 |
 
 **Server ingest rate**, measured by sending already-recorded spans in 512-span batches
 back to back from one thread (20 batches per payload and repeat), next to how fast the
@@ -436,25 +494,23 @@ tight loop makes spans:
 
 | Payload | Server ingest, spans/s (median of 5) | Spread | Tight loop makes, spans/s | Tight loop: stored, spans/s |
 | --- | ---: | ---: | ---: | ---: |
-| small | 10,356 | 10,076 to 10,441 | 27,092 | 8,648 |
-| large | 4,397 | 4,024 to 4,474 | 12,940 | 3,857 |
+| small | 9,604 | 9,211 to 9,773 | 26,189 | 7,162 |
+| large | 4,248 | 3,735 to 4,362 | 12,718 | 3,371 |
 
 What this says:
 
-- With the default `batch=True`, recording costs the agent about **37 µs per span with
-  small payloads and 77 µs with 8,000-character ones**, about 0.4 ms and 0.85 ms for this
-  11-span run. The five repeats agree to within a few percent.
-- **The dropped spans are a rate mismatch.** The tight loop makes spans 2.6 to 2.9 times
-  faster than one exporter thread and this server store them (27,092 vs 10,356 spans/s
-  small, 12,940 vs 4,397 large), and while the loop runs the exporter also shares the
-  agent's CPU, so the server stored only 8,648 and 3,857 spans/s. The 2,048-span queue
-  fills in well under a second, and about half the spans were dropped (51% and 52% over
-  the five repeats; the earlier single run saw 45-48%). The SDK counted every one:
-  stored + dropped = sent over the five repeats. About two thirds of the drops (41,966 of
-  61,172 small, 41,080 of 62,882 large) were recorded on their runs. The rest are run
-  spans that were themselves dropped once even the slots kept for run spans were full,
-  and the counts those run spans would have carried, so they are only in the SDK total
-  (see "Dropped spans are counted").
+- With the default `batch=True`, recording costs the agent about **38 µs per span with
+  small payloads and 79 µs with 8,000-character ones**, about 0.42 ms and 0.87 ms for
+  this 11-span run. In the `batch=True` rows the slowest repeat was up to 8.5% above
+  the median and the fastest within 2% of it (the box is shared).
+- **The dropped spans are a rate mismatch.** The tight loop makes spans 2.7 to 3.0 times
+  faster than one exporter thread and this server store them (26,189 vs 9,604 spans/s
+  small, 12,718 vs 4,248 large), and while the loop runs the exporter also shares the
+  agent's CPU, so the server stored only 7,162 and 3,371 spans/s. The 2,048-span queue
+  fills in well under a second, and about half the spans were dropped (54% and 50% over
+  the five repeats). The SDK counted every one (stored + dropped = sent), **every drop
+  is recorded on its run** (65,282 of 65,282 small, 60,982 of 60,982 large), and **every
+  run closed** (11,000 of 11,000): run spans skip the queue.
 - Real agents spend hundreds of milliseconds on each model call, far below these rates.
   A burst of thousands of spans can still lose some; `max_queue_size` buys headroom.
 - `batch=False` waits for an HTTP round trip and a database commit per span, about 6 ms
@@ -603,12 +659,14 @@ over the cap on their own are dropped, with one warning per export.
 Splitting is capped at `max_export_attempts` HTTP requests per export (default `32`, set
 it with `configure(max_export_attempts=...)`), and the first failure that isn't a `413`
 (a timeout, a transport error, a 5xx, rejected credentials) stops the export: the halves
-not yet sent are dropped instead of being tried against a server that is already
-failing. Isolating one oversized span in a full 512-span batch takes 19 requests.
+not yet sent are dropped (or spooled, with the [on-disk spool](#on-disk-spool-opt-in))
+instead of being tried against a server that is already failing. Isolating one oversized span in a full 512-span batch takes 19 requests.
 
 Worst case for one export: a server that is down or hanging costs one `timeout` (5 s by
 default), since the first failure ends the export. Only a server that keeps answering
-`413` slowly can make an export take up to `max_export_attempts` × `timeout`. With
+`413` slowly can make an export take up to `max_export_attempts` × `timeout`. Replaying
+the spool is part of the same export and shares its attempt cap, so it doesn't change
+these bounds. With
 `batch=True` (the default) exports run on a background thread; `flush()` and
 `shutdown()` stop waiting at their own timeouts (see [Failure isolation](#failure-isolation)).
 With `batch=False` every span is exported on its own as it ends, so there is nothing to
@@ -639,6 +697,12 @@ permission) removes a single run with all its events, including the messages and
 payloads stored on them.
 
 ## HTTP API
+
+The API is versioned by its `/v1` prefix. From 0.1.0 on, `/v1` only changes in ways
+that don't break clients (new endpoints, optional fields, new response fields; clients
+should ignore fields they don't know); a breaking change would mean `/v2`, served next to
+`/v1` for a while. The full policy is in the
+[changelog](https://github.com/shupandee/agentflight/blob/main/CHANGELOG.md#http-api-versioning).
 
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |
@@ -703,11 +767,16 @@ docker compose down --volumes
 - **Week 6: tree, screenshots, overhead** (done): an indented span tree in the viewer,
   README screenshots, an overhead benchmark with its method and measured results, and a
   cap on the exporter's split-on-413 requests.
-- **Week 7: dropped spans** (this branch): spans dropped from a full export queue are
-  counted and shown as incomplete recordings in the viewer and replay; a configurable
-  queue size; split retries stop at the first non-413 failure; bounded `flush()` and
-  `shutdown()`; benchmark repeats and the server's ingest rate. Deferred: a demo,
-  overhead on real (non-synthetic) agent runs, and a rate limit on failed keys.
+- **Week 7: dropped spans** (done): spans dropped from a full export queue are counted
+  and shown as incomplete recordings in the viewer and replay; a configurable queue size;
+  split retries stop at the first non-413 failure; bounded `flush()` and `shutdown()`;
+  benchmark repeats and the server's ingest rate.
+- **0.1.0** (this branch): run spans on their own lane, so runs with drops still close;
+  release packaging (migrations in the package, `agentflight-server migrate`, a Trusted
+  Publishing release workflow) and the `/v1` stability policy; an opt-in on-disk spool
+  for failed exports. Next: OTLP ingest, `parent_run_id`, server-side redaction, run
+  diff. Deferred: a demo, overhead on real (non-synthetic) agent runs, and a rate limit
+  on failed keys.
 
 ## License
 
