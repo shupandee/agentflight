@@ -398,3 +398,121 @@ def test_single_span_over_the_body_cap_fails_without_looping() -> None:
     exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
     assert exporter.export(_finished_spans(4)) is SpanExportResult.FAILURE
     assert calls == 7  # 4 spans -> 2+2 -> 1+1+1+1: every split tried once
+
+
+def _export_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "agentflight.exporter" and r.levelname == "WARNING"
+    ]
+
+
+def test_single_oversized_span_is_dropped_with_one_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(413)
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with caplog.at_level("WARNING"):
+        assert exporter.export(_finished_spans(1)) is SpanExportResult.FAILURE
+    assert calls == 1
+    warnings = _export_warnings(caplog)
+    assert len(warnings) == 1
+    assert "1 of 1 spans" in warnings[0] and "body cap" in warnings[0]
+
+
+def test_every_dropped_span_in_one_export_shares_one_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exporter = AgentFlightExporter(
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(413)))
+    )
+    with caplog.at_level("WARNING"):
+        assert exporter.export(_finished_spans(4)) is SpanExportResult.FAILURE
+    assert _export_warnings(caplog) == [
+        "agentflight: failed to export 4 of 4 spans: "
+        "span is larger than the server's body cap (HTTP 413)"
+    ]
+
+
+def test_one_half_failing_fails_the_export(caplog: pytest.LogCaptureFixture) -> None:
+    import json
+
+    received: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        names = [s["name"] for s in json.loads(request.content)["spans"]]
+        if len(names) > 2:
+            return httpx.Response(413)
+        if "s0" in names:  # the first half hits a server error
+            return httpx.Response(500)
+        received.extend(names)
+        return httpx.Response(202)
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with caplog.at_level("WARNING"):
+        assert exporter.export(_finished_spans(4)) is SpanExportResult.FAILURE
+    assert sorted(received) == ["s2", "s3"]  # the other half still went through
+    (warning,) = _export_warnings(caplog)
+    assert "2 of 4 spans" in warning and "500" in warning
+
+
+def test_export_attempts_are_capped(caplog: pytest.LogCaptureFixture) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(413)
+
+    exporter = AgentFlightExporter(
+        client=httpx.Client(transport=httpx.MockTransport(handler)), max_attempts=5
+    )
+    with caplog.at_level("WARNING"):
+        # Every span is oversized: uncapped, 64 spans would take 127 requests.
+        assert exporter.export(_finished_spans(64)) is SpanExportResult.FAILURE
+    assert calls == 5
+    (warning,) = _export_warnings(caplog)
+    assert "64 of 64 spans" in warning
+    # The cap is per export: the next export gets a fresh budget.
+    calls = 0
+    exporter.export(_finished_spans(64))
+    assert calls == 5
+
+
+def test_default_cap_isolates_one_oversized_span_in_a_full_batch() -> None:
+    import json
+
+    received = 0
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal received, calls
+        calls += 1
+        names = [s["name"] for s in json.loads(request.content)["spans"]]
+        if "s100" in names:  # one span too big on its own; everything containing it fails
+            return httpx.Response(413)
+        received += len(names)
+        return httpx.Response(202)
+
+    exporter = AgentFlightExporter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert exporter.export(_finished_spans(512)) is SpanExportResult.FAILURE
+    assert (received, calls) == (511, 19)  # 1 + 2 * log2(512), under the default of 32
+
+
+def test_max_attempts_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        AgentFlightExporter(max_attempts=0)
+
+
+def test_configure_passes_max_export_attempts() -> None:
+    rec = agentflight.configure("http://x", batch=False, max_export_attempts=3)
+    exporter = rec.provider._active_span_processor._span_processors[0].span_exporter
+    assert exporter._max_attempts == 3
+    agentflight.shutdown()

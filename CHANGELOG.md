@@ -4,7 +4,16 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 the project is in early development (`0.x`), `/v1` can still change, and every change that
 can break a client is listed under **Behaviour changes**.
 
-## Unreleased (week 5)
+## Unreleased (week 6)
+
+### Changed
+
+- **Split-on-413 retries are capped per export.** The exporter makes at most
+  `max_export_attempts` requests per export (default `32`, `configure(...)` takes it);
+  spans still unsent then are dropped. Each export that drops spans now logs one warning
+  with the count, instead of one per failed request.
+
+## Week 5 (merged in #3)
 
 ### Behaviour changes
 

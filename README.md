@@ -488,8 +488,17 @@ batch sizes are measured. A request over a limit gets `413` and nothing from it 
 | `AGENTFLIGHT_MAX_EVENTS_PER_SPAN` | `1024` | Events on one span (OpenTelemetry's SDK keeps 128 by default) |
 
 A full SDK batch of payload-heavy spans can be bigger than 16 MiB. When the server answers
-`413`, the SDK's exporter splits the batch in half and retries each half, so only a single
-span over the cap is dropped (with a warning).
+`413`, the SDK's exporter splits the batch in half and retries each half, so only spans
+over the cap on their own are dropped, with one warning per export.
+
+Splitting is capped at `max_export_attempts` HTTP requests per export (default `32`, set
+it with `configure(max_export_attempts=...)`); whatever is still unsent then is dropped.
+Isolating one oversized span in a full 512-span batch takes 19 requests. Worst case, one
+export takes `max_export_attempts` × `timeout` (32 × 5 s with the defaults) when every
+request is slow. With `batch=True` (the default) that happens on the exporter's background
+thread, though `flush()` and `shutdown()` wait for it. With `batch=False` every span is
+exported on its own as it ends, so there is nothing to split and a span end blocks for at
+most one `timeout`.
 
 Span, span event and attribute names are limited to 255 characters (`422` above that). If
 you turn off the SDK's payload cap (`max_attr_chars=None`), raise

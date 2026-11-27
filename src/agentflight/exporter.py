@@ -48,11 +48,21 @@ def span_to_dict(span: ReadableSpan) -> dict[str, Any]:
     }
 
 
+DEFAULT_MAX_ATTEMPTS = 32
+"""HTTP requests one ``export()`` may make while splitting batches the server rejects
+with 413. Isolating one oversized span in a 512-span batch takes 19."""
+
+
 class AgentFlightExporter(SpanExporter):
     """POSTs batches of spans as JSON to ``{endpoint}/v1/spans``.
 
     ``api_key`` is sent as ``Authorization: Bearer <key>``. Auth failures are logged once
     (without the key) and never raised.
+
+    If the server answers ``413`` (batch over its body cap), the batch is split in half
+    and each half retried, so only spans that are too big on their own are dropped. One
+    ``export()`` makes at most ``max_attempts`` requests; what is left unsent when they
+    run out is dropped. Each export that drops spans logs one warning.
 
     An ``httpx.Client`` can be injected (useful for tests or custom auth/TLS).
     """
@@ -65,9 +75,13 @@ class AgentFlightExporter(SpanExporter):
         timeout: float = 5.0,
         headers: dict[str, str] | None = None,
         api_key: str | None = None,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         self._url = endpoint.rstrip("/") + INGEST_PATH
         self._auth_warned = False
+        self._max_attempts = max_attempts
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout)
         self._headers = dict(headers or {})
@@ -81,29 +95,54 @@ class AgentFlightExporter(SpanExporter):
         # Never raise: OTel processors log exporter exceptions, but a custom processor might
         # not, and export failures must never reach agent code.
         try:
-            payload = {"spans": [span_to_dict(s) for s in spans]}
-            response = self._client.post(self._url, json=payload, headers=self._headers)
-            if response.status_code == 413 and len(spans) > 1:
-                # Batch over the server's body cap: send it in halves instead of dropping it.
-                half = len(spans) // 2
-                first = self.export(spans[:half])
-                second = self.export(spans[half:])
-                ok = first is SpanExportResult.SUCCESS and second is SpanExportResult.SUCCESS
-                return SpanExportResult.SUCCESS if ok else SpanExportResult.FAILURE
-            if response.status_code in (401, 403):
-                if not self._auth_warned:
-                    self._auth_warned = True
-                    logger.warning(
-                        "agentflight: server rejected credentials (HTTP %d); spans are being "
-                        "dropped. Check AGENTFLIGHT_API_KEY.",
-                        response.status_code,
-                    )
-                return SpanExportResult.FAILURE
-            response.raise_for_status()
+            attempts = [self._max_attempts]
+            dropped, reason = self._send(list(spans), attempts)
         except Exception as exc:
             logger.warning("agentflight: failed to export %d spans: %r", len(spans), exc)
             return SpanExportResult.FAILURE
-        return SpanExportResult.SUCCESS
+        if reason is None:
+            return SpanExportResult.SUCCESS
+        if reason:  # "": already reported (credentials)
+            logger.warning(
+                "agentflight: failed to export %d of %d spans: %s", dropped, len(spans), reason
+            )
+        return SpanExportResult.FAILURE
+
+    def _send(self, spans: list[ReadableSpan], attempts: list[int]) -> tuple[int, str | None]:
+        """POST ``spans``, splitting on 413.
+
+        Returns (spans dropped, why): ``why`` is None on success and ``""`` when the failure
+        was already logged.
+        """
+        if attempts[0] <= 0:
+            return len(spans), f"gave up after {self._max_attempts} requests"
+        attempts[0] -= 1
+        try:
+            payload = {"spans": [span_to_dict(s) for s in spans]}
+            response = self._client.post(self._url, json=payload, headers=self._headers)
+        except Exception as exc:
+            return len(spans), repr(exc)
+        if response.status_code in (401, 403):
+            if not self._auth_warned:
+                self._auth_warned = True
+                logger.warning(
+                    "agentflight: server rejected credentials (HTTP %d); spans are being "
+                    "dropped. Check AGENTFLIGHT_API_KEY.",
+                    response.status_code,
+                )
+            return len(spans), ""
+        if response.status_code == 413:
+            if len(spans) == 1:
+                return 1, "span is larger than the server's body cap (HTTP 413)"
+            half = len(spans) // 2
+            first, why_first = self._send(spans[:half], attempts)
+            second, why_second = self._send(spans[half:], attempts)
+            return first + second, why_first if why_first is not None else why_second
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            return len(spans), repr(exc)
+        return 0, None
 
     def shutdown(self) -> None:
         if self._owns_client:
