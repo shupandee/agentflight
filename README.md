@@ -2,9 +2,9 @@
 
 A black box recorder for AI agents. AgentFlight records what an agent does during a run:
 model calls, tool executions, decisions, state changes, token spend and failures. Every run
-is stored as an ordered timeline you can query, and (from week 3) replay.
+is stored as an ordered timeline you can query, and (from week 4) replay.
 
-> Status: early development (week 2, hardening). APIs may change.
+> Status: early development (week 3, integrations). APIs may change.
 
 ## Architecture
 
@@ -84,6 +84,79 @@ agentflight.flush()  # before exit, so batched spans are sent
 - `@agentflight.tool` works on sync and async functions; `@agentflight.tool(name="...")`
   overrides the name.
 - If the server is unreachable, export fails with a logged warning; your agent keeps running.
+
+## Integrations
+
+Optional extras; the core SDK depends on neither package.
+
+### OpenAI-style chat clients
+
+```bash
+pip install "agentflight[openai]"
+```
+
+```python
+from openai import OpenAI
+from agentflight.integrations.openai import instrument_openai
+
+client = instrument_openai(OpenAI())  # same client, now recorded
+with agentflight.run("support-agent"):
+    resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs, tools=tools)
+```
+
+- Each `chat.completions.create` call is an `llm` span with the model, messages, request
+  params (`tools`, `temperature`, ...), the full response (tool calls included) and
+  `tokens_in`/`tokens_out` from `response.usage`.
+- Works with `OpenAI` and `AsyncOpenAI`, and with any client that has the same
+  `client.chat.completions.create(model=..., messages=...)` shape. `openai` itself is never
+  imported by AgentFlight.
+- Cost isn't guessed. There's no built-in price table, so pass
+  `instrument_openai(client, cost=lambda model, tokens_in, tokens_out: ...)` if you want it.
+- `extra_headers`, `extra_query`, `extra_body` and `timeout` are passed to the client but
+  never recorded (headers can carry credentials). Everything recorded goes through your
+  `redact` hook.
+- Fail-open: the call happens exactly once with your arguments and its response or
+  exception comes back unchanged. If response parsing or your `cost` function fails, that's
+  logged and ignored. A client without the expected shape is returned untouched.
+- **Not recorded yet:** `stream=True` calls (passed straight through) and the Responses API.
+
+### LangGraph
+
+```bash
+pip install "agentflight[langgraph]"
+```
+
+```python
+from agentflight.integrations.langgraph import AgentFlightCallbackHandler
+
+handler = AgentFlightCallbackHandler(run_name="react-agent")
+graph.invoke(inputs, config={"callbacks": [handler]})
+print(handler.run_id)
+```
+
+- The graph becomes a `run`. Inside an `agentflight.run(...)` it's a `node` span in that run
+  instead. Each executed node is a `node` span with `agentflight.node.name`, `.step`,
+  `.input` (state in) and `.output` (state update).
+- Chat model and LLM calls inside nodes are `llm` spans (messages, params, response, token
+  usage from `usage_metadata` or `token_usage`). LangChain tools are `tool` spans. So
+  `create_react_agent`-style graphs record without any SDK calls in your code.
+- LangChain's own runnables inside a node (prompts, sequences, routers) aren't recorded.
+  Their children attach to the nearest recorded span.
+- Errors are recorded where they happen and share one failure id up the graph. LangGraph
+  interrupts aren't errors: the node's output records `{"interrupted": ...}`.
+- Params whose names contain `api_key`, `secret`, `password` or `authorization` are dropped.
+- Fail-open: every callback is guarded, so a broken recorder never changes the graph's
+  result or exception.
+- **Limitation:** spans you record yourself inside a node (`@agentflight.tool`,
+  `llm_call`) attach to the surrounding `agentflight.run`, not to the node span, and are
+  only part of a run if one is open.
+
+Both examples run offline (scripted model, no API key needed):
+
+```bash
+python examples/openai_agent.py      # uses the real API if OPENAI_API_KEY is set
+python examples/langgraph_agent.py
+```
 
 ## Failure isolation
 
@@ -257,10 +330,11 @@ docker compose down --volumes
 
 - **Week 1: recorder core** (done): SDK, OTel exporter, ingest API, Postgres storage,
   migrations, failure isolation, tests, CI with a Compose smoke test.
-- **Week 2: hardening** (this branch): logical failure counting, API-key auth, retention
+- **Week 2: hardening** (done): logical failure counting, API-key auth, retention
   and deletion, explicit truncation and redaction.
-- **Week 3: integrations.** Auto-instrumentation for OpenAI-style chat clients (tokens and
-  usage taken from responses) and LangGraph, plus a sample agent recording real runs.
+- **Week 3: integrations** (this branch): OpenAI-style chat client instrumentation (usage
+  from responses) and a LangGraph callback handler, with offline example agents.
+  Deferred: streaming and the Responses API.
 - **Week 4: deterministic replay and fork.** Re-run a recorded trace step by step, serving
   cached model and tool outputs, and fork a run from any step with changed inputs.
 - **Week 5: React viewer and benchmarks.** Run timeline, decision tree, token spend and

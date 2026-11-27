@@ -100,6 +100,8 @@ _JSON_SUFFIXES = (
     ".choice",
     ".old",
     ".new",
+    ".input",
+    ".output",
     ".truncated",
 )
 

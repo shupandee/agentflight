@@ -16,6 +16,9 @@ LLM_TOKENS_OUT = "agentflight.llm.tokens_out"
 LLM_COST_USD = "agentflight.llm.cost_usd"
 LLM_PARAMS = "agentflight.llm.params"
 
+# Which integration produced a span (e.g. "openai", "langgraph"); unset for manual calls.
+INTEGRATION = "agentflight.integration"
+
 TOOL_NAME = "agentflight.tool.name"
 TOOL_ARGS = "agentflight.tool.args"
 TOOL_RESULT = "agentflight.tool.result"
@@ -27,6 +30,11 @@ DECISION_REASON = "agentflight.decision.reason"
 STATE_KEY = "agentflight.state.key"
 STATE_OLD = "agentflight.state.old"
 STATE_NEW = "agentflight.state.new"
+
+NODE_NAME = "agentflight.node.name"
+NODE_STEP = "agentflight.node.step"
+NODE_INPUT = "agentflight.node.input"
+NODE_OUTPUT = "agentflight.node.output"
 
 ERROR_TYPE = "agentflight.error.type"
 ERROR_MESSAGE = "agentflight.error.message"
@@ -43,3 +51,4 @@ TOOL = "tool"
 DECISION = "decision"
 STATE = "state"
 ERROR = "error"
+NODE = "node"  # a graph or graph node (LangGraph)

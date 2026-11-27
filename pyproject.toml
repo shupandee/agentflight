@@ -27,8 +27,11 @@ server = [
     "alembic>=1.13",
     "psycopg[binary]>=3.1",
 ]
+# Integrations: only needed for the frameworks you use.
+openai = ["openai>=1.0"]
+langgraph = ["langgraph>=1.0"]
 dev = [
-    "agentflight[server]",
+    "agentflight[server,openai,langgraph]",
     "pytest>=8.0",
     "ruff>=0.5",
     "mypy>=1.10",
