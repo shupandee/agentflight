@@ -359,8 +359,15 @@ agentflight.configure(
   masks dict entries with those names (case-insensitive) at any depth. If your hook
   raises, the value is replaced with `"<redaction failed>"`; it fails closed and nothing is
   recorded.
-- **Not covered yet:** exception messages and stack traces, run and tool names, and model
-  names aren't passed through the hook.
+- **Errors are redacted too.** Exception messages go through the hook with the key
+  `agentflight.error.message`, and stack traces with `exception.stacktrace`, before they
+  are stored (in the error attributes, the span status and the OpenTelemetry `exception`
+  event). Both are plain strings, so a hook that should scrub them has to handle `str`
+  values; `redact_fields(...)` only masks dict entries. Both are capped at
+  `max_attr_chars`, and a cut message is listed in `agentflight.truncated`.
+- **Names are not redacted.** Run, tool and model names are stored as given, because
+  replay matches steps by them. Don't put personal data or secrets in run names (or tool
+  names); put them in metadata or arguments, where the hook applies.
 
 ## Authentication
 
