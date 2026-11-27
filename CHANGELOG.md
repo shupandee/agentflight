@@ -4,7 +4,28 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 "HTTP API versioning" under 0.1.0); every change that can break a client is listed under
 **Behaviour changes**.
 
-## 0.1.0 (not yet released; dated when it is tagged)
+## Unreleased
+
+### Added
+
+- **OTLP ingest:** `POST /v1/traces` accepts OTLP/HTTP trace exports
+  (`application/x-protobuf` or `application/json`, optionally `Content-Encoding: gzip`), so
+  any OpenTelemetry-instrumented agent or Collector can record runs without the SDK. Same
+  `ingest` key auth and ingest limits as `POST /v1/spans`; the 16 MiB body cap applies to the
+  decompressed body too. Responses follow the OTLP spec: `partial_success` for spans that
+  can't be stored, `google.rpc.Status` errors with `400`/`401`/`403`/`413`/`415`, and a
+  retryable `503` only when the database is unavailable. Spans with a name or span event
+  name over 255 characters are rejected that way, as on `/v1/spans`.
+- OTLP spans map onto runs: the trace is the run and its parentless span closes it;
+  `gen_ai.*` operations, models, tokens and tool names become `llm` and `tool` events that
+  count in run totals and filters; `service.*` and `deployment.environment` become run
+  metadata; every other attribute (resource attributes as `otel.resource.*`) is kept.
+  Spans with `agentflight.*` attributes are read as on `/v1/spans`. Re-sent batches are
+  idempotent. See "OTLP ingest" in the README for limitations (no replay or cost for
+  OTLP-only runs).
+- The server depends on `opentelemetry-proto`.
+
+## 0.1.0 (2026-11-27)
 
 The first release on PyPI, as **`agentflight-sdk`** (the name `agentflight` is too close
 to an existing PyPI project): `pip install agentflight-sdk` for the SDK,

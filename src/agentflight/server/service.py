@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +29,8 @@ from agentflight.server.schemas import EventOut, RunDetail, RunSummary, SpanIn
 # Stored run status from the root span's status. A root span that ended without setting a
 # status is "unknown" (not "ok"): nothing reported success.
 RUN_STATUS = {"ok": "ok", "error": "error", "unset": "unknown"}
+# Root spans of other OpenTelemetry senders: unset is OpenTelemetry's normal success.
+_OTEL_RUN_STATUS = {"ok": "ok", "error": "error", "unset": "ok"}
 # Every status a client can see. "abandoned" is never stored: it's a "running" run with no
 # span received for longer than the stale threshold, decided when the run is read.
 STATUSES = ("running", "ok", "error", "unknown", "abandoned")
@@ -127,11 +129,18 @@ def recompute_totals(session: Session, run_ids: list[str]) -> None:
             run.cost_usd = None if cost is None else float(cost)
 
 
-def ingest_spans(session: Session, spans: list[SpanIn]) -> list[str]:
+def ingest_spans(
+    session: Session, spans: list[SpanIn], roots: Collection[tuple[str, str]] = ()
+) -> list[str]:
     """Upsert spans as events, creating/updating their runs. Idempotent per span id.
 
     The whole batch is looked up with one query per table, flushed once, and the totals of
     every run it touches are recomputed in SQL.
+
+    A span closes its run when it is an AgentFlight run span (``agentflight.kind=run``) or
+    its ``(trace_id, span_id)`` is in ``roots``: root spans from other OpenTelemetry
+    senders, which keep their own kind. For those, an unset status means the run ended
+    normally (``ok``), as in OpenTelemetry, rather than ``unknown``.
     """
     run_ids = list(dict.fromkeys(s.trace_id for s in spans))
     span_ids = list(dict.fromkeys(s.span_id for s in spans))
@@ -154,12 +163,13 @@ def ingest_spans(session: Session, spans: list[SpanIn]) -> list[str]:
         run.last_seen_ns = now
 
         kind = str(span.attributes.get(A.KIND, "span"))[:16]
-        if kind == A.RUN:
+        if kind == A.RUN or (span.trace_id, span.span_id) in roots:
             run.name = str(span.attributes.get(A.RUN_NAME, span.name))[:255]
             run.root_span_id = span.span_id
             run.start_time_ns = span.start_time_ns
             run.end_time_ns = span.end_time_ns
-            run.status = RUN_STATUS[span.status] if span.end_time_ns else "running"
+            status = RUN_STATUS[span.status] if kind == A.RUN else _OTEL_RUN_STATUS[span.status]
+            run.status = status if span.end_time_ns else "running"
             meta = _loads(span.attributes.get(A.RUN_METADATA, {}))
             run.metadata_ = meta if isinstance(meta, dict) else {"value": meta}
             dropped = _as_int(span.attributes.get(A.RUN_DROPPED_SPANS)) or 0
