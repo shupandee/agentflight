@@ -103,11 +103,48 @@ def test_full_key_session_is_still_read_only(ui: TestClient) -> None:
     assert ui.post("/v1/spans", json={"spans": []}).status_code == 401
 
 
+def _change(text: str, index: int) -> str:
+    """``text`` with the character at ``index`` replaced by a different one."""
+    i = index % len(text)
+    return text[:i] + ("B" if text[i] == "A" else "A") + text[i + 1 :]
+
+
+def test_tampering_always_changes_the_token() -> None:
+    # The old test set the last two signature characters to "AA", which left the token
+    # unchanged whenever the signature already ended in "AA" (about 1 in 1,000 tokens:
+    # the last base64 character of a 32-byte HMAC takes only 16 values). Every
+    # replacement above must change the token, whatever it was.
+    for text in ["AAAA", "AAAB", "BAAA", "xyzAA"]:
+        for index in (0, 2, -1):
+            assert _change(text, index) != text
+
+
+def test_non_ascii_cookies_are_refused_not_a_server_error(engine: Engine) -> None:
+    app = create_app(engine, Settings(api_key=TEST_KEY))
+    with TestClient(app, raise_server_exceptions=False, follow_redirects=False) as c:
+        for cookie in ["abc.\xe9xyz", "\xe9.abc", "abc.\xff" * 3]:
+            raw = f"{COOKIE_NAME}={cookie}".encode("latin-1")
+            resp = c.get("/ui", headers={"Cookie": raw})  # type: ignore[dict-item]
+            assert resp.status_code == 303, cookie
+
+
 def test_tampered_or_expired_sessions_are_refused(ui: TestClient) -> None:
     sign_in(ui)
     token = ui.cookies[COOKIE_NAME]
     body, sig = token.split(".")
-    for bad in [f"{body}.{sig[:-2]}AA", f"{body[:-2]}AA.{sig}", "garbage", ""]:
+    tampered = [
+        f"{body}.{_change(sig, 0)}",  # first, middle and last signature characters
+        f"{body}.{_change(sig, len(sig) // 2)}",
+        f"{body}.{_change(sig, -1)}",
+        f"{body}.{sig[:-1]}",  # truncated signature
+        f"{body}.{sig}A",  # extended signature
+        f"{_change(body, 5)}.{sig}",  # changed payload
+        f"{body}.",
+        "garbage",
+        "",
+    ]
+    assert token not in tampered
+    for bad in tampered:
         ui.cookies.clear()
         ui.cookies.set(COOKIE_NAME, bad, path="/ui")
         assert ui.get("/ui").status_code == 303

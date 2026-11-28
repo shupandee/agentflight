@@ -67,7 +67,10 @@ class SessionSigner:
     def verify(self, token: str, now: float | None = None) -> ViewerSession | None:
         now = time.time() if now is None else now
         body, sep, signature = token.partition(".")
-        if not sep or not hmac.compare_digest(signature, self._sign(body)):
+        # Constant-time over the full signature. Compared as bytes: compare_digest raises
+        # TypeError for str with non-ASCII characters, which a crafted cookie can contain.
+        expected = self._sign(body).encode()
+        if not sep or not hmac.compare_digest(signature.encode("utf-8", "replace"), expected):
             return None
         try:
             payload = json.loads(_unb64(body))

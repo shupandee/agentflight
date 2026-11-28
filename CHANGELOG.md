@@ -69,6 +69,9 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   those spans if the send then failed; senders now mark the file they are sending, and
   eviction and expiry skip marked files. If only files being sent are left, a new batch
   that doesn't fit is dropped and counted instead of going past the size cap.
+- A viewer session cookie with non-ASCII characters in its signature made the viewer answer
+  `500`; it is now treated as no session (sign in again). The signature is still compared in
+  constant time over its full length (`hmac.compare_digest`, now on bytes).
 - `422` responses no longer echo the submitted input (FastAPI's default included the
   offending values, which can be recorded payloads); they list `loc`, `msg` and `type`.
 - Database errors are logged without their SQL parameters (`hide_parameters`).
