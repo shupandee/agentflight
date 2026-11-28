@@ -300,6 +300,72 @@ Plain batch: about 18% faster with a policy. Realistic batch: about 2 ms faster 
 args have no escapes; every multi-line value takes the full walk, as before). No change
 without a policy file.
 
+### 9.2 Literal pre-check before the patterns
+
+Most of the remaining time was the pattern scan (`re.Pattern.subn` over every leaf). Every
+match of a preset contains a literal, so the pattern is run only when the text contains
+one (`_PREFILTERS` in `redaction.py`):
+
+| Preset | Every match contains | Case |
+| --- | --- | --- |
+| `bearer` | `bearer` | insensitive (the pattern is `(?i)`), tested on `text.lower()` |
+| `aws-access-key-id` | `AKIA` or `ASIA` | sensitive |
+| `openai-key` | `sk-` | sensitive |
+
+For the case-insensitive one, `text.lower()` is exact: no code point other than `B b E e A
+a R r` matches those letters under `(?i)` (checked over every code point in
+`test_ignore_case_fragments_only_match_ascii_letters`; the non-ASCII case folds, such as
+Kelvin sign to `k`, long s to `s` and dotted/dotless i, are for letters not in `bearer`).
+A text key rule (its pattern is the key, case-insensitive, between word boundaries) runs
+only when its ASCII key appears in the lowercased text; non-ASCII keys always run. The
+lowercased text is recomputed after any substitution, so a later rule sees what earlier
+rules left (a custom marker can contain a literal). Custom `pattern` rules have no
+pre-check and always run. The same check is used by the JSON-walk skip (9.1), and the
+quoted marker for JSON values is computed once per rule instead of per match.
+
+Equivalence tests (`tests/test_redaction.py`):
+
+- `test_every_preset_match_contains_a_fragment`: 20,000 random texts built from preset
+  pieces, separators and non-ASCII letters (over 1,000 with a match); every match contains
+  one of its preset's literals.
+- `test_literal_pre_check_gives_the_same_matches_and_markers` (five policies: key and
+  pattern rules together, patterns only, ASCII keys, non-ASCII keys, `on_match = "drop"`):
+  for the same random texts and JSON values, output text, rule names in markers,
+  `Changes.rules`, match counts and drop status are identical with the pre-check and with
+  it switched off.
+- `test_literal_pre_check_skips_the_regex`: on clean text only the custom pattern runs.
+- `test_pre_check_sees_text_changed_by_earlier_rules`: a marker that introduces a literal
+  is still redacted by the next rule.
+
+Each guard was removed in turn and a test failed: `bearer` made case-sensitive, `ASIA`
+dropped, a wrong `openai-key` literal, a stale lowercased text after a substitution, the
+key literal not lowercased.
+
+**Combining the patterns into one regex isn't done.** After the pre-check, the redaction
+step alone on the realistic batch takes about 15 ms of a 55 ms request (about 73 ms
+before), and on the payloads measured most leaves run no pattern at all. Combining would
+add a match-to-rule mapping that has to keep the rules' order and overlap behaviour, for
+little left to win. Limitation: text that contains a literal without a secret (the word
+"bearer" in prose, `sk-` inside `task-`) runs the pattern as before.
+
+Measured (same method and machine as 9.1; before = main `8f7e366`, after = the literal
+pre-check; 3 rounds of 15 posts, medians per round; policy: 2 rules):
+
+| DB | Batch | Policy | Before (rounds 1/2/3) | After (rounds 1/2/3) |
+| --- | --- | --- | --- | --- |
+| SQLite in memory | plain | none | 45.8 / 44.9 / 44.4 ms | 44.9 / 44.3 / 44.0 ms |
+| SQLite in memory | plain | 2 rules | 121.8 / 121.7 / 121.5 ms | 50.1 / 49.7 / 49.5 ms |
+| SQLite in memory | realistic | none | 39.9 / 40.0 / 39.3 ms | 39.8 / 39.6 / 39.7 ms |
+| SQLite in memory | realistic | 2 rules | 109.4 / 109.8 / 109.8 ms | 55.3 / 56.0 / 55.2 ms |
+| Postgres 17 local | plain | none | 59.4 / 59.2 / 59.0 ms | 58.0 / 58.6 / 58.9 ms |
+| Postgres 17 local | plain | 2 rules | 136.7 / 136.9 / 138.9 ms | 65.8 / 65.7 / 66.0 ms |
+| Postgres 17 local | realistic | none | 57.0 / 56.4 / 57.5 ms | 55.4 / 57.4 / 55.4 ms |
+| Postgres 17 local | realistic | 2 rules | 127.3 / 127.0 / 126.7 ms | 73.5 / 73.8 / 74.2 ms |
+
+With the policy, the redaction overhead over the no-policy request drops from about 77 ms
+to 5 ms (SQLite, plain), 70 to 16 ms (SQLite, realistic), 78 to 7 ms (Postgres, plain)
+and 70 to 18 ms (Postgres, realistic). No change without a policy file.
+
 ## 10. Tests (PR 1, `tests/test_redaction.py`)
 
 - Policy: every validation error; the server refuses to start (bad preset, bad TOML,

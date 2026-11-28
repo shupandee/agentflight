@@ -86,6 +86,17 @@ PRESETS: dict[str, tuple[str, ...]] = {
     "openai-key": (r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}",),
 }
 
+# Literal pre-check for the presets: every match of the pattern contains one of these
+# fragments, so when none is in the text the regex is skipped. (fragments, ignore case):
+# with ignore case the fragments are compared with the lowercased text, which is exact
+# because no non-ASCII character matches "b", "e", "a" or "r" under (?i) (a test checks
+# every code point).
+_PREFILTERS: dict[str, tuple[tuple[str, ...], bool]] = {
+    PRESETS["bearer"][0]: (("bearer",), True),
+    PRESETS["aws-access-key-id"][0]: (("AKIA", "ASIA"), False),
+    PRESETS["openai-key"][0]: (("sk-",), False),
+}
+
 _MAX_DEPTH = 32  # nested JSON walked; deeper values are treated as text
 _JSON_START = ("{", "[")
 # Attribute suffixes whose values the SDK writes as JSON text (see server.service).
@@ -162,7 +173,10 @@ class Policy:
     marker: str = DEFAULT_MARKER
     on_error: str = "redact"
     # Text-level "key": value matching for each key-rule key, built once.
-    _text_keys: tuple[tuple[Rule, re.Pattern[str]], ...] = ()
+    # (rule, pattern, literal): literal is the lowercased key when it is ASCII (the pattern
+    # then only matches its ASCII upper and lower case letters), else None (no pre-check).
+    _text_keys: tuple[tuple[Rule, re.Pattern[str], str | None], ...] = ()
+    _quoted: dict[str, str] = field(default_factory=dict, compare=False, repr=False)
     # Per scope: (key rule keys, patterns) for the quick "nothing can match" check.
     _quick: dict[str, tuple[tuple[str, ...], tuple[re.Pattern[str], ...], bool]] = field(
         default_factory=dict, compare=False, repr=False
@@ -201,7 +215,7 @@ class Policy:
         if len(set(names)) != len(names):
             raise PolicyError("rule names must be unique")
         text_keys = tuple(
-            (rule, _text_key_pattern(key))
+            (rule, _text_key_pattern(key), key if key.isascii() else None)
             for rule in rules
             if rule.keys
             for key in sorted(rule.keys)
@@ -220,7 +234,15 @@ class Policy:
             for scope in SCOPES
         }
         policy = cls(
-            rules=rules, marker=marker, on_error=on_error, _text_keys=text_keys, _quick=quick
+            rules=rules,
+            marker=marker,
+            on_error=on_error,
+            _text_keys=text_keys,
+            _quick=quick,
+            _quoted={
+                r.name: json.dumps(marker.replace("{rule}", r.name), ensure_ascii=False)
+                for r in rules
+            },
         )
         policy._check_markers()
         return policy
@@ -245,15 +267,32 @@ class Policy:
 
     def redact_text(self, text: str, scope: str, changes: Changes) -> str:
         """Pattern rules, then text-level ``"key": value`` matching for key rules."""
+        lowered: str | None = None
         for rule in self._rules(scope):
             marker = self.marker_for(rule.name)
             for pattern in rule.patterns:
+                pre = _PREFILTERS.get(pattern.pattern)
+                if pre is not None:
+                    fragments, ignore_case = pre
+                    if ignore_case and lowered is None:
+                        lowered = text.lower()
+                    hay = lowered if ignore_case else text
+                    assert hay is not None
+                    if not any(f in hay for f in fragments):
+                        continue  # no match possible: skip the regex
                 text, n = pattern.subn(marker, text)
+                if n:
+                    lowered = None
                 changes.hit(rule.name, n)
-        for rule, pattern in self._text_keys:
+        for rule, pattern, literal in self._text_keys:
             if scope not in rule.scope:
                 continue
-            quoted = json.dumps(self.marker_for(rule.name), ensure_ascii=False)
+            if literal is not None:
+                if lowered is None:
+                    lowered = text.lower()
+                if literal not in lowered:
+                    continue  # the key isn't in the text: skip the regex
+            quoted = self._quoted[rule.name]
             hits = 0
 
             def sub(m: re.Match[str], quoted: str = quoted) -> str:
@@ -264,6 +303,8 @@ class Policy:
                 return m.group(1) + quoted
 
             text = pattern.sub(sub, text)
+            if hits:
+                lowered = None
             changes.hit(rule.name, hits)
         return text
 
@@ -326,13 +367,13 @@ class Policy:
         keys, patterns, context_free = self._quick[scope]
         if patterns and not context_free:
             return False
+        lowered = text.lower()
         if keys:
             if not all(k.isascii() for k in keys):
                 return False
-            lowered = text.lower()
             if any(k in lowered for k in keys):
                 return False
-        return not any(p.search(text) for p in patterns)
+        return not any(_may_match(p, text, lowered) and p.search(text) for p in patterns)
 
     def redact_string(
         self, text: str, scope: str, changes: Changes, depth: int = 0, *, json_hint: bool
@@ -399,6 +440,16 @@ class _NotJson:
 
 _NOT_JSON: Any = _NotJson()
 _DROP: Any = _NotJson()
+
+
+def _may_match(pattern: re.Pattern[str], text: str, lowered: str) -> bool:
+    """False when the literal pre-check rules a match of ``pattern`` out."""
+    pre = _PREFILTERS.get(pattern.pattern)
+    if pre is None:
+        return True
+    fragments, ignore_case = pre
+    hay = lowered if ignore_case else text
+    return any(f in hay for f in fragments)
 
 
 def _text_key_pattern(key: str) -> re.Pattern[str]:

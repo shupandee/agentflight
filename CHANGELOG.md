@@ -41,6 +41,10 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   backslash escapes, no key rule name in the text, no pattern match, only ASCII key rule
   names, and no anchored or lookaround pattern in the policy); the result is the same as
   the full walk. Multi-line payloads (escaped newlines) still take the full walk.
+- Redaction runs a preset's pattern only when the text contains one of the literals every
+  match of it contains (`bearer`, case-insensitive; `AKIA` or `ASIA`; `sk-`), and a text
+  key rule's pattern only when the key appears in the lowercased text. Same matches and
+  markers; with a two-rule policy a 512-span ingest took about half the time.
 - The server records what it redacted in `agentflight.redacted`, returned as each event's
   `redacted` field. `AGENTFLIGHT_REDACTION_ON_ERROR` (`redact`, the default, stores
   `[REDACTION_FAILED]`; `reject` drops the span) decides what happens when redaction fails.

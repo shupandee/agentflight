@@ -3,8 +3,10 @@ replay of redacted recordings, and a canary secret that must not survive anywher
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1121,3 +1123,137 @@ def test_quick_check_falls_back_where_a_skip_would_leak(
     out = redact(_policy(policy), {"agentflight.tool.args": text}).attributes
     assert secret not in out["agentflight.tool.args"], text
     assert REDACTED in out
+
+
+# Literal pre-check for presets and key names -------------------------------------------------
+
+
+def _without_prefilters(policy: Policy, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turn off both literal pre-checks: every regex runs, as before."""
+    monkeypatch.setattr(redaction, "_PREFILTERS", {})
+    object.__setattr__(policy, "_text_keys", tuple((r, p, None) for r, p, _ in policy._text_keys))
+
+
+def test_ignore_case_fragments_only_match_ascii_letters() -> None:
+    import sys
+
+    # The pre-check compares ignore-case fragments with text.lower(). That is exact only if
+    # no non-ASCII character matches one of their letters under (?i) (as the Kelvin sign
+    # matches "k"): check every code point.
+    for fragments, ignore_case in redaction._PREFILTERS.values():
+        if not ignore_case:
+            continue
+        for letter in sorted(set("".join(fragments))):
+            assert letter.isascii()
+            p = re.compile("(?i)" + re.escape(letter))
+            odd = [c for c in range(128, sys.maxunicode + 1) if p.fullmatch(chr(c))]
+            assert odd == [], (letter, odd)
+
+
+def _fragment_texts(seed: str, n: int) -> list[str]:
+    import random
+
+    rng = random.Random(seed)
+    tokens = [
+        "Bearer ", "bearer\t", "BEARER  ", "bEaReR\n", "beare r ", "Bear er", "\u212aey",
+        "AKIA", "ASIA", "AKIa", "akia", "AS1A", "sk-", "sk-proj-", "sk-svcacct-", "SK-",
+        "s k-", "task-", "ABCDEFGHIJKLMNOP", "abcdefghijklmnop0123", "0123456789", "=", "==",
+        "-", "_", ".", "~", "+", "/", " ", "\n", '"', "\u017f", "\u0130", "\u0131", "\u00e9",
+        '"api_key": "v"', '"API_KEY":1', '"Api_Key" : null', '"apikey": "x"', '"password":',
+        '"api_key": "[REDACTED:keys]"', "[REDACTED:openai]", "{", "}", ",", '"Token": "t"',
+    ]  # fmt: skip
+    return ["".join(rng.choice(tokens) for _ in range(rng.randint(0, 30))) for _ in range(n)]
+
+
+def test_every_preset_match_contains_a_fragment() -> None:
+    texts = _fragment_texts("fragments", 20000)
+    hits = 0
+    for source, (fragments, ignore_case) in redaction._PREFILTERS.items():
+        pattern = re.compile(source)
+        for text in texts:
+            for m in pattern.finditer(text):
+                hits += 1
+                found = m.group(0).lower() if ignore_case else m.group(0)
+                assert any(f in found for f in fragments), (source, m.group(0))
+    assert hits > 1000  # the generator does produce matches
+
+
+@pytest.mark.parametrize("name", ["both", "patterns", "ascii-keys", "keys", "drop"])
+def test_literal_pre_check_gives_the_same_matches_and_markers(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    texts = _fragment_texts(f"pre-{name}", 3000)
+    values = texts + [json.dumps({"note": t, "api_key": t[:5]}) for t in texts[:500]]
+
+    def run(policy: Policy) -> list[tuple[Any, ...]]:
+        out = []
+        for scope in redaction.SCOPES:
+            for text in texts:
+                changes = redaction.Changes()
+                out.append((policy.redact_text(text, scope, changes), changes.rules, changes.count))
+        for value in values:
+            r = redact(policy, {"agentflight.tool.args": value, "note": value}, status=value)
+            out.append((r.attributes, r.status_message))
+        return out
+
+    with_check = run(_policy(QUICK_POLICIES[name]))
+    reference = _policy(QUICK_POLICIES[name])
+    with monkeypatch.context() as m:
+        _without_prefilters(reference, m)
+        without = run(reference)
+    assert with_check == without
+    assert any(isinstance(r[1], list) and r[1] for r in with_check)  # something matched
+
+
+def test_literal_pre_check_skips_the_regex(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = _policy()
+    calls: list[str] = []
+
+    class Spy:
+        def __init__(self, p: re.Pattern[str]) -> None:
+            self.p, self.pattern = p, p.pattern
+
+        def subn(self, *a: Any) -> Any:
+            calls.append(self.pattern)
+            return self.p.subn(*a)
+
+        def search(self, *a: Any) -> Any:
+            calls.append(self.pattern)
+            return self.p.search(*a)
+
+    spied = tuple(
+        dataclasses.replace(r, patterns=tuple(Spy(p) for p in r.patterns))  # type: ignore[misc]
+        for r in policy.rules
+    )
+    object.__setattr__(policy, "rules", spied)
+    changes = redaction.Changes()
+    assert policy.redact_text("nothing to see here", "attributes", changes) == "nothing to see here"
+    # Only the user's own pattern ran; the three presets were ruled out by their fragments.
+    assert calls == ["secret-[a-z]+"]
+    calls.clear()
+    out = policy.redact_text("Bearer abcdefghijklmnop0123", "attributes", changes)
+    assert out == "[REDACTED:bearer]" and PRESETS_BEARER in calls
+
+
+PRESETS_BEARER = redaction.PRESETS["bearer"][0]
+
+
+def test_pre_check_sees_text_changed_by_earlier_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A marker can put a key name into the text; the key's pre-check must look at the
+    # text as it is after the earlier substitutions, not as it was.
+    doc = (
+        'marker = "{{\\"{rule}\\": 1}}"\n'
+        '[[rules]]\nname = "bearer"\npreset = "bearer"\n'
+        '[[rules]]\nname = "api_key"\npatterns = ["zzz"]\n'
+        '[[rules]]\nname = "keys"\nkeys = ["api_key"]\n'
+    )
+    text = "Bearer is a word; zzz"
+    got_changes = redaction.Changes()
+    got = _policy(doc).redact_text(text, "attributes", got_changes)
+    reference = _policy(doc)
+    with monkeypatch.context() as m:
+        _without_prefilters(reference, m)
+        want_changes = redaction.Changes()
+        want = reference.redact_text(text, "attributes", want_changes)
+    assert (got, got_changes.rules) == (want, want_changes.rules)
+    assert "keys" in got_changes.rules  # the key rule did see the marker's key
