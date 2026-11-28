@@ -30,10 +30,48 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 - README: an Install section with every `agentflight-sdk` install form and the import
   name (`agentflight`).
 
+### Changed
+
+- **Spool kill switch:** `configure(spool_enabled=False)` or `AGENTFLIGHT_SPOOL_ENABLED=false`
+  turns the on-disk spool off even when a directory is configured, and logs one warning at
+  startup when it overrides a directory.
+- **A spool size or age of zero or less disables the spool.** `spool_max_bytes` and
+  `spool_max_age_s`, or `AGENTFLIGHT_SPOOL_MAX_BYTES` and `AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS`,
+  now behave the same in code and in the environment: zero or negative turns the spool off
+  with one warning and recording continues. Before, a non-positive size in the environment
+  meant the 64 MiB default (with a warning), and one in code made `configure()` fail and disable
+  recording altogether. A value that isn't a number is still ignored with a warning.
+- **Sharing a spool directory between processes is safe.** (No locking; documented as
+  "sharing works but may resend duplicates; one folder per process avoids that".) Cap
+  eviction could delete a file another process was in the middle of sending, which lost
+  those spans if the send then failed; senders now mark the file they are sending, and
+  eviction and expiry skip marked files. If only files being sent are left, a new batch
+  that doesn't fit is dropped and counted instead of going past the size cap.
+- README: the spool holds recorded payloads as plain JSON on disk (owner-only `0700`/`0600`
+  where the OS supports it) and the settings table.
+
 ### Behaviour changes
 
-- **Database migration `0005`** adds three nullable columns and an index to `runs`. Run
-  `agentflight-server migrate` when upgrading the server (existing runs have no parent).
+- **Runs can have a parent run (sub-agent runs).** A run started inside another run is
+  linked to it as a sub-agent run, and `agentflight.run(parent_run_id=...)` links one
+  explicitly. Nothing changes for runs that have no parent.
+- **OTLP parents are inferred from span links by default.** A root span whose links all
+  point into exactly one other trace is stored as started from that trace's run
+  (`parent_source` `inferred`); an explicit `agentflight.run.parent_run_id` attribute
+  always wins. To turn the inference off, set `AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS=false`
+  on the server (links are still kept on the event as `otel.links`).
+- **Database migration `0005`** adds three nullable columns (`parent_run_id`,
+  `parent_span_id`, `parent_source`) and an index to `runs`. Run `agentflight-server
+  migrate` when upgrading the server (existing runs have no parent).
+- **Re-create the database if you ran unreleased `main` between the two `0005` commits.**
+  `0005` first added only `parent_run_id` and `parent_span_id` (commit `842002b`) and gained
+  `parent_source` in the next commit (`cd19d0c`), so a database migrated with the first
+  version is already at `0005` without that column, and `migrate` won't add it. Those two
+  commits reached `main` together (in the merge of PR #9), so this only affects a
+  checkout of the branch or of `842002b` itself. Databases from 0.2.0 or earlier, or
+  migrated with `cd19d0c` or later, are fine.
+- **`0005` is frozen from the next release.** Once released, a migration is never edited:
+  any further schema change goes in `0006` or later.
 - `agentflight.run()` called inside another run now records a parent link on the nested run
   where it recorded none before. Nothing else about nested runs changes.
 

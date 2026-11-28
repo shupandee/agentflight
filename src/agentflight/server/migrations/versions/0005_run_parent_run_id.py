@@ -3,6 +3,9 @@
 New nullable columns, NULL for existing runs (nothing recorded a parent before), and an
 index on parent_run_id for listing a run's children.
 
+Frozen from the first release that contains it: change the schema again in 0006 or later,
+never by editing this file.
+
 Revision ID: 0005
 Revises: 0004
 Create Date: 2026-11-28

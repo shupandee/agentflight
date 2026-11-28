@@ -12,6 +12,15 @@ can't be written or a corrupt file loses those spans (counted in ``dropped`` and
 once per kind of problem) and never raises.
 
 Spool I/O happens on the exporter's thread only; the agent's thread never touches it.
+
+Several processes may share a directory without locking. Names are unique per process
+(``<born_ns>-<pid>-<seq>-<count>``), a file another process already sent and deleted is
+skipped silently, and the cap never evicts a file that is being sent: the sender drops a
+``<name>.sending-<pid>`` marker while it holds the file, and an evictor first renames the
+victim aside, looks for a fresh marker, and renames it back if there is one. (Markers
+older than ``IN_FLIGHT_STALE_SECONDS`` are a crashed sender's and protect nothing.) Two
+processes may still send the same file, which costs a duplicate send (ingest is
+idempotent) and nothing else.
 """
 
 from __future__ import annotations
@@ -39,6 +48,9 @@ MAX_FILES = 10_000
 
 SUFFIX = ".spool.json"
 _TMP_PREFIX = ".tmp-"
+_SENDING = ".sending-"
+IN_FLIGHT_STALE_SECONDS = 600.0
+"""A sending marker older than this belongs to a crashed process; it protects nothing."""
 _FORMAT = 1
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
@@ -148,27 +160,98 @@ class Spool:
         if lost:
             self._lose(f.count)
 
-    def _sweep(self, incoming: int) -> None:
-        """Delete expired files, stale temporary files and, to fit ``incoming`` more bytes,
-        the oldest files."""
+    def _in_flight(self, name: str) -> bool:
+        """Is some process sending the file called ``name``? (A fresh marker exists.)"""
+        prefix = name + _SENDING
+        now_ns = time.time_ns()
+        try:
+            for entry in os.scandir(self.directory):
+                if entry.name.startswith(prefix):
+                    try:
+                        age_ns = now_ns - entry.stat(follow_symlinks=False).st_mtime_ns
+                    except OSError:
+                        continue
+                    if age_ns < IN_FLIGHT_STALE_SECONDS * 1e9:
+                        return True
+        except OSError:
+            pass
+        return False
+
+    def _marker(self, f: SpoolFile) -> Path:
+        return f.path.with_name(f"{f.path.name}{_SENDING}{os.getpid()}")
+
+    def _mark(self, f: SpoolFile) -> None:
+        """Say this process is sending ``f``. Best effort: without a marker the file is
+        just as evictable as it was before markers existed."""
+        try:
+            fd = os.open(self._marker(f), os.O_WRONLY | os.O_CREAT | _NOFOLLOW, 0o600)
+            os.close(fd)
+            os.utime(self._marker(f))
+        except OSError as exc:
+            self._warn("mark", "can't mark a file as being sent (%s)", exc)
+
+    def _unmark(self, f: SpoolFile) -> None:
+        with contextlib.suppress(OSError):
+            self._marker(f).unlink()
+
+    def _evict(self, f: SpoolFile) -> bool:
+        """Delete ``f`` to make room (or because it expired) unless it is being sent.
+
+        True if it is gone, False if it stays. The file is renamed aside first and the
+        markers are checked after: a sender marks before it reads, so either its read fails
+        (the rename came first; it skips the file) or its marker is already there when we
+        look (and we put the file back). There is no window in which a file is deleted
+        while a sender that has read it can't see that coming.
+        """
+        aside = f.path.with_name(
+            f"{_TMP_PREFIX}evict-{os.getpid()}-{next(self._seq)}-{f.path.name}"
+        )
+        try:
+            os.rename(f.path, aside)
+        except FileNotFoundError:
+            return True  # another process got there first
+        except OSError as exc:
+            self._warn("unlink", "can't delete spooled files (%s)", exc)
+            return False
+        if self._in_flight(f.path.name):
+            try:
+                os.rename(aside, f.path)
+            except OSError as exc:
+                self._warn("restore", "can't put back a file that is being sent (%s)", exc)
+            return False
+        try:
+            aside.unlink()
+        except OSError as exc:
+            self._warn("unlink", "can't delete spooled files (%s)", exc)
+        self._lose(f.count)
+        return True
+
+    def _sweep(self, incoming: int) -> bool:
+        """Delete expired files, stale temporary files and markers and, to fit ``incoming``
+        more bytes, the oldest files, never one that is being sent.
+
+        False if ``incoming`` still doesn't fit (the files left are all being sent)."""
         now_ns = time.time_ns()
         max_age_ns = int(self.max_age_s * 1e9)
         try:
             for entry in os.scandir(self.directory):
-                if entry.name.startswith(_TMP_PREFIX):
-                    try:  # left behind by a crash mid-write
-                        if now_ns - entry.stat(follow_symlinks=False).st_mtime_ns > 3600e9:
-                            os.unlink(entry.path)
-                    except OSError:
-                        pass
+                stale_s = 3600e9 if entry.name.startswith(_TMP_PREFIX) else None
+                if _SENDING in entry.name and not entry.name.startswith(_TMP_PREFIX):
+                    stale_s = IN_FLIGHT_STALE_SECONDS * 1e9
+                if stale_s is None:
+                    continue
+                try:  # left behind by a crash mid-write or mid-send
+                    if now_ns - entry.stat(follow_symlinks=False).st_mtime_ns > stale_s:
+                        os.unlink(entry.path)
+                except OSError:
+                    pass
         except OSError:
             pass
         files = self.files()
         keep: list[SpoolFile] = []
         expired = 0
         for f in files:
-            if now_ns - f.born_ns > max_age_ns:
-                self._remove(f, lost=True)
+            if now_ns - f.born_ns > max_age_ns and self._evict(f):
                 expired += f.count
             else:
                 keep.append(f)
@@ -176,22 +259,27 @@ class Spool:
             self._warn("age", "spans older than %gs were deleted unsent", self.max_age_s)
         total = sum(f.size for f in keep)
         evicted = 0
-        while keep and (total + incoming > self.max_bytes or len(keep) >= MAX_FILES):
-            oldest = keep.pop(0)
-            self._remove(oldest, lost=True)
-            total -= oldest.size
-            evicted += oldest.count
+        for oldest in list(keep):
+            if total + incoming <= self.max_bytes and len(keep) < MAX_FILES:
+                break
+            if self._evict(oldest):
+                keep.remove(oldest)
+                total -= oldest.size
+                evicted += oldest.count
         if evicted:
             self._warn(
                 "full", "full (%d bytes); the oldest spooled spans were deleted", self.max_bytes
             )
+        return total + incoming <= self.max_bytes and len(keep) < MAX_FILES
 
     def _write(self, spans: list[dict[str, Any]], born_ns: int) -> Path | None:
         data = json.dumps({"v": _FORMAT, "spans": spans}, separators=(",", ":")).encode()
         if len(data) > self.max_bytes:
             self._warn("big", "a batch of %d bytes is over the spool's cap", len(data))
             return None
-        self._sweep(len(data))
+        if not self._sweep(len(data)):
+            self._warn("busy", "full of files being sent; a batch of %d bytes is lost", len(data))
+            return None
         name = f"{born_ns:020d}-{os.getpid()}-{next(self._seq):06d}-{len(spans)}{SUFFIX}"
         final = self.directory / name
         tmp = self.directory / f"{_TMP_PREFIX}{name}"
@@ -243,9 +331,15 @@ class Spool:
                 self._sweep(0)
                 files = self.files()
             for f in files:
-                spans = self._read(f)
-                if spans is not None:
-                    yield f, spans
+                # Mark before reading: an evictor that renamed the file aside before this
+                # point makes the read fail (skip it); one that comes later sees the marker.
+                self._mark(f)
+                try:
+                    spans = self._read(f)
+                    if spans is not None:
+                        yield f, spans
+                finally:
+                    self._unmark(f)
         finally:
             self._replaying.release()
 

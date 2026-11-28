@@ -505,6 +505,20 @@ agentflight.configure("http://localhost:8000", spool_dir="/var/tmp/agentflight-s
 # or AGENTFLIGHT_SPOOL_DIR=/var/tmp/agentflight-spool
 ```
 
+| Setting | `configure(...)` | Environment | Default |
+| --- | --- | --- | --- |
+| Directory (setting it turns the spool on) | `spool_dir` | `AGENTFLIGHT_SPOOL_DIR` | unset: off |
+| Kill switch | `spool_enabled=False` | `AGENTFLIGHT_SPOOL_ENABLED=false` | on (when a directory is set) |
+| Size cap | `spool_max_bytes` | `AGENTFLIGHT_SPOOL_MAX_BYTES` | 64 MiB |
+| Age cap | `spool_max_age_s` | `AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS` | 24 h |
+
+An explicit argument wins over the environment; the kill switch wins over a directory (so a
+deployment can switch the spool off without editing code) and logs one warning at startup
+saying it did. A size or age of zero or less, in code or in the environment, disables the
+spool with one warning (it means "nothing on disk", not "the default") and recording
+carries on. An environment value that isn't a number is ignored with a warning (the
+default is used).
+
 With a spool directory, spans that weren't stored because of a failure that may clear up
 (server down, transport error, timeout, 5xx, 408/425/429, rejected credentials, the
 attempt cap or the run span deadline) are written to disk, one file per failed batch,
@@ -523,9 +537,15 @@ last one left behind. Run spans are sent before the spool is replayed.
   and 10,000 files; when a new batch doesn't fit, the oldest files are deleted. Files older
   than `spool_max_age_s` (`AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS`, default 24 h) are deleted
   unsent. A batch bigger than the whole spool isn't kept.
-- **Private.** The spool holds recorded payloads (after `redact`) in plain JSON. The
-  directory is created `0700` (an existing one you own is tightened to `0700`) and files
-  are created `0600`; a directory that is a symlink or belongs to another user is not used.
+- **Private, but it is sensitive data on disk.** The spool holds recorded payloads
+  (messages, tool arguments and results, stack traces; after `redact`, if you set one) in
+  plain, unencrypted JSON until they are sent or expire. The directory is created `0700`
+  (an existing one you own is tightened to `0700`) and files, including the temporary and
+  marker files, are created `0600`, whatever the umask, on systems that support Unix
+  permissions (on Windows these modes do nothing; use a directory only your account can
+  read). A directory that is a symlink or belongs to another user is not used. Put the
+  spool on storage you would trust with the payloads themselves, and prefer a short
+  `spool_max_age_s` for sensitive data.
 - **Fail-open.** A full disk, a directory that can't be created or written, or a corrupt
   file (deleted when found) loses those spans, logs one warning per kind of problem and
   never raises. Files are written to a temporary name and renamed, so a crash mid-write
@@ -535,8 +555,14 @@ last one left behind. Run spans are sent before the spool is replayed.
   (the batch worker and the run-span lane). That's why it needs `batch=True`: with
   `batch=False` the export runs on the agent's thread, so `spool_dir` is ignored with a
   warning. It also only works with the built-in exporter.
-- **One process per directory is best.** Two processes sharing one spool can both send
-  the same file; that's safe (ingest is idempotent) but wasted work.
+- **Sharing a directory works but may resend duplicates; one folder per process avoids
+  that.** There is no locking. File names are unique per process, a file another process
+  already sent (and deleted) is skipped silently, and the size cap never deletes a file
+  another process is sending: a sender marks the file it is sending, and eviction skips
+  marked files (a crashed sender's marker expires after 10 minutes). If every file left is
+  being sent, a new batch that doesn't fit is dropped (and counted) rather than going past
+  the cap. Two processes can still send the same file; ingest is idempotent, so the cost
+  is a duplicate send.
 
 Limitations (known, not yet handled):
 

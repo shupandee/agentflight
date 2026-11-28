@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -430,3 +431,425 @@ def test_failed_run_span_is_spooled_and_closes_the_run_later(tmp_path: Path, c: 
     exporter = AgentFlightExporter("http://testserver", client=c, spool=Spool(spool_dir))
     assert exporter.export([]) is SpanExportResult.SUCCESS
     assert c.get(f"/v1/runs/{r.run_id}").json()["status"] == "ok"
+
+
+# Settings
+
+
+def test_kill_switch_turns_the_spool_off_even_with_a_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert agentflight.configure("http://127.0.0.1:9", spool_dir=tmp_path).spool is not None
+    assert (
+        agentflight.configure("http://127.0.0.1:9", spool_dir=tmp_path, spool_enabled=False).spool
+        is None
+    )
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path / "env"))
+    for off in ("false", "0", "no", "OFF"):
+        monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", off)
+        assert agentflight.configure("http://127.0.0.1:9").spool is None, off
+        assert agentflight.configure("http://127.0.0.1:9", spool_dir=tmp_path).spool is None, off
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", "true")
+    assert agentflight.configure("http://127.0.0.1:9").spool is not None
+    # An explicit argument wins over the environment.
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", "false")
+    rec = agentflight.configure("http://127.0.0.1:9", spool_enabled=True)
+    assert rec.spool is not None and rec.spool.directory == tmp_path / "env"
+
+
+def test_disabled_spool_drops_failed_batches_and_writes_nothing(
+    tmp_path: Path, server: Server
+) -> None:
+    server.status = 503
+    directory = tmp_path / "spool"
+    agentflight.configure(
+        "http://127.0.0.1:9", spool_dir=directory, spool_enabled=False, timeout=0.2
+    )
+    with agentflight.run("offline"):
+        pass
+    assert agentflight.flush(timeout_millis=10_000)
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("bad", ["abc", "1.5", ""])
+def test_a_non_numeric_size_or_age_in_the_environment_is_ignored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: str,
+) -> None:
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_MAX_BYTES", bad)
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS", bad)
+    with caplog.at_level("WARNING"):
+        rec = agentflight.configure("http://127.0.0.1:9")
+    assert rec.spool is not None
+    assert rec.spool.max_bytes == _spool.DEFAULT_SPOOL_MAX_BYTES
+    assert rec.spool.max_age_s == _spool.DEFAULT_SPOOL_MAX_AGE_SECONDS
+    if bad:
+        assert "ignoring AGENTFLIGHT_SPOOL_MAX_BYTES" in caplog.text
+
+
+def _spool_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "spool" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "env", "needle"),
+    [
+        ({"spool_max_bytes": 0}, {}, "spool_max_bytes=0"),
+        ({"spool_max_bytes": -1}, {}, "spool_max_bytes=-1"),
+        ({"spool_max_age_s": 0}, {}, "spool_max_age_s=0"),
+        ({"spool_max_age_s": -60}, {}, "spool_max_age_s=-60"),
+        ({}, {"AGENTFLIGHT_SPOOL_MAX_BYTES": "0"}, "AGENTFLIGHT_SPOOL_MAX_BYTES='0'"),
+        ({}, {"AGENTFLIGHT_SPOOL_MAX_BYTES": "-5"}, "AGENTFLIGHT_SPOOL_MAX_BYTES='-5'"),
+        ({}, {"AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS": "0"}, "AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS='0'"),
+    ],
+)
+def test_a_cap_of_zero_or_less_disables_the_spool_with_one_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kwargs: dict[str, Any],
+    env: dict[str, str],
+    needle: str,
+) -> None:
+    """In code or in the environment, 0 means "nothing on disk", never the 64 MiB default."""
+    directory = tmp_path / "spool"
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with caplog.at_level("WARNING"):
+        rec = agentflight.configure(
+            "http://127.0.0.1:9", spool_dir=directory, timeout=0.2, **kwargs
+        )
+    warnings = _spool_warnings(caplog)
+    assert len(warnings) == 1 and needle in warnings[0] and "disabled" in warnings[0]
+    assert rec.spool is None
+    # Recording carries on: a run is recorded and exported (here the server is down), the
+    # agent isn't disturbed, and nothing is written to disk.
+    with agentflight.run("still-recording") as r:
+        agentflight.decision("step", 1)
+    assert r.run_id
+    assert agentflight.flush(timeout_millis=10_000)
+    assert not directory.exists()
+
+
+def test_the_kill_switch_overriding_a_directory_logs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        agentflight.configure(
+            "http://127.0.0.1:9", spool_dir=tmp_path / "code", spool_enabled=False
+        )
+    (message,) = _spool_warnings(caplog)
+    assert str(tmp_path / "code") in message and "turned off" in message
+    caplog.clear()
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path / "env"))
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", "false")
+    with caplog.at_level("WARNING"):
+        agentflight.configure("http://127.0.0.1:9")
+    (message,) = _spool_warnings(caplog)
+    assert str(tmp_path / "env") in message
+    caplog.clear()
+    monkeypatch.delenv("AGENTFLIGHT_SPOOL_DIR")
+    with caplog.at_level("WARNING"):  # nothing to override: nothing to say
+        agentflight.configure("http://127.0.0.1:9")
+    assert _spool_warnings(caplog) == []
+
+
+def test_arguments_override_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path / "env"))
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_MAX_BYTES", "4096")
+    rec = agentflight.configure(
+        "http://127.0.0.1:9",
+        spool_dir=tmp_path / "arg",
+        spool_max_bytes=8192,
+        spool_max_age_s=60,
+    )
+    assert rec.spool is not None
+    assert (rec.spool.directory, rec.spool.max_bytes, rec.spool.max_age_s) == (
+        tmp_path / "arg",
+        8192,
+        60,
+    )
+
+
+# Several processes (or threads) on one directory
+
+
+def test_processes_writing_to_one_spool_never_collide_or_corrupt(tmp_path: Path) -> None:
+    directory = tmp_path / "shared"
+    writers, batches, per_batch = 4, 25, 3
+    child = textwrap.dedent(
+        f"""
+        import sys
+        from agentflight._spool import Spool
+        spool = Spool({str(directory)!r})
+        who = sys.argv[1]
+        for i in range({batches}):
+            spans = [{{"name": f"{{who}}-{{i}}-{{j}}"}} for j in range({per_batch})]
+            assert spool.put(spans)
+        assert spool.dropped == 0
+        """
+    )
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", child, f"p{n}"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for n in range(writers)
+    ]
+    for proc in procs:
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err
+
+    spool = Spool(directory)
+    files = spool.files()
+    assert len(files) == writers * batches
+    assert len({f.path.name for f in files}) == len(files)  # pid in the name: no overwrites
+    assert not [p for p in directory.iterdir() if p.name.startswith(".tmp-")]
+    seen = [s["name"] for _, batch in spool.replay() for s in batch]
+    assert len(seen) == writers * batches * per_batch == len(set(seen))
+    assert spool.dropped == 0
+
+
+def test_two_replayers_and_a_writer_on_one_directory_lose_nothing(
+    tmp_path: Path, server: Server
+) -> None:
+    """Separate Spool objects share no locks, like separate processes would not."""
+    directory = tmp_path / "shared"
+    total = 60
+    delivered: list[str] = []
+    lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def make() -> AgentFlightExporter:
+        def handler(request: httpx.Request) -> httpx.Response:
+            names = [s["name"] for s in json.loads(request.content)["spans"]]
+            with lock:
+                delivered.extend(names)
+            return httpx.Response(202)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        return AgentFlightExporter(client=client, spool=Spool(directory))
+
+    writer = Spool(directory)
+    stop = threading.Event()
+
+    def write() -> None:
+        try:
+            for i in range(total):
+                assert writer.put([{"name": f"s{i}"}])
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def replay(exporter: AgentFlightExporter) -> None:
+        try:
+            while not stop.is_set():
+                assert exporter.export([]) is SpanExportResult.SUCCESS
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    a, b = make(), make()
+    threads = [threading.Thread(target=replay, args=(x,)) for x in (a, b)]
+    threads.append(threading.Thread(target=write))
+    for t in threads:
+        t.start()
+    threads[-1].join(timeout=60)
+    stop.set()
+    for t in threads[:-1]:
+        t.join(timeout=60)
+    assert not errors
+    assert a.export([]) is SpanExportResult.SUCCESS  # whatever the others left behind
+    # At-least-once: a file read by both replayers may be sent twice (ingest is idempotent).
+    assert {f"s{i}" for i in range(total)} <= set(delivered)
+    assert Spool(directory).pending_spans() == 0
+    assert writer.dropped == 0
+
+
+# Sharing one directory is safe (no locking): in-flight files are protected from eviction
+
+
+def _size(spans_: list[dict[str, Any]]) -> int:
+    return len(json.dumps({"v": 1, "spans": spans_}, separators=(",", ":")))
+
+
+def test_cap_eviction_never_removes_a_file_another_spool_is_sending(tmp_path: Path) -> None:
+    batch = [{"name": "x" * 50}]
+    directory = tmp_path / "shared"
+    cap = int(_size(batch) * 3.5)
+    sender, writer = Spool(directory, max_bytes=cap), Spool(directory, max_bytes=cap)
+    for _ in range(3):
+        assert sender.put(batch)
+    oldest = spool_files(sender)[0]
+    replay = sender.replay()
+    f, items = next(replay)  # `sender` is now sending the oldest file
+    assert f.path == oldest
+
+    # `writer` (think: another process) needs room; the oldest file is the eviction victim.
+    assert writer.put(batch)
+    assert oldest.exists()
+    assert len(spool_files(writer)) == 3  # it evicted the next oldest instead
+    assert sum(p.stat().st_size for p in spool_files(writer)) <= cap
+
+    # The send fails entirely: the file is still there to retry.
+    sender.settle(f, len(items), items)
+    replay.close()
+    assert oldest.exists()
+    assert not [p for p in directory.iterdir() if ".sending" in p.name]
+
+
+def test_eviction_skips_in_flight_files_but_the_cap_still_holds(tmp_path: Path) -> None:
+    batch = [{"name": "x" * 50}]
+    cap = int(_size(batch) * 2.5)
+    a, b = Spool(tmp_path / "s", max_bytes=cap), Spool(tmp_path / "s", max_bytes=cap)
+    assert a.put(batch) and a.put(batch)
+    replay = a.replay()
+    held = [next(replay)]  # file 1 in flight; file 2 is next in line
+    # Everything evictable goes, but never the in-flight file, and never past the cap.
+    for _ in range(4):
+        b.put(batch)
+    assert held[0][0].path.exists()
+    assert sum(p.stat().st_size for p in spool_files(b)) <= cap
+    replay.close()
+    assert b.put(batch)  # once the send is over, its file can be evicted again
+    assert sum(p.stat().st_size for p in spool_files(b)) <= cap
+
+
+def test_a_crashed_senders_marker_protects_nothing_for_ever(tmp_path: Path) -> None:
+    batch = [{"name": "x" * 50}]
+    cap = int(_size(batch) * 1.5)
+    a, b = Spool(tmp_path / "s", max_bytes=cap), Spool(tmp_path / "s", max_bytes=cap)
+    assert a.put(batch)
+    replay = a.replay()
+    f, _ = next(replay)
+    (marker,) = [p for p in (tmp_path / "s").iterdir() if ".sending-" in p.name]
+    assert b.put(batch) is False  # protected while the marker is fresh: no room, so lost
+    assert b.dropped == 1
+    assert f.path.exists()
+    old = time.time() - _spool.IN_FLIGHT_STALE_SECONDS - 5
+    os.utime(marker, (old, old))  # the sender crashed long ago
+    assert b.put(batch)
+    assert not f.path.exists()  # evicted for the newer batch
+    assert not marker.exists()  # and the stale marker was cleaned up
+    replay.close()
+
+
+def test_evict_puts_back_a_file_whose_sender_marked_it_meanwhile(tmp_path: Path) -> None:
+    a, b = Spool(tmp_path / "s"), Spool(tmp_path / "s")
+    assert a.put([{"name": "a"}])
+    (f,) = a.files()
+    a._mark(f)
+    assert b._evict(f) is False
+    assert f.path.exists()
+    assert not [p for p in (tmp_path / "s").iterdir() if p.name.startswith(".tmp-")]
+    a._unmark(f)
+    assert b._evict(f) is True
+    assert not f.path.exists() and b.dropped == 1
+
+
+def test_a_file_sent_and_deleted_by_another_process_is_skipped_silently(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    directory = tmp_path / "shared"
+    mine, other = Spool(directory), Spool(directory)
+    for name in ("a", "b", "c"):
+        assert mine.put([{"name": name}])
+    replay = mine.replay()  # lists all three files
+    first, _ = next(replay)
+    first_path, second, third = [f.path for f in other.files()]
+    # Meanwhile another process sends and deletes the second file, and evicts the third.
+    second.unlink()
+    assert other._evict(other.files()[-1]) is True
+    assert not third.exists()
+    mine.settle(first, 1, [])
+    with caplog.at_level("DEBUG", logger="agentflight"):
+        rest = list(replay)  # the two missing files are skipped without a word
+    assert rest == []
+    assert caplog.text == ""
+    assert not first_path.exists()
+    assert mine.dropped == 0  # nothing of ours was lost or corrupt
+    assert not [p for p in directory.iterdir() if ".sending-" in p.name]
+
+
+def test_a_sender_that_loses_the_race_to_an_evictor_skips_the_file(tmp_path: Path) -> None:
+    s = Spool(tmp_path / "s")
+    assert s.put([{"name": "a"}])
+    (f,) = s.files()
+    aside = f.path.with_name(".tmp-evict-1-1-" + f.path.name)
+    os.rename(f.path, aside)  # an evictor holds it aside, deciding
+    assert list(s.replay()) == []
+    assert not [p for p in (tmp_path / "s").iterdir() if ".sending-" in p.name]
+
+
+def test_eviction_in_another_process_never_removes_the_file_being_sent(tmp_path: Path) -> None:
+    directory = tmp_path / "shared"
+    batch = [{"name": "x" * 50}]
+    cap = int(_size(batch) * 2.5)
+    seed = Spool(directory, max_bytes=cap)
+    assert seed.put(batch) and seed.put(batch)
+    oldest = spool_files(seed)[0]
+    sender = textwrap.dedent(
+        f"""
+        import sys
+        from agentflight._spool import Spool
+        spool = Spool({str(directory)!r}, max_bytes={cap})
+        replay = spool.replay()
+        f, items = next(replay)          # sending the oldest file
+        print("sending", f.path.name, flush=True)
+        sys.stdin.readline()             # hold it until the parent has tried to evict it
+        spool.settle(f, len(items), items)  # the send failed: it stays for later
+        replay.close()
+        """
+    )
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    proc = subprocess.Popen(
+        [sys.executable, "-c", sender],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None and proc.stdin is not None
+        assert proc.stdout.readline().split()[1] == oldest.name
+        writer = Spool(directory, max_bytes=cap)
+        for _ in range(5):  # enough pressure to evict every other file
+            writer.put(batch)
+        assert oldest.exists()
+        assert sum(p.stat().st_size for p in spool_files(writer)) <= cap
+    finally:
+        proc.stdin.write("\n")  # type: ignore[union-attr]
+        proc.stdin.flush()  # type: ignore[union-attr]
+        _, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+    assert oldest.exists()  # still there after the failed send
+
+
+def test_every_file_the_spool_creates_is_owner_only_whatever_the_umask(tmp_path: Path) -> None:
+    """Spooled batches, rewritten partial files and sending markers: 0600; directory: 0700."""
+    old = os.umask(0)
+    try:
+        s = Spool(tmp_path / "spool")
+        assert s.put([{"name": "a"}, {"name": "b"}])
+        replay = s.replay()
+        f, items = next(replay)
+        markers = [p for p in s.directory.iterdir() if ".sending-" in p.name]
+        marker_mode = stat.S_IMODE(os.stat(markers[0]).st_mode)
+        s.settle(f, len(items), items[1:])  # sent one, one left: the file is rewritten
+        replay.close()
+    finally:
+        os.umask(old)
+    assert len(markers) == 1
+    assert marker_mode == 0o600
+    assert stat.S_IMODE(os.stat(s.directory).st_mode) == 0o700
+    (rewritten,) = spool_files(s)
+    assert stat.S_IMODE(os.stat(rewritten).st_mode) == 0o600
+    assert json.loads(rewritten.read_text())["spans"] == [{"name": "b"}]

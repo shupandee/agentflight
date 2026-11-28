@@ -423,6 +423,7 @@ def configure(
     spool_dir: str | os.PathLike[str] | None = None,
     spool_max_bytes: int | None = None,
     spool_max_age_s: float | None = None,
+    spool_enabled: bool | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
@@ -438,7 +439,10 @@ def configure(
     failed to export on disk and retries them on later exports, up to ``spool_max_bytes``
     (``AGENTFLIGHT_SPOOL_MAX_BYTES``, 64 MiB) and ``spool_max_age_s``
     (``AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS``, 24 h); it needs ``batch=True`` and the
-    built-in exporter.
+    built-in exporter. ``spool_enabled=False`` (or ``AGENTFLIGHT_SPOOL_ENABLED=false``)
+    turns the spool off whatever directory is configured (one warning says so). A size or
+    age of zero or less, in code or in the environment, turns it off too, with one warning;
+    recording carries on without a spool.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
@@ -446,7 +450,12 @@ def configure(
     try:
         key = api_key if api_key is not None else os.environ.get("AGENTFLIGHT_API_KEY")
         spool = _make_spool(
-            spool_dir, spool_max_bytes, spool_max_age_s, batch=batch, custom=exporter is not None
+            spool_dir,
+            spool_max_bytes,
+            spool_max_age_s,
+            enabled=spool_enabled,
+            batch=batch,
+            custom=exporter is not None,
         )
         _recorder = Recorder(
             exporter
@@ -469,14 +478,54 @@ def configure(
     return _recorder
 
 
+def _spool_setting(
+    name: str, value: float | None, env: str, default: float
+) -> tuple[float | None, bool]:
+    """A spool cap from the argument, else the environment, else ``default``.
+
+    Returns ``(value, ok)``. ``ok`` is False for a cap of zero or less, in code or in the
+    environment: that disables the spool (nothing on disk) rather than meaning "default".
+    An environment value that isn't a number is ignored with a warning (the default).
+    """
+    source = f"{name}={value!r}"
+    if value is None:
+        raw = os.environ.get(env)
+        if raw is None or not raw.strip():
+            return default, True
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("agentflight: ignoring %s=%r (not a number)", env, raw)
+            return default, True
+        source = f"{env}={raw!r}"
+    if value <= 0:
+        logger.warning("agentflight: %s is not positive; the on-disk spool is disabled", source)
+        return None, False
+    return value, True
+
+
 def _make_spool(
     directory: str | os.PathLike[str] | None,
     max_bytes: int | None,
     max_age_s: float | None,
     *,
+    enabled: bool | None,
     batch: bool,
     custom: bool,
 ) -> Spool | None:
+    configured = directory if directory is not None else os.environ.get("AGENTFLIGHT_SPOOL_DIR")
+    if enabled is None:
+        raw = os.environ.get("AGENTFLIGHT_SPOOL_ENABLED")
+        enabled = True if raw is None else raw.strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        if configured:
+            logger.warning(
+                "agentflight: the on-disk spool is turned off (spool_enabled=False or "
+                "AGENTFLIGHT_SPOOL_ENABLED=false) although a spool directory is set (%s); "
+                "nothing will be spooled",
+                configured,
+            )
+        return None
     if directory is None:
         directory = os.environ.get("AGENTFLIGHT_SPOOL_DIR") or None
     if directory is None:
@@ -487,11 +536,21 @@ def _make_spool(
             "agentflight: the spool needs batch=True and the built-in exporter; not spooling"
         )
         return None
-    if max_bytes is None:
-        max_bytes = _env_int("AGENTFLIGHT_SPOOL_MAX_BYTES") or DEFAULT_SPOOL_MAX_BYTES
-    if max_age_s is None:
-        max_age_s = _env_int("AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS") or DEFAULT_SPOOL_MAX_AGE_SECONDS
-    return Spool(directory, max_bytes=max_bytes, max_age_s=max_age_s)
+    size, ok = _spool_setting(
+        "spool_max_bytes", max_bytes, "AGENTFLIGHT_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES
+    )
+    if not ok:
+        return None
+    age, ok = _spool_setting(
+        "spool_max_age_s",
+        max_age_s,
+        "AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS",
+        DEFAULT_SPOOL_MAX_AGE_SECONDS,
+    )
+    if not ok:
+        return None
+    assert size is not None and age is not None
+    return Spool(directory, max_bytes=int(size), max_age_s=age)
 
 
 def get_recorder() -> Recorder:
