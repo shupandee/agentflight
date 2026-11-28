@@ -32,8 +32,26 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 
 ### Behaviour changes
 
-- **Database migration `0005`** adds three nullable columns and an index to `runs`. Run
-  `agentflight-server migrate` when upgrading the server (existing runs have no parent).
+- **Runs can have a parent run (sub-agent runs).** A run started inside another run is
+  linked to it as a sub-agent run, and `agentflight.run(parent_run_id=...)` links one
+  explicitly. Nothing changes for runs that have no parent.
+- **OTLP parents are inferred from span links by default.** A root span whose links all
+  point into exactly one other trace is stored as started from that trace's run
+  (`parent_source` `inferred`); an explicit `agentflight.run.parent_run_id` attribute
+  always wins. To turn the inference off, set `AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS=false`
+  on the server (links are still kept on the event as `otel.links`).
+- **Database migration `0005`** adds three nullable columns (`parent_run_id`,
+  `parent_span_id`, `parent_source`) and an index to `runs`. Run `agentflight-server
+  migrate` when upgrading the server (existing runs have no parent).
+- **Re-create the database if you ran unreleased `main` between the two `0005` commits.**
+  `0005` first added only `parent_run_id` and `parent_span_id` (commit `842002b`) and gained
+  `parent_source` in the next commit (`cd19d0c`), so a database migrated with the first
+  version is already at `0005` without that column, and `migrate` won't add it. Those two
+  commits reached `main` together (in the merge of PR #9), so this only affects a
+  checkout of the branch or of `842002b` itself. Databases from 0.2.0 or earlier, or
+  migrated with `cd19d0c` or later, are fine.
+- **`0005` is frozen from the next release.** Once released, a migration is never edited:
+  any further schema change goes in `0006` or later.
 - `agentflight.run()` called inside another run now records a parent link on the nested run
   where it recorded none before. Nothing else about nested runs changes.
 
