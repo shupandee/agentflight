@@ -61,6 +61,7 @@ def main() -> int:
     for path in (
         "migrations/env.py",
         "migrations/versions/0004_run_dropped_spans.py",
+        "migrations/versions/0005_run_parent_run_id.py",
         "viewer/templates/run.html",
         "viewer/static/viewer.css",
     ):

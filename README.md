@@ -1035,9 +1035,9 @@ docker compose down --volumes
   gzip) from any OpenTelemetry-instrumented agent or Collector, with `gen_ai.*` mapped to
   models, tokens and tools. Deferred: OTLP over gRPC, replay from `gen_ai` content,
   cost from a price table.
-- **Sub-agent runs** (unreleased): `parent_run_id` links runs started inside other runs
+- **0.3.0** (released): **sub-agent runs**: `parent_run_id` links runs started inside other runs
   across the SDK, `/v1/spans`, OTLP, the viewer and the run filters.
-- **Server-side redaction** (unreleased): a TOML policy the server applies to every span
+- **Server-side redaction** (0.3.0): a TOML policy the server applies to every span
   from `/v1/spans` and OTLP before storing it, with replay refusing redacted inputs.
   Deferred: a viewer badge and run-level count, a command to redact stored runs.
 - **Next:** run diff. Deferred: a demo, overhead
