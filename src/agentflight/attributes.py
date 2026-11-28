@@ -10,6 +10,10 @@ RUN_METADATA = "agentflight.run.metadata"
 # On the run span: spans of this run the SDK dropped because its export queue was full,
 # counted up to the moment the run ended (best effort; see the README).
 RUN_DROPPED_SPANS = "agentflight.run.dropped_spans"
+# On the run span of a sub-agent (child) run: the run that started it, and the span of that
+# run that was open when it did (so a viewer can show where the child was spawned).
+RUN_PARENT_RUN_ID = "agentflight.run.parent_run_id"
+RUN_PARENT_SPAN_ID = "agentflight.run.parent_span_id"
 
 LLM_MODEL = "agentflight.llm.model"
 LLM_MESSAGES = "agentflight.llm.messages"

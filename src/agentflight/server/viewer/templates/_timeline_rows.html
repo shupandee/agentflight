@@ -11,6 +11,7 @@
     <span class="muted">{{ e.attributes["agentflight.llm.tokens_in"] | number }} → {{ e.attributes.get("agentflight.llm.tokens_out") | number }} tokens</span>
     {% endif %}
     {% if e.attributes["agentflight.replay.source"] is defined %}<span class="replayed">{{ e.attributes["agentflight.replay.source"] }}</span>{% endif %}
+    {% for c in spawned_at.get(e.span_id, []) %}<a class="spawned" href="/ui/runs/{{ c.id }}">↳ sub-agent run: {{ c.name or c.id }}</a>{% endfor %}
     {% if e.status == "error" %}<div class="errmsg">{{ e.status_message or "error" }}</div>{% endif %}
     </div>
   </td>

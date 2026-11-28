@@ -10,7 +10,7 @@
   <tbody>
   {% for r in runs %}
     <tr{% if r.errors %} class="has-errors"{% endif %}>
-      <td><a href="/ui/runs/{{ r.id }}">{{ r.name or "(unnamed)" }}</a><div class="id">{{ r.id }}</div>{% if r.dropped_spans %}<div class="incomplete">incomplete recording: {{ r.dropped_spans | number }} span{% if r.dropped_spans != 1 %}s{% endif %} dropped</div>{% endif %}</td>
+      <td><a href="/ui/runs/{{ r.id }}">{{ r.name or "(unnamed)" }}</a><div class="id">{{ r.id }}</div>{% if r.parent_run_id %}<div class="muted">sub-agent run of <a class="id" href="/ui/runs/{{ r.parent_run_id }}">{{ r.parent_run_id }}</a></div>{% endif %}{% if r.dropped_spans %}<div class="incomplete">incomplete recording: {{ r.dropped_spans | number }} span{% if r.dropped_spans != 1 %}s{% endif %} dropped</div>{% endif %}</td>
       <td><span class="status st-{{ r.status }}">{{ r.status }}</span></td>
       <td>{{ r.start_time_ns | utc }}</td>
       <td class="num">{{ r.duration_ms | duration }}</td>

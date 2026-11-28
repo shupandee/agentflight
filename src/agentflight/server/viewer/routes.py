@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from agentflight import __version__
 from agentflight.server import service
 from agentflight.server.auth import permissions_for
+from agentflight.server.models import Run
 from agentflight.server.schemas import RunSummary
 from agentflight.server.settings import Permission, Settings
 from agentflight.server.viewer.format import FILTERS, parse_filters, replay_info, timeline_scale
@@ -34,6 +35,7 @@ HERE = Path(__file__).parent
 LOGIN_PATH = "/ui/login"
 RUNS_PAGE = 50
 EVENTS_PAGE = 100
+CHILD_RUNS_SHOWN = 50
 
 # No inline script or style anywhere; everything comes from /ui/static.
 CONTENT_SECURITY_POLICY = (
@@ -213,6 +215,14 @@ def _timeline_page(
     if found is None:
         return None
     run, depths = found
+    children = service.child_runs(
+        db, run_id, limit=CHILD_RUNS_SHOWN, abandoned_before_ns=_abandoned_before(request)
+    )
+    spawned_at: dict[str, list[dict[str, Any]]] = {}
+    for child in children:
+        if child.parent_span_id:
+            spawned_at.setdefault(child.parent_span_id, []).append(child.model_dump())
+    parent = db.get(Run, run.parent_run_id) if run.parent_run_id else None
     detail = run.model_dump()
     for event, depth in zip(detail["events"], depths, strict=True):
         event["depth"] = depth
@@ -220,6 +230,10 @@ def _timeline_page(
         "run": detail,
         "events": detail["events"],
         "scale": timeline_scale(detail),
+        "children": [c.model_dump() for c in children],
+        "spawned_at": spawned_at,
+        "parent_name": parent.name if parent else None,
+        "parent_known": parent is not None,
         "next_offset": offset + EVENTS_PAGE if offset + EVENTS_PAGE < run.event_count else None,
     }
 

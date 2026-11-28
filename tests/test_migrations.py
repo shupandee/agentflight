@@ -329,6 +329,36 @@ def test_0004_adds_dropped_spans_with_zero_for_existing_runs(db_url: str) -> Non
     command.downgrade(cfg, "base")
 
 
+def test_0005_adds_parent_run_columns_null_for_existing_runs(db_url: str) -> None:
+    cfg = _config(db_url)
+    command.upgrade(cfg, "0004")
+    engine = make_engine(db_url)
+    with engine.begin() as conn:
+        _insert(
+            conn,
+            "INSERT INTO runs (id, name, status, metadata) VALUES (:id, 'r', 'ok', '{}')",
+            id="a" * 32,
+        )
+    engine.dispose()
+    command.upgrade(cfg, "0005")
+    engine = make_engine(db_url)
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT parent_run_id, parent_span_id FROM runs")).one()
+        assert tuple(row) == (None, None)
+        assert "ix_runs_parent_run_id" in {i["name"] for i in inspect(conn).get_indexes("runs")}
+    engine.dispose()
+    command.downgrade(cfg, "0004")
+    engine = make_engine(db_url)
+    with engine.connect() as conn:
+        names = {c["name"] for c in inspect(conn).get_columns("runs")}
+        indexes = {i["name"] for i in inspect(conn).get_indexes("runs")}
+        assert conn.execute(text("SELECT count(*) FROM runs")).scalar_one() == 1
+    engine.dispose()
+    assert not {"parent_run_id", "parent_span_id"} & names
+    assert "ix_runs_parent_run_id" not in indexes
+    command.downgrade(cfg, "base")
+
+
 def test_migrate_command_uses_the_packaged_migrations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -343,6 +373,6 @@ def test_migrate_command_uses_the_packaged_migrations(
         assert {"runs", "events", "alembic_version"} <= set(inspect(engine).get_table_names())
         with engine.connect() as conn:
             head = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert head.startswith("0004")
+        assert head.startswith("0005")
     finally:
         engine.dispose()
