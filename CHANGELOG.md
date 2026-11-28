@@ -33,9 +33,22 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 ### Changed
 
 - **Spool kill switch:** `configure(spool_enabled=False)` or `AGENTFLIGHT_SPOOL_ENABLED=false`
-  turns the on-disk spool off even when a directory is configured. Everything else about
-  the spool (caps, atomic writes, fail-open, retry on the next export) is as in 0.1.0; this
-  release adds tests for two processes sharing a directory and for the settings.
+  turns the on-disk spool off even when a directory is configured, and logs one warning at
+  startup when it overrides a directory.
+- **A spool size or age of zero or less disables the spool.** `spool_max_bytes` and
+  `spool_max_age_s`, or `AGENTFLIGHT_SPOOL_MAX_BYTES` and `AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS`,
+  now behave the same in code and in the environment: zero or negative turns the spool off
+  with one warning and recording continues. Before, a non-positive size in the environment
+  meant the 64 MiB default (with a warning), and one in code made `configure()` fail and disable
+  recording altogether. A value that isn't a number is still ignored with a warning.
+- **Sharing a spool directory between processes is safe.** (No locking; documented as
+  "sharing works but may resend duplicates; one folder per process avoids that".) Cap
+  eviction could delete a file another process was in the middle of sending, which lost
+  those spans if the send then failed; senders now mark the file they are sending, and
+  eviction and expiry skip marked files. If only files being sent are left, a new batch
+  that doesn't fit is dropped and counted instead of going past the size cap.
+- README: the spool holds recorded payloads as plain JSON on disk (owner-only `0700`/`0600`
+  where the OS supports it) and the settings table.
 
 ### Behaviour changes
 
