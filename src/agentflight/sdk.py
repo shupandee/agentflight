@@ -423,6 +423,7 @@ def configure(
     spool_dir: str | os.PathLike[str] | None = None,
     spool_max_bytes: int | None = None,
     spool_max_age_s: float | None = None,
+    spool_enabled: bool | None = None,
 ) -> Recorder:
     """Point the SDK at an AgentFlight server (or a custom exporter) and return the recorder.
 
@@ -438,7 +439,8 @@ def configure(
     failed to export on disk and retries them on later exports, up to ``spool_max_bytes``
     (``AGENTFLIGHT_SPOOL_MAX_BYTES``, 64 MiB) and ``spool_max_age_s``
     (``AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS``, 24 h); it needs ``batch=True`` and the
-    built-in exporter.
+    built-in exporter. ``spool_enabled=False`` (or ``AGENTFLIGHT_SPOOL_ENABLED=false``)
+    turns the spool off whatever directory is configured.
     If setup fails, recording is disabled (a warning is logged) rather than raising.
     """
     global _recorder
@@ -446,7 +448,12 @@ def configure(
     try:
         key = api_key if api_key is not None else os.environ.get("AGENTFLIGHT_API_KEY")
         spool = _make_spool(
-            spool_dir, spool_max_bytes, spool_max_age_s, batch=batch, custom=exporter is not None
+            spool_dir,
+            spool_max_bytes,
+            spool_max_age_s,
+            enabled=spool_enabled,
+            batch=batch,
+            custom=exporter is not None,
         )
         _recorder = Recorder(
             exporter
@@ -474,9 +481,15 @@ def _make_spool(
     max_bytes: int | None,
     max_age_s: float | None,
     *,
+    enabled: bool | None,
     batch: bool,
     custom: bool,
 ) -> Spool | None:
+    if enabled is None:
+        raw = os.environ.get("AGENTFLIGHT_SPOOL_ENABLED")
+        enabled = True if raw is None else raw.strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
     if directory is None:
         directory = os.environ.get("AGENTFLIGHT_SPOOL_DIR") or None
     if directory is None:

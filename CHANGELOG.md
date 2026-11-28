@@ -30,6 +30,13 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 - README: an Install section with every `agentflight-sdk` install form and the import
   name (`agentflight`).
 
+### Changed
+
+- **Spool kill switch:** `configure(spool_enabled=False)` or `AGENTFLIGHT_SPOOL_ENABLED=false`
+  turns the on-disk spool off even when a directory is configured. Everything else about
+  the spool (caps, atomic writes, fail-open, retry on the next export) is as in 0.1.0; this
+  release adds tests for two processes sharing a directory and for the settings.
+
 ### Behaviour changes
 
 - **Runs can have a parent run (sub-agent runs).** A run started inside another run is

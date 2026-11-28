@@ -505,6 +505,17 @@ agentflight.configure("http://localhost:8000", spool_dir="/var/tmp/agentflight-s
 # or AGENTFLIGHT_SPOOL_DIR=/var/tmp/agentflight-spool
 ```
 
+| Setting | `configure(...)` | Environment | Default |
+| --- | --- | --- | --- |
+| Directory (setting it turns the spool on) | `spool_dir` | `AGENTFLIGHT_SPOOL_DIR` | unset: off |
+| Kill switch | `spool_enabled=False` | `AGENTFLIGHT_SPOOL_ENABLED=false` | on (when a directory is set) |
+| Size cap | `spool_max_bytes` | `AGENTFLIGHT_SPOOL_MAX_BYTES` | 64 MiB |
+| Age cap | `spool_max_age_s` | `AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS` | 24 h |
+
+An explicit argument wins over the environment; the kill switch wins over a directory (so a
+deployment can switch the spool off without editing code). A non-numeric or non-positive
+size or age in the environment is ignored with a warning (the default is used).
+
 With a spool directory, spans that weren't stored because of a failure that may clear up
 (server down, transport error, timeout, 5xx, 408/425/429, rejected credentials, the
 attempt cap or the run span deadline) are written to disk, one file per failed batch,

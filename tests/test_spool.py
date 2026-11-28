@@ -430,3 +430,176 @@ def test_failed_run_span_is_spooled_and_closes_the_run_later(tmp_path: Path, c: 
     exporter = AgentFlightExporter("http://testserver", client=c, spool=Spool(spool_dir))
     assert exporter.export([]) is SpanExportResult.SUCCESS
     assert c.get(f"/v1/runs/{r.run_id}").json()["status"] == "ok"
+
+
+# Settings
+
+
+def test_kill_switch_turns_the_spool_off_even_with_a_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert agentflight.configure("http://127.0.0.1:9", spool_dir=tmp_path).spool is not None
+    assert (
+        agentflight.configure("http://127.0.0.1:9", spool_dir=tmp_path, spool_enabled=False).spool
+        is None
+    )
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path / "env"))
+    for off in ("false", "0", "no", "OFF"):
+        monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", off)
+        assert agentflight.configure("http://127.0.0.1:9").spool is None, off
+        assert agentflight.configure("http://127.0.0.1:9", spool_dir=tmp_path).spool is None, off
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", "true")
+    assert agentflight.configure("http://127.0.0.1:9").spool is not None
+    # An explicit argument wins over the environment.
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_ENABLED", "false")
+    rec = agentflight.configure("http://127.0.0.1:9", spool_enabled=True)
+    assert rec.spool is not None and rec.spool.directory == tmp_path / "env"
+
+
+def test_disabled_spool_drops_failed_batches_and_writes_nothing(
+    tmp_path: Path, server: Server
+) -> None:
+    server.status = 503
+    directory = tmp_path / "spool"
+    agentflight.configure(
+        "http://127.0.0.1:9", spool_dir=directory, spool_enabled=False, timeout=0.2
+    )
+    with agentflight.run("offline"):
+        pass
+    assert agentflight.flush(timeout_millis=10_000)
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5", ""])
+def test_a_bad_size_or_age_in_the_environment_is_ignored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: str,
+) -> None:
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_MAX_BYTES", bad)
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS", bad)
+    with caplog.at_level("WARNING"):
+        rec = agentflight.configure("http://127.0.0.1:9")
+    assert rec.spool is not None
+    assert rec.spool.max_bytes == _spool.DEFAULT_SPOOL_MAX_BYTES
+    assert rec.spool.max_age_s == _spool.DEFAULT_SPOOL_MAX_AGE_SECONDS
+    if bad:
+        assert "ignoring AGENTFLIGHT_SPOOL_MAX_BYTES" in caplog.text
+
+
+def test_arguments_override_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_DIR", str(tmp_path / "env"))
+    monkeypatch.setenv("AGENTFLIGHT_SPOOL_MAX_BYTES", "4096")
+    rec = agentflight.configure(
+        "http://127.0.0.1:9",
+        spool_dir=tmp_path / "arg",
+        spool_max_bytes=8192,
+        spool_max_age_s=60,
+    )
+    assert rec.spool is not None
+    assert (rec.spool.directory, rec.spool.max_bytes, rec.spool.max_age_s) == (
+        tmp_path / "arg",
+        8192,
+        60,
+    )
+
+
+# Several processes (or threads) on one directory
+
+
+def test_processes_writing_to_one_spool_never_collide_or_corrupt(tmp_path: Path) -> None:
+    directory = tmp_path / "shared"
+    writers, batches, per_batch = 4, 25, 3
+    child = textwrap.dedent(
+        f"""
+        import sys
+        from agentflight._spool import Spool
+        spool = Spool({str(directory)!r})
+        who = sys.argv[1]
+        for i in range({batches}):
+            spans = [{{"name": f"{{who}}-{{i}}-{{j}}"}} for j in range({per_batch})]
+            assert spool.put(spans)
+        assert spool.dropped == 0
+        """
+    )
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", child, f"p{n}"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for n in range(writers)
+    ]
+    for proc in procs:
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err
+
+    spool = Spool(directory)
+    files = spool.files()
+    assert len(files) == writers * batches
+    assert len({f.path.name for f in files}) == len(files)  # pid in the name: no overwrites
+    assert not [p for p in directory.iterdir() if p.name.startswith(".tmp-")]
+    seen = [s["name"] for _, batch in spool.replay() for s in batch]
+    assert len(seen) == writers * batches * per_batch == len(set(seen))
+    assert spool.dropped == 0
+
+
+def test_two_replayers_and_a_writer_on_one_directory_lose_nothing(
+    tmp_path: Path, server: Server
+) -> None:
+    """Separate Spool objects share no locks, like separate processes would not."""
+    directory = tmp_path / "shared"
+    total = 60
+    delivered: list[str] = []
+    lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def make() -> AgentFlightExporter:
+        def handler(request: httpx.Request) -> httpx.Response:
+            names = [s["name"] for s in json.loads(request.content)["spans"]]
+            with lock:
+                delivered.extend(names)
+            return httpx.Response(202)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        return AgentFlightExporter(client=client, spool=Spool(directory))
+
+    writer = Spool(directory)
+    stop = threading.Event()
+
+    def write() -> None:
+        try:
+            for i in range(total):
+                assert writer.put([{"name": f"s{i}"}])
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def replay(exporter: AgentFlightExporter) -> None:
+        try:
+            while not stop.is_set():
+                assert exporter.export([]) is SpanExportResult.SUCCESS
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    a, b = make(), make()
+    threads = [threading.Thread(target=replay, args=(x,)) for x in (a, b)]
+    threads.append(threading.Thread(target=write))
+    for t in threads:
+        t.start()
+    threads[-1].join(timeout=60)
+    stop.set()
+    for t in threads[:-1]:
+        t.join(timeout=60)
+    assert not errors
+    assert a.export([]) is SpanExportResult.SUCCESS  # whatever the others left behind
+    # At-least-once: a file read by both replayers may be sent twice (ingest is idempotent).
+    assert {f"s{i}" for i in range(total)} <= set(delivered)
+    assert Spool(directory).pending_spans() == 0
+    assert writer.dropped == 0
