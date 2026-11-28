@@ -240,8 +240,39 @@ three rounds, with the main and branch runs alternated in separate processes.
 The off path shows no regression: the three rounds differ by -0.5 to +1.8 ms (noise). The
 policy: 2 rules (one key rule with 3 keys, one rule with 3 presets). With it, a
 payload-heavy batch costs about three times the no-policy request. Not measured: Postgres,
-real agent payloads, OTLP, other rule counts. Speed-up (follow-up, before the next release):
-skip the JSON walk when no key rule can match the text.
+real agent payloads, OTLP, other rule counts. A speed-up
+(skip the JSON parse and walk when nothing can match) follows in section 9.1.
+
+### 9.1 Skipping the JSON walk
+
+`Policy._nothing_can_match(text, scope)` returns True only when the full parse-and-walk
+would leave the text unchanged, and the value is then kept as is. It says False (and the
+full walk runs) when the text has a backslash (an escape can make a decoded string differ
+from the raw text: `\u0061pi_key`, `\n` for `\s`), when a key rule name appears in the
+lowercased text (non-ASCII text is walked if a key isn't ASCII), when any pattern matches
+the raw text, or when the scope has a pattern with an anchor or lookaround (`^ $ \A \Z
+(?= (?! (?<= (?<! (?(`), which can match a string on its own but not inside the JSON text.
+Differential tests compare it against the full walk on 600 random documents per policy,
+and break when any of the three guards is removed.
+
+Measured with the same method (3 rounds of 15 posts, medians per round; policy: 2 rules;
+shape "plain" has no escapes or key names in the payload, "newlines" has `\n` in the message
+text, "keyed" has an `api_key` key in each message's metadata):
+
+| Policy on, median of round 1 / 2 / 3 | Before | After |
+| --- | --- | --- |
+| SQLite in memory, plain | 148.1 / 148.0 / 149.1 ms | 121.6 / 122.3 / 121.6 ms |
+| SQLite in memory, newlines | 150.2 / 149.6 / 151.0 ms | 150.0 / 148.7 / 148.9 ms |
+| SQLite in memory, keyed | 161.9 / 161.5 / 161.9 ms | 162.9 / 163.0 / 163.4 ms |
+| Postgres 17 (local), plain | 165.9 / 170.5 / 168.5 ms | 136.7 / 137.2 / 138.5 ms |
+| Postgres 17 (local), newlines | 170.8 / 168.4 / 168.5 ms | 165.7 / 165.7 / 164.1 ms |
+| Postgres 17 (local), keyed | 181.5 / 179.1 / 180.2 ms | 178.8 / 179.2 / 179.1 ms |
+
+Without a policy file: about 44 ms (SQLite) and 60-62 ms (Postgres) in every shape, before
+and after (the code isn't reached). So the speed-up is about 18% for payloads with nothing
+to redact, none for payloads with newlines or a key name. A profile of the plain case after
+the change puts about 73 of 78 ms in `re.Pattern.search` (the three presets scanning 2.4 MB),
+so the next cost is the pattern scan itself, not the JSON walk.
 
 ## 10. Tests (PR 1, `tests/test_redaction.py`)
 

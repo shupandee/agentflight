@@ -102,6 +102,9 @@ _JSON_SUFFIXES = (
     ".input",
     ".output",
 )
+# Pattern features that look outside the matched text (anchors, lookarounds, conditionals):
+# conservative, so a ``^`` inside a character class counts too.
+_CONTEXT_FREE = re.compile(r"\^|\$|\\[AZ]|\(\?<?[=!]|\(\?\(")
 # Nested quantifiers such as (a+)+ or (a*)* : the classic catastrophic-backtracking shape.
 _NESTED_QUANTIFIER = re.compile(r"\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)\s*[+*{]")
 
@@ -160,6 +163,10 @@ class Policy:
     on_error: str = "redact"
     # Text-level "key": value matching for each key-rule key, built once.
     _text_keys: tuple[tuple[Rule, re.Pattern[str]], ...] = ()
+    # Per scope: (key rule keys, patterns) for the quick "nothing can match" check.
+    _quick: dict[str, tuple[tuple[str, ...], tuple[re.Pattern[str], ...], bool]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     # -- loading ---------------------------------------------------------------------
 
@@ -199,7 +206,22 @@ class Policy:
             if rule.keys
             for key in sorted(rule.keys)
         )
-        policy = cls(rules=rules, marker=marker, on_error=on_error, _text_keys=text_keys)
+        quick = {
+            scope: (
+                tuple(sorted({k for r in rules if scope in r.scope for k in r.keys})),
+                tuple(p for r in rules if scope in r.scope for p in r.patterns),
+                all(
+                    _CONTEXT_FREE.search(p.pattern) is None
+                    for r in rules
+                    if scope in r.scope
+                    for p in r.patterns
+                ),
+            )
+            for scope in SCOPES
+        }
+        policy = cls(
+            rules=rules, marker=marker, on_error=on_error, _text_keys=text_keys, _quick=quick
+        )
         policy._check_markers()
         return policy
 
@@ -276,6 +298,38 @@ class Policy:
             return self.redact_string(value, scope, changes, depth + 1, json_hint=False)
         return value
 
+    def _nothing_can_match(self, text: str, scope: str) -> bool:
+        """True only if parsing and walking ``text`` would leave it unchanged.
+
+        A cheap check that skips the JSON parse and walk for the common case of a payload
+        that holds nothing for the policy. It is deliberately conservative; whenever it
+        isn't sure it says False and the full walk runs:
+
+        * a backslash in the text (escapes: ``\\n``, ``\\"``, ``\\u0061``) means a decoded
+          string can differ from the raw text, so a key or pattern could match only after
+          parsing;
+        * a pattern with anchors or lookarounds can match a string on its own but not inside
+          the surrounding JSON text, so such patterns turn the check off for their scope
+          (``\\b`` is fine: the characters around a JSON string are quotes);
+        * without escapes, every string leaf and dict key is a substring of the raw text,
+          so a pattern that matches a leaf also matches the raw text, and a key that
+          matches (case-insensitively) appears in the lowercased text. Keys are compared
+          lowercased, as the walk does; if a key isn't ASCII, non-ASCII text is walked
+          (lowercasing depends on context for a few letters).
+        """
+        if "\\" in text:
+            return False
+        keys, patterns, context_free = self._quick[scope]
+        if patterns and not context_free:
+            return False
+        if keys:
+            if not text.isascii() and not all(k.isascii() for k in keys):
+                return False
+            lowered = text.lower()
+            if any(k in lowered for k in keys):
+                return False
+        return not any(p.search(text) for p in patterns)
+
     def redact_string(
         self, text: str, scope: str, changes: Changes, depth: int = 0, *, json_hint: bool
     ) -> str:
@@ -283,6 +337,8 @@ class Policy:
         else only when it looks like an object or array), otherwise treated as text."""
         stripped = text.lstrip()
         if (json_hint or stripped.startswith(_JSON_START)) and depth <= _MAX_DEPTH:
+            if self._nothing_can_match(text, scope):
+                return text
             try:
                 parsed = json.loads(text)
             except ValueError:

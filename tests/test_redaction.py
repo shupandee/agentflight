@@ -946,3 +946,131 @@ def test_only_on_redacted_input_live_goes_live_and_it_is_recorded(rec: TestClien
     assert root["attributes"][A.REPLAY_ON_REDACTED_INPUT] == "live"
     step = next(e for e in events(rec, r.run_id) if e["kind"] == "tool")
     assert step["attributes"][A.REPLAY_SOURCE] == "live"
+
+
+# The quick check that skips the JSON parse and walk ---------------------------------------------
+
+QUICK_POLICIES = {
+    "keys": '[[rules]]\nname = "k"\nkeys = ["api_key", "clé"]\n',
+    "patterns": '[[rules]]\nname = "p"\npreset = ["bearer", "openai-key"]\n',
+    "both": POLICY,
+    "anchored": '[[rules]]\nname = "a"\npatterns = ["^ACCT-[0-9]+$"]\n',
+    "lookaround": '[[rules]]\nname = "l"\npatterns = ["(?<![a-z])tok[0-9]+(?=;)"]\n',
+    "drop": '[[rules]]\nname = "d"\nkeys = ["token"]\naction = "drop"\n',
+}
+
+
+def _no_quick_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Policy, "_nothing_can_match", lambda self, text, scope: False)
+
+
+def _random_doc(rng: Any, depth: int = 0) -> Any:
+    words = [
+        "hello",
+        "word",
+        "line\nbreak",
+        'say "hi"',
+        "back\\slash",
+        "caf\u00e9",
+        "clé",
+        "\u03a3\u03af\u03c3",
+        "ACCT-123",
+        "tok7;",
+        "xtok7;",
+        "Bearer abcdefghijklmnop0123",
+        "sk-" + "a" * 24,
+        "secret-a",
+        "",
+        " ",
+        "\u212a",
+        '{"api_key": "nested"}',
+        "1234",
+    ]
+    keys = ["api_key", "API_KEY", "Api_Key", "other", "token", "clé", "CLÉ", "n", "\u212a"]
+    roll = rng.random()
+    if depth > 3 or roll < 0.35:
+        return rng.choice([*words, 7, 2.5, True, None])
+    if roll < 0.65:
+        return [_random_doc(rng, depth + 1) for _ in range(rng.randint(0, 4))]
+    return {rng.choice(keys): _random_doc(rng, depth + 1) for _ in range(rng.randint(0, 4))}
+
+
+@pytest.mark.parametrize("name", sorted(QUICK_POLICIES))
+def test_quick_check_gives_the_same_result_as_the_full_walk(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import random
+
+    policy = _policy(QUICK_POLICIES[name])
+    rng = random.Random(f"quick-{name}")
+    cases = []
+    for _ in range(600):
+        doc = _random_doc(rng)
+        text = json.dumps(
+            doc, ensure_ascii=rng.random() < 0.5, indent=rng.choice([None, 2]), sort_keys=False
+        )
+        cases.append(text)
+    cases += ["", "{}", "[]", '"just a string"', "12", "{broken api_key", '{"a": "ACCT-123"}']
+    with monkeypatch.context() as m:
+        _no_quick_check(m)
+        expected = [
+            redact(policy, {"agentflight.tool.args": c, "gen_ai.x": c}, status=None) for c in cases
+        ]
+    got = [redact(policy, {"agentflight.tool.args": c, "gen_ai.x": c}, status=None) for c in cases]
+    for text, want, have in zip(cases, expected, got, strict=True):
+        assert have.attributes == want.attributes, (name, text)
+    assert any(REDACTED in r.attributes for r in got)  # the generator does hit the policy
+    assert any(REDACTED not in r.attributes for r in got)
+
+
+def test_quick_check_skips_the_parse_when_nothing_can_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parsed: list[str] = []
+    real = json.loads
+
+    def spy(text: Any, *a: Any, **kw: Any) -> Any:
+        parsed.append(text)
+        return real(text, *a, **kw)
+
+    monkeypatch.setattr(json, "loads", spy)
+    policy = _policy()
+    clean = json.dumps([{"role": "user", "content": "hello there", "n": 1}], ensure_ascii=False)
+    out = redact(policy, {"agentflight.llm.messages": clean})
+    assert out.attributes["agentflight.llm.messages"] == clean and not parsed
+    # A key rule's name, or a pattern hit, in the text: parsed and walked.
+    keyed = json.dumps({"api_key": "k"})
+    assert redact(policy, {"agentflight.llm.messages": keyed}).attributes[
+        "agentflight.llm.messages"
+    ] == json.dumps({"api_key": "[REDACTED:keys]"})
+    leaked = json.dumps({"note": f"x {CANARY}"})
+    assert (
+        CANARY
+        not in redact(policy, {"agentflight.llm.messages": leaked}).attributes[
+            "agentflight.llm.messages"
+        ]
+    )
+    assert len(parsed) == 2  # only those two (escape-free) values were parsed
+
+
+def test_quick_check_is_off_for_escapes_and_context_sensitive_patterns() -> None:
+    policy = _policy()
+    # A key written with a unicode escape only matches after decoding.
+    escaped = '{"\\u0061pi_key": "k"}'
+    assert json.loads(
+        redact(policy, {"agentflight.tool.args": escaped}).attributes["agentflight.tool.args"]
+    ) == {"api_key": "[REDACTED:keys]"}
+    # \s matches the decoded newline, not the two characters backslash-n.
+    bearer = json.dumps({"h": "Bearer\nabcdefghijklmnop0123"})
+    assert (
+        "abcdefghijklmnop0123"
+        not in redact(policy, {"agentflight.tool.args": bearer}).attributes["agentflight.tool.args"]
+    )
+    # An anchored pattern matches the leaf, not the JSON text around it.
+    anchored = _policy(QUICK_POLICIES["anchored"])
+    out = redact(anchored, {"agentflight.tool.args": '{"id": "ACCT-123"}'})
+    assert json.loads(out.attributes["agentflight.tool.args"]) == {"id": "[REDACTED:a]"}
+    # A non-ASCII key rule with non-ASCII text isn't skipped.
+    cle = _policy(QUICK_POLICIES["keys"])
+    out = redact(cle, {"agentflight.tool.args": '{"CLÉ": "k", "\u00e9": 1}'})
+    assert json.loads(out.attributes["agentflight.tool.args"])["CLÉ"] == "[REDACTED:k]"
