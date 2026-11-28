@@ -43,6 +43,7 @@ from agentflight import sdk
 logger = logging.getLogger("agentflight")
 
 OnDivergence = Literal["raise", "live"]
+OnRedactedInput = Literal["raise", "live"]
 
 STEP_KINDS = (A.LLM, A.TOOL)
 _NO_OUTPUT: Any = object()
@@ -55,6 +56,15 @@ class ReplayError(Exception):
 
 class ReplayDivergence(ReplayError):
     """The live run made a call that doesn't match the recording at that step."""
+
+
+class RedactedInputError(ReplayDivergence):
+    """A recorded step's input was redacted by the server, so the live call can't be
+    compared with it.
+
+    Raised even with ``on_divergence="live"``: going live past a redacted input needs its
+    own opt-in, ``on_redacted_input="live"``, which is recorded on the replayed run.
+    """
 
 
 class ReplayedError(Exception):
@@ -82,6 +92,8 @@ class Step:
     output: Any
     error: tuple[str, str] | None  # (type name, message) if the call failed
     truncated: dict[str, Any] = field(default_factory=dict)
+    # attribute key -> {rules, count, ...}: values the server's redaction policy replaced
+    redacted: dict[str, Any] = field(default_factory=dict)
 
 
 def _steps(events: list[dict[str, Any]]) -> list[Step]:
@@ -120,6 +132,7 @@ def _steps(events: list[dict[str, Any]]) -> list[Step]:
                 output=attrs.get(_OUTPUT_KEY[kind]),
                 error=error,
                 truncated=dict(e.get("truncated") or {}),
+                redacted=dict(e.get("redacted") or {}),
             )
         )
     return steps
@@ -226,11 +239,21 @@ class ReplaySession:
 
     mode = "replay"
 
-    def __init__(self, recording: Recording, on_divergence: OnDivergence = "raise") -> None:
+    def __init__(
+        self,
+        recording: Recording,
+        on_divergence: OnDivergence = "raise",
+        on_redacted_input: OnRedactedInput = "raise",
+    ) -> None:
         if on_divergence not in ("raise", "live"):
             raise ValueError(f"on_divergence must be 'raise' or 'live', not {on_divergence!r}")
+        if on_redacted_input not in ("raise", "live"):
+            raise ValueError(
+                f"on_redacted_input must be 'raise' or 'live', not {on_redacted_input!r}"
+            )
         self.recording = recording
         self.on_divergence = on_divergence
+        self.on_redacted_input = on_redacted_input
         if recording.incomplete:
             # Said up front: missing steps show up later as divergences or live calls.
             logger.warning(
@@ -261,7 +284,13 @@ class ReplaySession:
         return max(0, len(self.recording.steps) - self.cursor)
 
     def run_attributes(self) -> dict[str, Any]:
-        return {A.REPLAY_SOURCE_RUN: self.recording.run_id, A.REPLAY_MODE: self.mode}
+        attrs: dict[str, Any] = {
+            A.REPLAY_SOURCE_RUN: self.recording.run_id,
+            A.REPLAY_MODE: self.mode,
+        }
+        if self.on_redacted_input == "live":
+            attrs[A.REPLAY_ON_REDACTED_INPUT] = "live"
+        return attrs
 
     def _check(self, step: Step, kind: str, name: str, inputs: dict[str, Any]) -> None:
         where = f"step {step.index}"
@@ -269,6 +298,13 @@ class ReplaySession:
             raise ReplayDivergence(
                 f"{where}: recorded {step.kind} {step.name!r}, got {kind} {name!r}"
             )
+        for key in sorted(set(inputs) | set(step.inputs)):
+            if key in step.redacted:
+                rules = ", ".join(str(r) for r in step.redacted[key].get("rules", []))
+                raise RedactedInputError(
+                    f"{where} ({kind} {name!r}): recorded {key} was redacted by the server "
+                    f"(rules: {rules}), so the live call can't be compared with it"
+                )
         for key, live in inputs.items():
             recorded = step.inputs.get(key)
             if live is None and key not in step.inputs:
@@ -290,6 +326,11 @@ class ReplaySession:
         output_key = _OUTPUT_KEY[step.kind]
         if output_key in step.truncated:
             raise ReplayError(f"step {step.index}: recorded {output_key} is truncated")
+        if output_key in step.redacted:
+            raise ReplayError(
+                f"step {step.index}: recorded {output_key} was redacted by the server; "
+                f"fork(recording, at={step.index}, output=...) supplies it"
+            )
         return step.output
 
     def _take(self, kind: str, name: str, inputs: dict[str, Any]) -> tuple[str, Any, int]:
@@ -301,6 +342,11 @@ class ReplaySession:
             return "live", None, index
         try:
             return self._plan(index, kind, name, inputs)
+        except RedactedInputError as exc:
+            if self.on_redacted_input != "live":
+                raise
+            self._diverge(index, str(exc))
+            return "live", None, index
         except ReplayDivergence as exc:
             if self.on_divergence == "raise":
                 raise
@@ -360,8 +406,9 @@ class ForkSession(ReplaySession):
         at: int,
         output: Any = _NO_OUTPUT,
         on_divergence: OnDivergence = "raise",
+        on_redacted_input: OnRedactedInput = "raise",
     ) -> None:
-        super().__init__(recording, on_divergence)
+        super().__init__(recording, on_divergence, on_redacted_input)
         count = len(recording.steps)
         if not 0 <= at <= count:
             raise ReplayError(f"fork step {at} out of range (recording has {count} steps)")
@@ -390,7 +437,10 @@ class ForkSession(ReplaySession):
 
 @contextmanager
 def replay(
-    recording: Recording, *, on_divergence: OnDivergence = "raise"
+    recording: Recording,
+    *,
+    on_divergence: OnDivergence = "raise",
+    on_redacted_input: OnRedactedInput = "raise",
 ) -> Iterator[ReplaySession]:
     """Replay ``recording``: recorded outputs are served and nothing is called live.
 
@@ -401,8 +451,15 @@ def replay(
     call that doesn't match the recording. ``"live"`` instead stops serving recorded
     outputs at that step and runs it and every later call live; the step and reason are
     kept on the session (``diverged_at``, ``divergence``) and on the run span.
+
+    A step whose recorded input was redacted by the server raises
+    :class:`RedactedInputError` whatever ``on_divergence`` says: the input can't be
+    compared. ``on_redacted_input="live"`` runs from that step live instead (as a
+    divergence), and is recorded on the run as ``agentflight.replay.on_redacted_input``.
+    A redacted recorded output raises :class:`ReplayError`; use :func:`fork` with
+    ``output=...`` for that step.
     """
-    session = ReplaySession(recording, on_divergence)
+    session = ReplaySession(recording, on_divergence, on_redacted_input)
     token = sdk._replay_session.set(session)
     try:
         yield session
@@ -417,6 +474,7 @@ def fork(
     *,
     output: Any = _NO_OUTPUT,
     on_divergence: OnDivergence = "raise",
+    on_redacted_input: OnRedactedInput = "raise",
 ) -> Iterator[ForkSession]:
     """Replay ``recording`` up to step ``at``, then run live.
 
@@ -426,9 +484,10 @@ def fork(
     result, or a model response in the form your code reads it), and live execution
     starts at the next step. ``at`` may equal the number of steps: the whole recording is
     replayed and any further calls run live. ``on_divergence`` works as in :func:`replay`
-    for the replayed prefix (and the override step's kind and name).
+    for the replayed prefix (and the override step's kind and name), and
+    ``on_redacted_input`` as in :func:`replay`.
     """
-    session = ForkSession(recording, at, output, on_divergence)
+    session = ForkSession(recording, at, output, on_divergence, on_redacted_input)
     token = sdk._replay_session.set(session)
     try:
         yield session

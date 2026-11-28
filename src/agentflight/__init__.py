@@ -4,6 +4,7 @@ from agentflight.exporter import AgentFlightExporter
 from agentflight.replayer import (
     ForkSession,
     Recording,
+    RedactedInputError,
     ReplayDivergence,
     ReplayedError,
     ReplayError,
@@ -35,6 +36,7 @@ __all__ = [
     "LLMCall",
     "Recorder",
     "Recording",
+    "RedactedInputError",
     "ReplayDivergence",
     "ReplayError",
     "ReplaySession",

@@ -127,7 +127,7 @@ def test_one_batch_updates_several_runs(client: TestClient) -> None:
     other = "d" * 32
     spans = [*batch(), span("0", "run", trace=other), llm("1", 1, 2, trace=other)]
     body = client.post("/v1/spans", json={"spans": spans}).json()
-    assert body == {"accepted": 8, "runs": [T, other]}
+    assert body == {"accepted": 8, "runs": [T, other], "rejected": 0, "error_message": ""}
     assert totals(client) == EXPECTED
     assert totals(client, other)["tokens_out"] == 2
 

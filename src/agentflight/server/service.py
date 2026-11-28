@@ -24,8 +24,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session
 
 from agentflight import attributes as A
+from agentflight import redaction
 from agentflight.server.models import Event, Run
-from agentflight.server.schemas import EventOut, RunDetail, RunSummary, SpanIn
+from agentflight.server.schemas import EventOut, RunDetail, RunSummary, SpanEventIn, SpanIn
 
 # Stored run status from the root span's status. A root span that ended without setting a
 # status is "unknown" (not "ok"): nothing reported success.
@@ -226,9 +227,53 @@ def _duration_ms(start: int | None, end: int | None) -> float | None:
     return (end - start) / 1e6
 
 
+@dataclass
+class Redacted:
+    """``redact_spans`` result: spans to store, and why the others were rejected."""
+
+    spans: list[SpanIn]
+    rejected: list[str]
+
+
+def redact_spans(
+    policy: redaction.Policy | None, spans: list[SpanIn], max_chars: int | None
+) -> Redacted:
+    """Apply the server's redaction policy to a batch before anything is stored or derived.
+
+    Without a policy, spans pass through unchanged. A span is rejected only in
+    ``on_error="reject"`` mode; the reason names the span and the attribute, never a value.
+    """
+    if policy is None:
+        return Redacted(spans, [])
+    kept: list[SpanIn] = []
+    rejected: list[str] = []
+    for span in spans:
+        result = redaction.redact_span_parts(
+            policy,
+            span.attributes,
+            [(e.name, e.time_ns, e.attributes) for e in span.events],
+            span.status_message,
+            max_chars=max_chars,
+        )
+        if result.error is not None:
+            rejected.append(f"span {span.span_id}: {result.error}")
+            continue
+        kept.append(
+            span.model_copy(
+                update={
+                    "attributes": result.attributes,
+                    "events": [SpanEventIn.model_construct(**e) for e in result.events],
+                    "status_message": result.status_message,
+                }
+            )
+        )
+    return Redacted(kept, rejected)
+
+
 def event_out(event: Event) -> EventOut:
     attrs = {k: _loads(v) if k.endswith(_JSON_SUFFIXES) else v for k, v in event.attributes.items()}
     truncated = attrs.get(A.TRUNCATED)
+    redacted = attrs.get(redaction.REDACTED)
     return EventOut(
         span_id=event.span_id,
         parent_span_id=event.parent_span_id,
@@ -241,6 +286,7 @@ def event_out(event: Event) -> EventOut:
         duration_ms=_duration_ms(event.start_time_ns, event.end_time_ns),
         attributes=attrs,
         truncated=truncated if isinstance(truncated, dict) else {},
+        redacted=redacted if isinstance(redacted, dict) else {},
         span_events=event.span_events,
     )
 
@@ -258,6 +304,7 @@ _JSON_SUFFIXES = (
     ".input",
     ".output",
     ".truncated",
+    ".redacted",
 )
 
 
@@ -373,7 +420,7 @@ def list_runs(
 
 # Attribute suffixes that hold recorded payloads (messages, outputs, args...). Left out of
 # events when a caller asks for ``payloads=False``.
-_PAYLOAD_SUFFIXES = tuple(s for s in _JSON_SUFFIXES if s != ".truncated")
+_PAYLOAD_SUFFIXES = tuple(s for s in _JSON_SUFFIXES if s not in (".truncated", ".redacted"))
 
 
 def _without_payloads(event: EventOut) -> EventOut:

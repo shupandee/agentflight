@@ -9,12 +9,15 @@ from collections.abc import Iterator, Mapping
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from agentflight import __version__
+from agentflight.redaction import Policy, PolicyError
 from agentflight.server import otlp, service
 from agentflight.server.auth import RedactingFilter, authorize, require
 from agentflight.server.db import make_engine, session_factory
@@ -64,6 +67,11 @@ _LOG_FILTER = RedactingFilter(())
 LOGGERS = ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi", "agentflight")
 
 
+def _join_errors(errors: list[str], limit: int = 10) -> str:
+    more = len(errors) - limit
+    return "; ".join(errors[:limit]) + (f"; and {more} more" if more > 0 else "")
+
+
 def create_app(engine: Engine | None = None, settings: Settings | None = None) -> FastAPI:
     """Build the app.
 
@@ -83,8 +91,32 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
         if _LOG_FILTER not in logger.filters:
             logger.addFilter(_LOG_FILTER)
 
+    policy: Policy | None = None
+    if settings.redaction_file:
+        try:
+            policy = Policy.from_file(settings.redaction_file, on_error=settings.redaction_on_error)
+        except PolicyError as exc:
+            raise RuntimeError(f"AGENTFLIGHT_REDACTION_FILE: {exc}") from exc
+        logging.getLogger("agentflight").info(
+            "server-side redaction on: %d rule(s) from %s",
+            len(policy.rules),
+            settings.redaction_file,
+        )
+
     app = FastAPI(title="AgentFlight", version=__version__)
     app.state.settings = settings
+    app.state.redaction = policy
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default 422 body echoes the offending input, which can be a recorded
+        # payload; report only where and what.
+        detail = [
+            {"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+            for e in exc.errors()[:20]
+        ]
+        return JSONResponse({"detail": detail}, status_code=422)
+
     app.add_middleware(BodySizeLimit, max_bytes=settings.max_body_bytes)
     app.state.engine = engine or make_engine()
     app.state.sessions = session_factory(app.state.engine)
@@ -105,8 +137,14 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
     @app.post("/v1/spans", response_model=IngestResponse, status_code=202, dependencies=[CanIngest])
     def ingest(body: IngestRequest, session: SessionDep) -> IngestResponse:
         check_spans(body.spans, settings)
-        run_ids = service.ingest_spans(session, body.spans)
-        return IngestResponse(accepted=len(body.spans), runs=run_ids)
+        redacted = service.redact_spans(policy, body.spans, settings.max_attribute_chars)
+        run_ids = service.ingest_spans(session, redacted.spans) if redacted.spans else []
+        return IngestResponse(
+            accepted=len(redacted.spans),
+            runs=run_ids,
+            rejected=len(redacted.rejected),
+            error_message=_join_errors(redacted.rejected),
+        )
 
     def store_otlp(body: bytes, fmt: str, encoding: str | None) -> otlp.Converted:
         raw = otlp.decompress(body, encoding, settings.max_body_bytes)
@@ -119,6 +157,11 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                 f"{count} spans in one request; the limit is {settings.max_spans_per_batch}",
             )
         converted = otlp.convert(request, settings)
+        if policy is not None and converted.spans:
+            redacted = service.redact_spans(policy, converted.spans, settings.max_attribute_chars)
+            for why in redacted.rejected:
+                converted.reject(why)
+            converted.spans = redacted.spans
         if converted.spans:
             with app.state.sessions() as session:
                 service.ingest_spans(session, converted.spans, converted.roots)
