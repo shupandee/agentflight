@@ -817,13 +817,14 @@ AGENTFLIGHT_REDACTION_FILE=/etc/agentflight/redaction.toml agentflight-server se
   command yet to redact stored runs.
 - **Cost.** Redaction runs on every span, in the request. On one machine, a
   `POST /v1/spans` of 512 spans took, without a policy file and with a two-rule policy (one
-  key rule with three keys, one rule with three presets): about 40 ms and 111 ms (in-memory
-  SQLite) or 57 ms and 128 ms (local Postgres) for a realistic batch (multi-line prompts,
-  replies and tool output, 1.47 MB of payload), and about 44 ms and 122 ms, or 60 ms and
-  137 ms, for single-line payloads with nothing to redact (2.36 MB). A policy that scans
-  every payload costs more than storing it.
+  key rule with three keys, one rule with three presets): about 40 ms and 55 ms (in-memory
+  SQLite) or 56 ms and 74 ms (local Postgres) for a realistic batch (multi-line prompts,
+  replies and tool output, 1.47 MB of payload), and about 44 ms and 50 ms, or 58 ms and
+  66 ms, for single-line payloads with nothing to redact (2.36 MB). Payloads that contain
+  a pattern's literals (for example the word "bearer", or "sk-" in "task-") cost more:
+  the pattern then scans them.
   Measure with your own policy and payloads; the cost grows with payload size and rule
-  count, and most of it is the pattern scan. The method is in
+  count. Custom patterns get no literal pre-check. The method is in
   `docs/design/server-side-redaction.md`.
 - **Client and server together** work: the client hook runs first, then the server policy.
   Markers never match a rule, so redacting twice changes nothing.
