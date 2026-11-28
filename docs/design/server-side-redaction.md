@@ -168,10 +168,11 @@ the truncation can't match.
 | The whole span can't be processed (engine crash), `redact` | Every non-structural string, list or map attribute, every such span event attribute, and the status message become `[REDACTION_FAILED]`; structural attributes, numbers and booleans are kept. |
 | Same, `reject` | The span isn't stored. |
 | Truncated or unparsable JSON with key rules | Text mode (4.1), not `[REDACTION_FAILED]`. |
-| Rejected spans on `/v1/spans` | **The other spans are stored.** `202` with `IngestResponse.accepted` = spans stored, `rejected` = n, `error_message` naming spans by id and attribute key, never values (mirrors OTLP `partial_success`). Not a 422 for the batch. |
+| Rejected spans on `/v1/spans` | **The other spans are stored.** `202` with `IngestResponse.accepted` = spans stored, `rejected` = n, `error_message` naming spans by id and attribute key, never values (`rejected` and `error_message` are always present; `error_message` is `null` when `rejected` is 0) (mirrors OTLP `partial_success`). Not a 422 for the batch. |
 | Rejected spans on `/v1/traces` | Counted in `partial_success.rejected_spans` / `error_message`; the rest stored. |
 
-The SDK exporter doesn't retry or spool rejected spans (they would fail the same way).
+The SDK exporter logs one warning per export for spans the server reports as rejected, and
+doesn't retry or spool them (they would fail the same way).
 
 **No echo of input in errors.** FastAPI's default 422 body includes `input` (the offending
 value, possibly a payload). The server installs a `RequestValidationError` handler that
@@ -223,21 +224,24 @@ backups, database WAL/replicas, and anything already exported elsewhere; documen
 
 ## 9. Performance
 
-Measured on the dev box (8 vCPU x86_64), one process, with a throwaway script (not in the repo):
-512 SDK-shaped LLM spans, 2.36 MB of JSON payload in total, policy with one key rule (3
-keys) and the three presets, median of 7 (engine) or 5 (HTTP) runs:
+One machine: 6 vCPU Intel Xeon (cloud VM), Linux 6.12, Python 3.13.5, SQLAlchemy 2.1.9,
+FastAPI 0.165.0, in-memory SQLite. **Postgres not measured.** Method: `bench_ingest.py`
+(a throwaway script, not in the repo): one `POST /v1/spans` through FastAPI's `TestClient`
+of 512 SDK-shaped LLM spans (2.36 MB of JSON payload: five messages and a response each),
+fresh database per repetition, two warm-up posts dropped, 15 timed posts, median reported;
+three rounds, with the main and branch runs alternated in separate processes.
 
-| | Median |
-| --- | --- |
-| `redact_spans`, no policy | 0.0 ms (pass-through) |
-| `redact_spans`, policy | 105 ms (about 0.2 ms per span) |
-| `POST /v1/spans` (TestClient, in-memory SQLite), no policy | 53 ms |
-| `POST /v1/spans`, policy | 157 ms |
+| | Round 1 | Round 2 | Round 3 |
+| --- | --- | --- | --- |
+| no policy file, main (`a6394c6`) | 43.0 ms | 43.1 ms | 44.1 ms |
+| no policy file, this branch | 44.8 ms | 43.3 ms | 43.6 ms |
+| policy on, this branch (2 rules) | 149.1 ms | 150.1 ms | 148.9 ms |
 
-So with this policy redaction costs more than storage for payload-heavy batches on SQLite
-in memory. Not measured: Postgres, real agent payloads, OTLP. Possible later work: skip the
-JSON walk when no key rule can match (substring pre-check), compile patterns into one
-alternation.
+The off path shows no regression: the three rounds differ by -0.5 to +1.8 ms (noise). The
+policy: 2 rules (one key rule with 3 keys, one rule with 3 presets). With it, a
+payload-heavy batch costs about three times the no-policy request. Not measured: Postgres,
+real agent payloads, OTLP, other rule counts. Speed-up (follow-up, before the next release):
+skip the JSON walk when no key rule can match the text.
 
 ## 10. Tests (PR 1, `tests/test_redaction.py`)
 
@@ -267,6 +271,10 @@ alternation.
   value including `status_message` and event attributes becomes `[REDACTION_FAILED]`; in
   `reject` mode the span is rejected. A negative control (a policy that matches nothing)
   was run once by hand to confirm the canary test fails without redaction.
+- Reply fields: `error_message` is `null` (and `rejected` 0) with and without a policy;
+  the SDK logs one warning for rejected spans and neither retries nor spools them;
+  `on_divergence="live"` alone still raises `RedactedInputError`, and only
+  `on_redacted_input="live"` goes live and is recorded on the run.
 - Smaller: marker over the cap (engine and server limit), re-send overwrites the map
   (including a forged one and a clean re-send), no policy stores as sent, `payloads=false`
   keeps the map, `hide_parameters` on both engines.

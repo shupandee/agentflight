@@ -143,7 +143,7 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             accepted=len(redacted.spans),
             runs=run_ids,
             rejected=len(redacted.rejected),
-            error_message=_join_errors(redacted.rejected),
+            error_message=_join_errors(redacted.rejected) if redacted.rejected else None,
         )
 
     def store_otlp(body: bytes, fmt: str, encoding: str | None) -> otlp.Converted:

@@ -34,9 +34,10 @@ class IngestResponse(BaseModel):
     accepted: int  # spans stored
     runs: list[str]
     # Spans not stored (server-side redaction failed with AGENTFLIGHT_REDACTION_ON_ERROR=
-    # reject), like OTLP partial_success. The message never contains attribute values.
+    # reject), like OTLP partial_success. Both fields are always present; error_message is
+    # null when rejected is 0, and never contains attribute values.
     rejected: int = 0
-    error_message: str = ""
+    error_message: str | None = None
 
 
 class EventOut(BaseModel):

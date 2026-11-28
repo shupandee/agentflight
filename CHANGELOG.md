@@ -45,9 +45,12 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   `on_redacted_input="live"` on `replay()` and `fork()` runs live from there and is
   recorded on the run as `agentflight.replay.on_redacted_input`. A redacted recorded output
   raises `ReplayError` (supply it with `fork(..., output=...)`).
-- `POST /v1/spans` responses gain `rejected` and `error_message` (spans not stored, as in
-  OTLP `partial_success`); `accepted` counts the spans stored. Both are `0`/`""` unless
-  redaction runs in `reject` mode.
+- **`POST /v1/spans` responses gain two fields (additive):** `rejected` (integer, spans not
+  stored) and `error_message` (string, or `null` when `rejected` is `0`), as in OTLP
+  `partial_success`. Both are always present. `accepted` now counts the spans stored; it
+  equals the number sent unless redaction runs in `reject` mode and rejects some.
+- The SDK exporter logs one warning per export when the server reports rejected spans, and
+  neither retries nor spools them.
 
 ### Changed
 

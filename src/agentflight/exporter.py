@@ -68,6 +68,8 @@ class _ExportState:
     remaining: int
     deadline: float | None = None  # time.monotonic() value; None: no overall deadline
     aborted: str | None = None
+    rejected: int = 0  # spans the server accepted the request for but didn't store
+    rejected_why: str = ""
 
     def abort(self, reason: str) -> str:
         self.aborted = reason
@@ -105,7 +107,10 @@ class AgentFlightExporter(SpanExporter):
     (transport error, timeout, 5xx, 408/425/429, credentials, attempt cap, deadline) are
     written to disk instead of dropped, and every later ``export()`` first sends what is
     spooled, oldest first, within the same attempt cap. Spans the server rejects for good
-    (a single span over the body cap, other 4xx) are not spooled.
+    (a single span over the body cap, other 4xx) are not spooled. Spans the server accepted
+    the request for but didn't store (``rejected`` in its ``202`` reply, from server-side
+    redaction in ``reject`` mode) are logged in one warning per export, and neither retried
+    nor spooled.
 
     An ``httpx.Client`` can be injected (useful for tests or custom auth/TLS).
     """
@@ -165,6 +170,14 @@ class AgentFlightExporter(SpanExporter):
             self._send(items, state, outcome)
             if not replay and outcome.why is None and self.spool is not None:
                 self._replay(self.spool, state)
+            if state.rejected:
+                # The server answered 202 but didn't store these (its redaction policy
+                # failed on them). Retrying would fail the same way: not retried, not spooled.
+                logger.warning(
+                    "agentflight: the server rejected %d spans (not stored, not retried): %s",
+                    state.rejected,
+                    state.rejected_why or "no reason given",
+                )
         except Exception as exc:
             logger.warning("agentflight: failed to export %d spans: %r", len(spans), exc)
             return SpanExportResult.FAILURE
@@ -256,6 +269,7 @@ class AgentFlightExporter(SpanExporter):
             self._send(items[half:], state, out)
             return
         if 200 <= code < 300:
+            self._note_rejected(response, state)
             return
         reason = state.abort(f"HTTP {code} from {self._url}")
         out.fail(reason)
@@ -263,6 +277,19 @@ class AgentFlightExporter(SpanExporter):
             out.retry.extend(items)
         else:
             out.lost += len(items)
+
+    @staticmethod
+    def _note_rejected(response: httpx.Response, state: _ExportState) -> None:
+        try:
+            body = response.json()
+            rejected = int(body.get("rejected") or 0)
+            message = body.get("error_message")
+        except Exception:  # not JSON, or not our shape: nothing was reported
+            return
+        if rejected > 0:
+            state.rejected += rejected
+            if not state.rejected_why and isinstance(message, str):
+                state.rejected_why = message
 
     def shutdown(self) -> None:
         if self._owns_client:

@@ -484,7 +484,7 @@ def test_a_failing_value_is_stored_as_failed_by_default(
     resp = api.post(
         "/v1/spans", json={"spans": [span("1", {"app.blob": CANARY, "app.ok": "fine"})]}
     )
-    assert resp.json() == {"accepted": 1, "runs": [T], "rejected": 0, "error_message": ""}
+    assert resp.json() == {"accepted": 1, "runs": [T], "rejected": 0, "error_message": None}
     e = event(api, "1")
     assert e["attributes"]["app.blob"] == FAILED
     assert e["attributes"]["app.ok"] == "fine"
@@ -844,3 +844,105 @@ def test_the_readme_example_policy_loads() -> None:
     out = redact(policy, {"note": "ACCT-12345678", "otel.resource.deploy.token": "t"})
     assert out.attributes["note"] == "[REDACTED:internal-ids]"
     assert "otel.resource.deploy.token" not in out.attributes
+
+
+# Always-present rejected / error_message ----------------------------------------------------
+
+
+def test_error_message_is_null_when_nothing_is_rejected(
+    api: TestClient, client: TestClient, engine: Engine, tmp_path: Path
+) -> None:
+    # With a policy that redacts, with a policy that doesn't touch the span, and without one:
+    # both fields are always in the reply, and error_message is null (not "").
+    redacting = api.post("/v1/spans", json={"spans": [span("1", {"note": "secret-a"})]}).json()
+    untouched = api.post("/v1/spans", json={"spans": [span("2", {"note": "fine"})]}).json()
+    off = client.post("/v1/spans", json={"spans": [span("3", {"note": "fine"})]}).json()
+    for body in (redacting, untouched, off):
+        assert body["rejected"] == 0
+        assert "error_message" in body and body["error_message"] is None
+    with _app(engine, tmp_path, redaction_on_error="reject") as strict:
+        ok = strict.post("/v1/spans", json={"spans": [span("4", {"note": "fine"})]}).json()
+    assert (ok["rejected"], ok["error_message"]) == (0, None)
+
+
+def test_sdk_logs_one_warning_for_rejected_spans_and_does_not_retry_or_spool(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from agentflight._spool import Spool
+    from agentflight.exporter import AgentFlightExporter
+
+    _break_one_value(monkeypatch, "app.blob")
+    memory = InMemorySpanExporter()
+    rec = agentflight.Recorder(memory, batch=False)
+    for i in range(3):
+        s = rec.tracer.start_span(f"s{i}")
+        s.set_attribute("app.blob", CANARY)  # every span fails redaction
+        s.end()
+    spans = list(memory.get_finished_spans())
+
+    with _app(engine, tmp_path, redaction_on_error="reject") as api:
+        posts = []
+        real_post = api.post
+
+        def counting_post(*a: Any, **kw: Any) -> Any:
+            posts.append(a)
+            return real_post(*a, **kw)
+
+        monkeypatch.setattr(api, "post", counting_post)
+        spool = Spool(tmp_path / "spool")
+        exporter = AgentFlightExporter("http://testserver", client=api, spool=spool)  # type: ignore[arg-type]
+        with caplog.at_level(logging.WARNING, logger="agentflight"):
+            result = exporter.export(spans)
+        warnings = [r for r in caplog.records if r.name.startswith("agentflight")]
+        assert len(warnings) == 1 and "rejected 3 spans" in warnings[0].getMessage()
+        assert "redaction failed for app.blob" in warnings[0].getMessage()
+        assert CANARY not in warnings[0].getMessage()
+        assert len(posts) == 1  # not retried
+        assert spool.pending_spans() == 0  # not spooled
+        assert result.name == "SUCCESS"  # the server answered; nothing to retry later
+        exporter.export([])  # a later export doesn't resend them
+        assert len(posts) == 2 and spool.pending_spans() == 0
+
+        # Nothing rejected: no warning.
+        caplog.clear()
+        clean = rec.tracer.start_span("clean")
+        clean.end()
+        with caplog.at_level(logging.WARNING, logger="agentflight"):
+            exporter.export([memory.get_finished_spans()[-1]])
+        assert not [r for r in caplog.records if r.name.startswith("agentflight")]
+
+
+# Change 3, split into the two behaviours -------------------------------------------------------
+
+
+def test_on_divergence_live_alone_still_raises_redacted_input_error(rec: TestClient) -> None:
+    recording = _recorded_lookup(rec)
+    with (
+        agentflight.replay(recording, on_divergence="live") as session,
+        pytest.raises(RedactedInputError),
+    ):
+        lookup("abc-key", "delhi")
+    assert session.diverged_at is None  # it didn't go live
+    with (
+        agentflight.fork(recording, 1, on_divergence="live"),
+        pytest.raises(RedactedInputError),
+    ):
+        lookup("abc-key", "delhi")  # a replayed prefix step is covered too
+
+
+def test_only_on_redacted_input_live_goes_live_and_it_is_recorded(rec: TestClient) -> None:
+    recording = _recorded_lookup(rec)
+    with (
+        agentflight.replay(recording, on_redacted_input="live") as session,
+        agentflight.run("opted-in") as r,
+    ):
+        assert lookup("abc-key", "delhi") == "result delhi"
+    assert (session.diverged_at, session.on_redacted_input) == (0, "live")
+    agentflight.flush()
+    root = next(e for e in events(rec, r.run_id) if e["kind"] == "run")
+    assert root["attributes"][A.REPLAY_ON_REDACTED_INPUT] == "live"
+    step = next(e for e in events(rec, r.run_id) if e["kind"] == "tool")
+    assert step["attributes"][A.REPLAY_SOURCE] == "live"

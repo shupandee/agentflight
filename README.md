@@ -809,9 +809,18 @@ AGENTFLIGHT_REDACTION_FILE=/etc/agentflight/redaction.toml agentflight-server se
   `[REDACTION_FAILED]`. With `AGENTFLIGHT_REDACTION_ON_ERROR=reject` such a span isn't
   stored; the rest of the batch is. `POST /v1/spans` then answers `202` with
   `"rejected": n` and an `error_message` naming the spans (never values), and OTLP reports
-  them in `partial_success`.
+  them in `partial_success`. The SDK exporter logs one warning per export for rejected
+  spans and neither retries nor spools them (they would be rejected again).
 - **Not retroactive.** The policy applies to spans received after a (re)start; spans
-  already stored are not rewritten. Policy changes need a restart.
+  already stored are not rewritten (and backups or database replicas keep what they have).
+  A policy change needs a restart and applies to spans received from then on. There is no
+  command yet to redact stored runs.
+- **Cost.** Redaction runs on every span, in the request. On one machine (in-memory SQLite,
+  Postgres not measured), a `POST /v1/spans` of 512 LLM spans (2.36 MB of JSON payload) took
+  about 44 ms without a policy file and about 149 ms with a two-rule policy (one key rule
+  with three keys, one rule with three presets): a policy that scans every payload costs
+  more than storing it. Measure with your own policy and payloads; the cost grows with
+  payload size and rule count. The method is in `docs/design/server-side-redaction.md`.
 - **Client and server together** work: the client hook runs first, then the server policy.
   Markers never match a rule, so redacting twice changes nothing.
 - `422` responses never echo the submitted values, and database errors are logged without
