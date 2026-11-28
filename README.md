@@ -879,7 +879,7 @@ docker compose down --volumes
   release packaging (migrations in the package, `agentflight-server migrate`, a Trusted
   Publishing release workflow) and the `/v1` stability policy; an opt-in on-disk spool
   for failed exports.
-- **OTLP ingest** (this branch): `POST /v1/traces` takes OTLP/HTTP (protobuf or JSON,
+- **0.2.0** (released): OTLP ingest: `POST /v1/traces` takes OTLP/HTTP (protobuf or JSON,
   gzip) from any OpenTelemetry-instrumented agent or Collector, with `gen_ai.*` mapped to
   models, tokens and tools. Deferred: OTLP over gRPC, replay from `gen_ai` content,
   cost from a price table.

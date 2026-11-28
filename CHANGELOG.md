@@ -4,7 +4,7 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 "HTTP API versioning" under 0.1.0); every change that can break a client is listed under
 **Behaviour changes**.
 
-## Unreleased
+## 0.2.0 (2026-11-28)
 
 ### Added
 
