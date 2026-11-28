@@ -4,7 +4,11 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 "HTTP API versioning" under 0.1.0); every change that can break a client is listed under
 **Behaviour changes**.
 
-## Unreleased
+## 0.3.0 (2026-11-28)
+
+Sub-agent runs, server-side redaction, and spool fixes. Upgrade the server with
+`agentflight-server migrate` (migration `0005`). The 0.2.0 SDK records into a 0.3.0 server
+and the 0.3.0 SDK into a 0.2.0 server.
 
 ### Added
 
@@ -77,9 +81,6 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   those spans if the send then failed; senders now mark the file they are sending, and
   eviction and expiry skip marked files. If only files being sent are left, a new batch
   that doesn't fit is dropped and counted instead of going past the size cap.
-- A viewer session cookie with non-ASCII characters in its signature made the viewer answer
-  `500`; it is now treated as no session (sign in again). The signature is still compared in
-  constant time over its full length (`hmac.compare_digest`, now on bytes).
 - `422` responses no longer echo the submitted input (FastAPI's default included the
   offending values, which can be recorded payloads); they list `loc`, `msg` and `type`.
 - Database errors are logged without their SQL parameters (`hide_parameters`).
@@ -106,10 +107,34 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   commits reached `main` together (in the merge of PR #9), so this only affects a
   checkout of the branch or of `842002b` itself. Databases from 0.2.0 or earlier, or
   migrated with `cd19d0c` or later, are fine.
-- **`0005` is frozen from the next release.** Once released, a migration is never edited:
-  any further schema change goes in `0006` or later.
+- **Migration `0005` is frozen from this release (v0.3.0).** A released migration is never
+  edited: any further schema change goes in `0006` or later.
 - `agentflight.run()` called inside another run now records a parent link on the nested run
   where it recorded none before. Nothing else about nested runs changes.
+- **A spool size or age of zero or less disables the spool** (`spool_max_bytes`,
+  `spool_max_age_s`, `AGENTFLIGHT_SPOOL_MAX_BYTES`, `AGENTFLIGHT_SPOOL_MAX_AGE_SECONDS`), with
+  one warning; recording continues. Before, a non-positive size in the environment meant the
+  64 MiB default, and one passed to `configure()` disabled recording altogether.
+- **`POST /v1/spans` responses have two new fields,** `rejected` and `error_message`
+  (always present; `error_message` is `null` when `rejected` is `0`), and `accepted` counts
+  the spans stored. Clients that read the response strictly must allow the new fields.
+- **Replay refuses redacted recordings.** A step whose recorded input was redacted by the
+  server raises `RedactedInputError` (a `ReplayDivergence`), even with
+  `on_divergence="live"`; only `on_redacted_input="live"` runs it live, and that is recorded
+  on the run. A step whose recorded output was redacted raises `ReplayError` (pass the output
+  with `fork(..., output=...)`). Runs recorded without a server policy are unaffected.
+- **Server-side redaction is off by default and not retroactive.** Nothing is redacted
+  unless `AGENTFLIGHT_REDACTION_FILE` is set. A policy applies only to spans received after
+  the server (re)starts with it; spans already stored, backups and replicas are not
+  rewritten.
+
+### Security
+
+- **Viewer session cookies with non-ASCII characters no longer cause a `500`.** A crafted
+  `agentflight_session` cookie made `/ui` raise an error in the signature check
+  (`hmac.compare_digest` on `str`); it is now treated as no session and redirects to sign-in.
+  The signature is still compared in constant time over its full length
+  (`hmac.compare_digest`, now on bytes). No session could be forged either way.
 
 ## 0.2.0 (2026-11-28)
 
