@@ -444,6 +444,14 @@ print(session.diverged_at)  # e.g. 0: the first model call already differed
   redacted. A step whose recorded output was truncated raises `ReplayError` instead of
   returning a partial value. If an input was truncated, only the stored prefix is
   compared.
+- **Inputs redacted by the server can't be compared.** A step whose recorded input was
+  changed by [server-side redaction](#server-side-redaction-opt-in) (listed in the event's
+  `redacted` field) raises `RedactedInputError`, a `ReplayDivergence`, even with
+  `on_divergence="live"`. To run live from that step instead, opt in separately with
+  `replay(recording, on_redacted_input="live")` (or `fork(...)`); the replayed run then
+  carries `agentflight.replay.on_redacted_input = "live"`. A step whose recorded output was
+  redacted by the server raises `ReplayError`; `fork(recording, at=N, output=...)` supplies
+  that output.
 - **Use the same `redact` hook** (and `max_attr_chars`) as when recording, or the inputs
   won't match.
 - **Sequential agents only** (see above). The replay is bound to the current context (a
@@ -723,7 +731,100 @@ agentflight.configure(
   `max_attr_chars`, and a cut message is listed in `agentflight.truncated`.
 - **Names are not redacted.** Run, tool and model names are stored as given, because
   replay matches steps by them. Don't put personal data or secrets in run names (or tool
-  names); put them in metadata or arguments, where the hook applies.
+  names); put them in metadata or arguments, where the hook applies. This holds for
+  server-side redaction too.
+
+### Server-side redaction (opt-in)
+
+The `redact` hook only covers what your own process records with the SDK. To enforce a
+policy on everything the server stores, including spans from other services and plain
+OpenTelemetry agents over [OTLP](#otlp-ingest-any-opentelemetry-agent), give the server a
+TOML policy file:
+
+```toml
+# redaction.toml
+version = 1
+# marker = "[REDACTED:{rule}]"   # the default
+
+[[rules]]
+name = "credentials"
+keys = ["api_key", "password", "authorization"]   # dict keys at any depth, any case
+
+[[rules]]
+name = "tokens"
+preset = ["bearer", "aws-access-key-id", "openai-key"]
+
+[[rules]]
+name = "internal-ids"
+patterns = ['\bACCT-[0-9]{8}\b']                  # Python regular expressions
+
+[[rules]]
+name = "resource-secrets"
+attributes = ["otel.resource.deploy.token"]        # exact names or globs (fnmatch)
+action = "drop"                                    # remove instead of masking
+# scope = ["attributes", "events", "status"]       # the default: everywhere
+```
+
+```bash
+AGENTFLIGHT_REDACTION_FILE=/etc/agentflight/redaction.toml agentflight-server serve
+```
+
+| Setting | Default | |
+| --- | --- | --- |
+| `AGENTFLIGHT_REDACTION_FILE` | unset (off) | The policy. The server refuses to start if it is missing or invalid |
+| `AGENTFLIGHT_REDACTION_ON_ERROR` | `redact` | A value whose redaction fails: `redact` stores `[REDACTION_FAILED]` in its place; `reject` doesn't store that span |
+
+- **Applied before anything is stored.** Both `POST /v1/spans` and `POST /v1/traces` run
+  the policy on every span after the size checks and before the run name, metadata,
+  tokens or failure ids are derived. It covers span attributes, span event attributes
+  (such as OpenTelemetry `exception` events) and status messages; `scope` limits a rule to
+  some of them.
+- **What a rule matches.** `keys` match dict keys inside JSON values: SDK payloads, run
+  metadata, OTLP map and array values, span link attributes, and plain string attributes
+  that hold JSON (such as `gen_ai.input.messages`), which are parsed when they start with
+  `{` or `[`. `patterns` are replaced wherever they match a string. `attributes` redact a
+  whole attribute. Presets cover key-shaped secrets only: `bearer` tokens, AWS access key
+  ids, and `sk-...` API keys. Emails, card numbers and the like need your own `patterns`.
+- **Truncated or broken JSON is matched as text.** A payload the SDK cut at
+  `max_attr_chars` (listed in `agentflight.truncated`) isn't valid JSON, so the server
+  applies `patterns` and looks for `"key": value` pairs in the text instead. A secret that
+  the truncation itself cut in half may not match any more; set `max_attr_chars` high
+  enough, or redact on the client too.
+- **Never redacted:** span and event names, and the structural attributes AgentFlight
+  reads: `agentflight.kind`, run, tool, model, node, decision and state names
+  (`agentflight.tool.name`, `agentflight.llm.model`...), token counts, cost, error type,
+  failure ids, parent run ids, `agentflight.truncated`, `agentflight.replay.*`. Globs skip
+  them, and naming one exactly in `attributes` is a startup error.
+- **What was redacted is recorded.** The server writes `agentflight.redacted` on the span:
+  `{key: {"rules": [...], "count": n}}` (with `"dropped": true` for dropped attributes,
+  keys such as `status_message` and `events[0].exception.message` for those parts). The API
+  returns it as each event's `redacted` field, also with `payloads=false`. It is always the
+  server's own: a value sent by a client is replaced, and a re-sent span gets a new one.
+- **Markers can be longer than the text they replace.** If a redacted value would exceed
+  `AGENTFLIGHT_MAX_ATTRIBUTE_CHARS`, the whole value is stored as one marker (and
+  `"over_cap": true`); it is never cut.
+- **Fails closed.** If redacting a value raises, `[REDACTION_FAILED]` is stored instead of
+  it. If a whole span can't be processed, every string or structured value that isn't
+  structural, every span event attribute and the status message become
+  `[REDACTION_FAILED]`. With `AGENTFLIGHT_REDACTION_ON_ERROR=reject` such a span isn't
+  stored; the rest of the batch is. `POST /v1/spans` then answers `202` with
+  `"rejected": n` and an `error_message` naming the spans (never values), and OTLP reports
+  them in `partial_success`. The SDK exporter logs one warning per export for rejected
+  spans and neither retries nor spools them (they would be rejected again).
+- **Not retroactive.** The policy applies to spans received after a (re)start; spans
+  already stored are not rewritten (and backups or database replicas keep what they have).
+  A policy change needs a restart and applies to spans received from then on. There is no
+  command yet to redact stored runs.
+- **Cost.** Redaction runs on every span, in the request. On one machine (in-memory SQLite,
+  Postgres not measured), a `POST /v1/spans` of 512 LLM spans (2.36 MB of JSON payload) took
+  about 44 ms without a policy file and about 149 ms with a two-rule policy (one key rule
+  with three keys, one rule with three presets): a policy that scans every payload costs
+  more than storing it. Measure with your own policy and payloads; the cost grows with
+  payload size and rule count. The method is in `docs/design/server-side-redaction.md`.
+- **Client and server together** work: the client hook runs first, then the server policy.
+  Markers never match a rule, so redacting twice changes nothing.
+- `422` responses never echo the submitted values, and database errors are logged without
+  their SQL parameters, whether or not a policy is set.
 
 ## Authentication
 
@@ -855,7 +956,7 @@ should ignore fields they don't know); a breaking change would mean `/v2`, serve
 
 | Method | Path | Permission | Description |
 | --- | --- | --- | --- |
-| `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
+| `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`). `202` with `accepted` (spans stored), `runs`, and `rejected`/`error_message` (spans not stored by [server-side redaction](#server-side-redaction-opt-in) in `reject` mode) |
 | `POST` | `/v1/traces` | ingest | [OTLP/HTTP](#otlp-ingest-any-opentelemetry-agent) trace export (protobuf or JSON, optionally gzip) |
 | `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status` (`running`, `ok`, `error`, `unknown`, `abandoned`), `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5), `parent_run_id` (the runs that run started), `has_parent` (`true`: only sub-agent runs, `false`: only top-level runs) |
 | `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time. Every event with payloads by default (what replay uses). `events_limit` (1-1000) and `events_offset` page the events; `payloads=false` leaves recorded payloads (messages, outputs, args, stack traces) out and lists them in each event's `omitted` |
@@ -931,7 +1032,10 @@ docker compose down --volumes
   cost from a price table.
 - **Sub-agent runs** (unreleased): `parent_run_id` links runs started inside other runs
   across the SDK, `/v1/spans`, OTLP, the viewer and the run filters.
-- **Next:** server-side redaction, run diff. Deferred: a demo, overhead
+- **Server-side redaction** (unreleased): a TOML policy the server applies to every span
+  from `/v1/spans` and OTLP before storing it, with replay refusing redacted inputs.
+  Deferred: a viewer badge and run-level count, a command to redact stored runs.
+- **Next:** run diff. Deferred: a demo, overhead
   on real (non-synthetic) agent runs, and a rate limit on failed keys.
 
 ## License

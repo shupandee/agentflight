@@ -111,6 +111,12 @@ class Settings:
     # OTLP ingest: read a root span whose links all point into one other trace as a
     # sub-agent run of that trace's run. Off: only explicit parents are stored.
     otlp_infer_parent_from_links: bool = True
+    # Server-side redaction: a TOML policy applied to every span before it is stored (see
+    # agentflight.redaction). Unset: spans are stored as sent.
+    redaction_file: str | None = None
+    # A value whose redaction fails: "redact" stores the span with [REDACTION_FAILED] in
+    # its place; "reject" doesn't store the span (reported as rejected).
+    redaction_on_error: str = "redact"
 
     @property
     def api_keys(self) -> dict[str, frozenset[Permission]]:
@@ -157,6 +163,8 @@ class Settings:
         for name, value in limits.items():
             if value <= 0:
                 raise RuntimeError(f"{name} must be positive")
+        if self.redaction_on_error not in ("redact", "reject"):
+            raise RuntimeError("AGENTFLIGHT_REDACTION_ON_ERROR must be 'redact' or 'reject'")
         if self.session_hours <= 0:
             raise RuntimeError("AGENTFLIGHT_SESSION_HOURS must be positive")
         if self.session_secret is not None and len(self.session_secret) < 32:
@@ -199,4 +207,8 @@ class Settings:
             session_hours=_float("AGENTFLIGHT_SESSION_HOURS", DEFAULT_SESSION_HOURS),
             cookie_secure=_bool("AGENTFLIGHT_COOKIE_SECURE", False),
             otlp_infer_parent_from_links=_bool("AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS", True),
+            redaction_file=os.environ.get("AGENTFLIGHT_REDACTION_FILE") or None,
+            redaction_on_error=(
+                os.environ.get("AGENTFLIGHT_REDACTION_ON_ERROR", "redact").strip().lower()
+            ),
         )

@@ -31,8 +31,13 @@ class IngestRequest(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    accepted: int
+    accepted: int  # spans stored
     runs: list[str]
+    # Spans not stored (server-side redaction failed with AGENTFLIGHT_REDACTION_ON_ERROR=
+    # reject), like OTLP partial_success. Both fields are always present; error_message is
+    # null when rejected is 0, and never contains attribute values.
+    rejected: int = 0
+    error_message: str | None = None
 
 
 class EventOut(BaseModel):
@@ -48,6 +53,9 @@ class EventOut(BaseModel):
     attributes: dict[str, Any]
     # attribute key -> {original_length, stored_length, reason} for truncated payloads
     truncated: dict[str, Any]
+    # attribute key (or "status_message", "events[i].key") -> {rules, count, ...} for
+    # values the server's redaction policy replaced; see agentflight.redaction
+    redacted: dict[str, Any] = Field(default_factory=dict)
     span_events: list[dict[str, Any]]
     # With ``payloads=false``: attribute keys (and "span_events") left out of this event
     omitted: list[str] = Field(default_factory=list)

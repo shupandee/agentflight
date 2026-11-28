@@ -19,7 +19,11 @@ def database_url() -> str:
 def make_engine(url: str | None = None) -> Engine:
     url = url or database_url()
     if url.startswith("sqlite"):
-        kwargs: dict[str, object] = {"connect_args": {"check_same_thread": False}}
+        kwargs: dict[str, object] = {
+            "connect_args": {"check_same_thread": False},
+            # Database errors are logged; their SQL parameters are recorded payloads.
+            "hide_parameters": True,
+        }
         if url in ("sqlite://", "sqlite:///:memory:"):
             kwargs["poolclass"] = StaticPool
         engine = create_engine(url, **kwargs)
@@ -29,7 +33,7 @@ def make_engine(url: str | None = None) -> Engine:
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
         return engine
-    return create_engine(url, pool_pre_ping=True)
+    return create_engine(url, pool_pre_ping=True, hide_parameters=True)
 
 
 def session_factory(engine: Engine) -> sessionmaker[Session]:

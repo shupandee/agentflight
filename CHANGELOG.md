@@ -29,6 +29,28 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   parent run with a toggle that hides sub-agent runs (`has_parent=false`).
 - README: an Install section with every `agentflight-sdk` install form and the import
   name (`agentflight`).
+- **Server-side redaction (opt-in):** `AGENTFLIGHT_REDACTION_FILE` points the server at a
+  TOML policy (rules with `keys`, `patterns`, `attributes` or a `preset`: `bearer`,
+  `aws-access-key-id`, `openai-key`; `action` `mask` or `drop`; `scope`) that is applied
+  to every span from `POST /v1/spans` and `POST /v1/traces` before it is stored or
+  anything is derived from it. Key rules also apply to JSON carried in plain string
+  attributes (OTLP `gen_ai.*`), and truncated or unparsable payloads are matched as text.
+  Structural attributes (kind, tool and model names, ids, counts, `agentflight.replay.*`)
+  are never redacted. An invalid policy stops the server from starting.
+- The server records what it redacted in `agentflight.redacted`, returned as each event's
+  `redacted` field. `AGENTFLIGHT_REDACTION_ON_ERROR` (`redact`, the default, stores
+  `[REDACTION_FAILED]`; `reject` drops the span) decides what happens when redaction fails.
+- Replay: `RedactedInputError` (a `ReplayDivergence`) for a step whose recorded input was
+  redacted by the server, raised even with `on_divergence="live"`; the separate opt-in
+  `on_redacted_input="live"` on `replay()` and `fork()` runs live from there and is
+  recorded on the run as `agentflight.replay.on_redacted_input`. A redacted recorded output
+  raises `ReplayError` (supply it with `fork(..., output=...)`).
+- **`POST /v1/spans` responses gain two fields (additive):** `rejected` (integer, spans not
+  stored) and `error_message` (string, or `null` when `rejected` is `0`), as in OTLP
+  `partial_success`. Both are always present. `accepted` now counts the spans stored; it
+  equals the number sent unless redaction runs in `reject` mode and rejects some.
+- The SDK exporter logs one warning per export when the server reports rejected spans, and
+  neither retries nor spools them.
 
 ### Changed
 
@@ -47,6 +69,9 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   those spans if the send then failed; senders now mark the file they are sending, and
   eviction and expiry skip marked files. If only files being sent are left, a new batch
   that doesn't fit is dropped and counted instead of going past the size cap.
+- `422` responses no longer echo the submitted input (FastAPI's default included the
+  offending values, which can be recorded payloads); they list `loc`, `msg` and `type`.
+- Database errors are logged without their SQL parameters (`hide_parameters`).
 - README: the spool holds recorded payloads as plain JSON on disk (owner-only `0700`/`0600`
   where the OS supports it) and the settings table.
 
