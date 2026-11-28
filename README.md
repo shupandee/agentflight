@@ -816,11 +816,12 @@ AGENTFLIGHT_REDACTION_FILE=/etc/agentflight/redaction.toml agentflight-server se
   A policy change needs a restart and applies to spans received from then on. There is no
   command yet to redact stored runs.
 - **Cost.** Redaction runs on every span, in the request. On one machine, a
-  `POST /v1/spans` of 512 LLM spans (about 2.4 MB of JSON payload) took about 44 ms
-  (in-memory SQLite) or 60 ms (local Postgres) without a policy file, and with a two-rule
-  policy (one key rule with three keys, one rule with three presets) about 122 ms and 137 ms
-  for payloads without escapes or key names, and 150-180 ms for payloads with newlines or
-  a matching key name: a policy that scans every payload costs more than storing it.
+  `POST /v1/spans` of 512 spans took, without a policy file and with a two-rule policy (one
+  key rule with three keys, one rule with three presets): about 40 ms and 111 ms (in-memory
+  SQLite) or 57 ms and 128 ms (local Postgres) for a realistic batch (multi-line prompts,
+  replies and tool output, 1.47 MB of payload), and about 44 ms and 122 ms, or 60 ms and
+  137 ms, for single-line payloads with nothing to redact (2.36 MB). A policy that scans
+  every payload costs more than storing it.
   Measure with your own policy and payloads; the cost grows with payload size and rule
   count, and most of it is the pattern scan. The method is in
   `docs/design/server-side-redaction.md`.

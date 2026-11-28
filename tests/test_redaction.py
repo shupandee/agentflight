@@ -957,6 +957,10 @@ QUICK_POLICIES = {
     "anchored": '[[rules]]\nname = "a"\npatterns = ["^ACCT-[0-9]+$"]\n',
     "lookaround": '[[rules]]\nname = "l"\npatterns = ["(?<![a-z])tok[0-9]+(?=;)"]\n',
     "drop": '[[rules]]\nname = "d"\nkeys = ["token"]\naction = "drop"\n',
+    "ascii-keys": '[[rules]]\nname = "k"\nkeys = ["api_key", "k"]\n',
+    "raw-escape": '[[rules]]\nname = "r"\npatterns = ["n[0-9]+", "u00e9"]\n',
+    "emoji": '[[rules]]\nname = "e"\npatterns = ["\U0001f600", "\u00e9"]\n',
+    "whitespace": '[[rules]]\nname = "w"\npatterns = ["tok\\\\s+[0-9]+"]\n',
 }
 
 
@@ -985,6 +989,15 @@ def _random_doc(rng: Any, depth: int = 0) -> Any:
         "\u212a",
         '{"api_key": "nested"}',
         "1234",
+        "\U0001f600 smile",
+        "Bearer\nabcdefghijklmnop0123",
+        "tok\n42",
+        "tok 42",
+        "x\n123",
+        "C:\\path\\n1",
+        json.dumps({"note": "Bearer\nabcdefghijklmnop0123"}),
+        json.dumps({"k": "multi\nline"}),
+        "line one\nline two\n\ttabbed",
     ]
     keys = ["api_key", "API_KEY", "Api_Key", "other", "token", "clé", "CLÉ", "n", "\u212a"]
     roll = rng.random()
@@ -1010,7 +1023,11 @@ def test_quick_check_gives_the_same_result_as_the_full_walk(
             doc, ensure_ascii=rng.random() < 0.5, indent=rng.choice([None, 2]), sort_keys=False
         )
         cases.append(text)
+        # Invalid JSON: text mode sees the raw text, escapes and all.
+        cases.append(text[: rng.randint(0, len(text))])
+        cases.append(text + ", broken")
     cases += ["", "{}", "[]", '"just a string"', "12", "{broken api_key", '{"a": "ACCT-123"}']
+    cases += ['{"a": "x\\n123", broken', '{"a": "\\x41"}', '"\\ud83d\\ude00"', '{"a": "\\u00e9"}']
     with monkeypatch.context() as m:
         _no_quick_check(m)
         expected = [
@@ -1074,3 +1091,33 @@ def test_quick_check_is_off_for_escapes_and_context_sensitive_patterns() -> None
     cle = _policy(QUICK_POLICIES["keys"])
     out = redact(cle, {"agentflight.tool.args": '{"CLÉ": "k", "\u00e9": 1}'})
     assert json.loads(out.attributes["agentflight.tool.args"])["CLÉ"] == "[REDACTED:k]"
+
+
+@pytest.mark.parametrize(
+    ("policy", "text", "secret"),
+    [
+        # A pattern that only matches the decoded text (\s against a newline).
+        (POLICY, json.dumps({"h": "Bearer\nabcdefghijklmnop0123"}), "abcdefghijklmnop0123"),
+        # A key that only appears once the escape is decoded.
+        (POLICY, '{"\\u0061pi_key": "hunter2"}', "hunter2"),
+        # Invalid JSON goes to text mode, which sees the raw escape characters.
+        (QUICK_POLICIES["raw-escape"], '{"a": "x\\n123", broken', "n123"),
+        # A surrogate pair decodes to one character only as a pair.
+        (QUICK_POLICIES["emoji"], json.dumps({"a": "hi \U0001f600"}), "\\ud83d\\ude00"),
+        # A non-ASCII key: text mode matches "\u0131" (dotless i) as "I" too, which a
+        # lowercased substring test would miss.
+        ('[[rules]]\nname = "k"\nkeys = ["\u0131d"]\n', '{"Id": "hunter2", broken', "hunter2"),
+        # JSON inside a string: its escapes are only decoded by the second parse.
+        (
+            POLICY,
+            json.dumps({"args": json.dumps({"n": "Bearer\nabcdefghijklmnop0123"})}),
+            "abcdefghijklmnop0123",
+        ),
+    ],
+)
+def test_quick_check_falls_back_where_a_skip_would_leak(
+    policy: str, text: str, secret: str
+) -> None:
+    out = redact(_policy(policy), {"agentflight.tool.args": text}).attributes
+    assert secret not in out["agentflight.tool.args"], text
+    assert REDACTED in out

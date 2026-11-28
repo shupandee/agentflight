@@ -38,8 +38,9 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
   Structural attributes (kind, tool and model names, ids, counts, `agentflight.replay.*`)
   are never redacted. An invalid policy stops the server from starting.
 - Redaction skips parsing a JSON payload when nothing in the policy can match it (no
-  backslash escapes, no key rule name in the text, no pattern match, and no anchored or
-  lookaround pattern in the policy); the result is the same as the full walk.
+  backslash escapes, no key rule name in the text, no pattern match, only ASCII key rule
+  names, and no anchored or lookaround pattern in the policy); the result is the same as
+  the full walk. Multi-line payloads (escaped newlines) still take the full walk.
 - The server records what it redacted in `agentflight.redacted`, returned as each event's
   `redacted` field. `AGENTFLIGHT_REDACTION_ON_ERROR` (`redact`, the default, stores
   `[REDACTION_FAILED]`; `reject` drops the span) decides what happens when redaction fails.

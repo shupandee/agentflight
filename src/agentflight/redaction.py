@@ -303,19 +303,23 @@ class Policy:
 
         A cheap check that skips the JSON parse and walk for the common case of a payload
         that holds nothing for the policy. It is deliberately conservative; whenever it
-        isn't sure it says False and the full walk runs:
+        isn't sure it says False and the full walk runs.
 
-        * a backslash in the text (escapes: ``\\n``, ``\\"``, ``\\u0061``) means a decoded
-          string can differ from the raw text, so a key or pattern could match only after
-          parsing;
-        * a pattern with anchors or lookarounds can match a string on its own but not inside
-          the surrounding JSON text, so such patterns turn the check off for their scope
-          (``\\b`` is fine: the characters around a JSON string are quotes);
-        * without escapes, every string leaf and dict key is a substring of the raw text,
-          so a pattern that matches a leaf also matches the raw text, and a key that
-          matches (case-insensitively) appears in the lowercased text. Keys are compared
-          lowercased, as the walk does; if a key isn't ASCII, non-ASCII text is walked
-          (lowercasing depends on context for a few letters).
+        Without escapes, every string leaf and dict key of a JSON text is a substring of
+        it, so a pattern that matches a leaf also matches the text, and a key that matches
+        (lowercased, as the walk compares keys) appears in the lowercased text. The same
+        holds for text mode, which sees the raw text when the value doesn't parse. It
+        says False when:
+
+        * the text has a backslash: an escape (``\\n``, ``\\"``, ``\\u0061``) makes a
+          decoded leaf differ from the raw text, so a key or pattern could match only after
+          parsing (``\\s`` against a decoded newline, ``\\u0061pi_key``);
+        * a key rule's key appears in the lowercased text, or a pattern matches it;
+        * a key rule has a non-ASCII key (lowercasing isn't letter by letter for a few
+          non-ASCII letters, and text mode matches each letter's upper and lower case);
+        * the scope has a pattern with an anchor or lookaround, which can match a string on
+          its own but not inside the surrounding JSON text (``\\b`` is fine: the
+          characters around a JSON string are quotes).
         """
         if "\\" in text:
             return False
@@ -323,7 +327,7 @@ class Policy:
         if patterns and not context_free:
             return False
         if keys:
-            if not text.isascii() and not all(k.isascii() for k in keys):
+            if not all(k.isascii() for k in keys):
                 return False
             lowered = text.lower()
             if any(k in lowered for k in keys):
