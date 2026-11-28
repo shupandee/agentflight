@@ -240,8 +240,65 @@ three rounds, with the main and branch runs alternated in separate processes.
 The off path shows no regression: the three rounds differ by -0.5 to +1.8 ms (noise). The
 policy: 2 rules (one key rule with 3 keys, one rule with 3 presets). With it, a
 payload-heavy batch costs about three times the no-policy request. Not measured: Postgres,
-real agent payloads, OTLP, other rule counts. Speed-up (follow-up, before the next release):
-skip the JSON walk when no key rule can match the text.
+real agent payloads, OTLP, other rule counts. A speed-up
+(skip the JSON parse and walk when nothing can match) follows in section 9.1.
+
+### 9.1 Skipping the JSON walk
+
+`Policy._nothing_can_match(text, scope)` returns True only when the full parse-and-walk
+(or text mode, for a value that doesn't parse) would leave the text unchanged; the value is
+then kept as is without being parsed. Without escapes, every string leaf and dict key of a
+JSON text is a substring of it, so a pattern that matches a leaf matches the text and a
+key appears in the lowercased text. It says False (full walk) when:
+
+- the text has a **backslash**. An escape makes a decoded leaf differ from the raw text: a
+  newline is stored as the two characters `\n`, so `\s+` in the `bearer` preset matches
+  `Bearer<newline>token` after parsing but not `Bearer\ntoken` in the raw text; a key can
+  be written `\u0061pi_key`; and JSON nested in a string has its escapes decoded only by
+  the second parse. So every multi-line payload takes the full walk;
+- a key rule's key appears in the lowercased text, or a pattern matches it;
+- a key rule has a non-ASCII key (text mode matches each letter's upper and lower case,
+  and `"I"` matches a dotless-i key, which a lowercased substring test misses);
+- the scope has a pattern with an anchor or lookaround (`^ $ \A \Z (?= (?! (?<= (?<! (?(`),
+  which can match a string on its own but not inside the JSON text.
+
+**Can the backslash rule be lifted? Not usefully.** A decode-aware check was built and
+proven equivalent: decode the JSON escapes letter by letter (`\n`, `\"`, `\uXXXX`), fall
+back on surrogate escapes (they decode in pairs) and on a backslash left after decoding
+(nested JSON, invalid escapes), and test both the raw text (text mode) and the decoded
+text. Its differential tests passed and each guard had a test that failed without it. But it
+was slower than the walk it replaces on realistic payloads: decoding in Python costs one
+callback per escape, and the patterns then scan the text twice. Same method as below:
+
+| Policy on, realistic batch | Before (main) | Decode-aware check |
+| --- | --- | --- |
+| SQLite in memory | 112.5 / 113.6 / 114.4 ms | 165.7 / 167.8 / 167.6 ms |
+| Postgres 17 local | 130.8 / 130.4 / 130.9 ms | 182.3 / 182.9 / 182.5 ms |
+
+So it isn't shipped. A profile of the realistic batch puts most of the redaction time in the
+pattern scan itself (`re.Pattern.subn` over the leaves), which the skip can't avoid when
+the text has to be scanned anyway; the regex speed-up (literal pre-check) addresses that.
+
+Measured (same method as section 9; 3 rounds of 15 posts, medians per round; policy: 2
+rules). "plain": 512 LLM spans, 2.36 MB of payload, no escapes. "realistic": 256 LLM spans
+(multi-line system and user prompts with quotes and a code block, an assistant tool call
+whose `arguments` is a JSON string, a multi-line reply) and 256 tool spans (JSON args, a
+multi-line tab-separated tool log), 1.47 MB of payload:
+
+| DB | Batch | Policy | Before (rounds 1/2/3) | After (rounds 1/2/3) |
+| --- | --- | --- | --- | --- |
+| SQLite in memory | plain | none | 44.1 / 43.6 / 44.2 ms | 43.8 / 44.4 / 43.3 ms |
+| SQLite in memory | plain | 2 rules | 148.1 / 148.4 / 149.3 ms | 121.5 / 122.1 / 121.9 ms |
+| SQLite in memory | realistic | none | 39.9 / 40.3 / 40.5 ms | 40.2 / 39.8 / 39.9 ms |
+| SQLite in memory | realistic | 2 rules | 112.8 / 112.6 / 115.3 ms | 110.5 / 111.3 / 113.5 ms |
+| Postgres 17 local | plain | none | 59.6 / 60.4 / 59.6 ms | 60.7 / 61.2 / 59.6 ms |
+| Postgres 17 local | plain | 2 rules | 165.3 / 164.5 / 165.0 ms | 137.1 / 137.7 / 138.2 ms |
+| Postgres 17 local | realistic | none | 57.5 / 57.2 / 56.8 ms | 57.9 / 56.7 / 57.9 ms |
+| Postgres 17 local | realistic | 2 rules | 131.3 / 130.7 / 146.1 ms | 128.7 / 126.5 / 128.0 ms |
+
+Plain batch: about 18% faster with a policy. Realistic batch: about 2 ms faster (its tool
+args have no escapes; every multi-line value takes the full walk, as before). No change
+without a policy file.
 
 ## 10. Tests (PR 1, `tests/test_redaction.py`)
 
