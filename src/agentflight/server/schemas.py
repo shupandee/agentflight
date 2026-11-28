@@ -80,6 +80,8 @@ class RunSummary(BaseModel):
     # started from. The parent need not be stored (it can arrive later or be deleted).
     parent_run_id: str | None = None
     parent_span_id: str | None = None
+    # "explicit" (the sender named the parent) or "inferred" (from OTLP span links)
+    parent_source: str | None = None
 
 
 class RunDetail(RunSummary):

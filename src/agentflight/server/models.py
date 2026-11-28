@@ -45,6 +45,8 @@ class Run(Base):
     # parent can arrive later or be deleted) and the span of the parent it was started from.
     parent_run_id: Mapped[str | None] = mapped_column(String(32), index=True)
     parent_span_id: Mapped[str | None] = mapped_column(String(16))
+    # "explicit" (the sender named the parent) or "inferred" (from OTLP span links)
+    parent_source: Mapped[str | None] = mapped_column(String(16))
 
     events: Mapped[list[Event]] = relationship(
         back_populates="run", cascade="all, delete-orphan", order_by="Event.start_time_ns"

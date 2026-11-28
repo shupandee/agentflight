@@ -54,6 +54,19 @@ flowchart LR
   SQL for every run an ingest batch touches, so listing runs never reads their events and
   re-sent spans can't make the totals drift.
 
+## Install
+
+The package on PyPI is **`agentflight-sdk`**; the import name is still **`agentflight`**.
+
+```bash
+pip install agentflight-sdk                # the SDK: import agentflight
+pip install "agentflight-sdk[server]"      # plus the server and viewer (agentflight-server)
+pip install "agentflight-sdk[openai]"      # plus the OpenAI-style client integration
+pip install "agentflight-sdk[langgraph]"   # plus the LangGraph integration
+```
+
+From a checkout, `pip install -e ".[server]"` (or `.[dev]`) installs the same package.
+
 ## Quickstart
 
 ```bash
@@ -85,7 +98,7 @@ The server includes a read-only viewer at `/ui`:
 
 - **Runs:** every run with its status, start time, duration, call counts, failures, tokens
   and cost, filtered by status, name, model, tool, errors, metadata (`key:value`), start
-  time, nesting (top-level or sub-agent runs) and parent run. Filters update the table in place. A run whose recorder dropped spans is marked
+  time, parent run, and a toggle that hides sub-agent runs (`has_parent=false`). Filters update the table in place. A run whose recorder dropped spans is marked
   "incomplete recording: N spans dropped" (see "Dropped spans are counted" below).
 - **Run page:** the run's spans as an indented tree (each span under its parent,
   siblings in start order) with a bar per span on the run's time axis, failures
@@ -103,6 +116,10 @@ The server includes a read-only viewer at `/ui`:
 ![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-page.png)
 
 ![A LangGraph run: model and tool calls nested under graph nodes](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/span-tree.png)
+
+![A parent run listing its sub-agent runs, each marked on the span that started it](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/sub-agent-parent.png)
+
+![A sub-agent run whose parent was never recorded](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/sub-agent-missing-parent.png)
 
 ![A fork run, linked to its source run, with cached, overridden and live steps](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/fork-run.png)
 
@@ -156,7 +173,7 @@ Optional extras; the core SDK depends on neither package.
 ### OpenAI-style chat clients
 
 ```bash
-pip install "agentflight-sdk[openai]"
+pip install "agentflight-sdk[openai]"   # import name: agentflight
 ```
 
 ```python
@@ -187,7 +204,7 @@ with agentflight.run("support-agent"):
 ### LangGraph
 
 ```bash
-pip install "agentflight-sdk[langgraph]"
+pip install "agentflight-sdk[langgraph]"   # import name: agentflight
 ```
 
 ```python
@@ -280,7 +297,7 @@ the SDK:
 | OTLP | AgentFlight |
 | --- | --- |
 | Span without a parent | Closes the run: its name is the run name, its status the run status (`unset` counts as `ok`, OpenTelemetry's convention). Until it arrives the run is `running`. |
-| Span without a parent that has an `agentflight.run.parent_run_id` attribute, or span links into exactly one other trace | The run is a [sub-agent run](#sub-agent-runs) of that run |
+| Span without a parent that has an `agentflight.run.parent_run_id` attribute (explicit), or else span links into exactly one other trace (inferred; `AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS=false` turns this off) | The run is a [sub-agent run](#sub-agent-runs) of that run |
 | `gen_ai.operation.name` `chat`, `text_completion`, `generate_content` or `embeddings` (or a `gen_ai.request.model` / `gen_ai.system` / `gen_ai.provider.name` without an operation) | An `llm` event: model from `gen_ai.response.model`, else `gen_ai.request.model`; tokens from `gen_ai.usage.input_tokens` / `output_tokens` (or the older `prompt_tokens` / `completion_tokens`). These count in the run's call and token totals and the `model` filter. |
 | `gen_ai.operation.name` `execute_tool` (or a `gen_ai.tool.name` without an operation) | A `tool` event named by `gen_ai.tool.name` (the `tool` filter) |
 | Any other span | A `span` event |

@@ -343,8 +343,10 @@ def test_0005_adds_parent_run_columns_null_for_existing_runs(db_url: str) -> Non
     command.upgrade(cfg, "0005")
     engine = make_engine(db_url)
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT parent_run_id, parent_span_id FROM runs")).one()
-        assert tuple(row) == (None, None)
+        row = conn.execute(
+            text("SELECT parent_run_id, parent_span_id, parent_source FROM runs")
+        ).one()
+        assert tuple(row) == (None, None, None)
         assert "ix_runs_parent_run_id" in {i["name"] for i in inspect(conn).get_indexes("runs")}
     engine.dispose()
     command.downgrade(cfg, "0004")
@@ -354,8 +356,52 @@ def test_0005_adds_parent_run_columns_null_for_existing_runs(db_url: str) -> Non
         indexes = {i["name"] for i in inspect(conn).get_indexes("runs")}
         assert conn.execute(text("SELECT count(*) FROM runs")).scalar_one() == 1
     engine.dispose()
-    assert not {"parent_run_id", "parent_span_id"} & names
+    assert not {"parent_run_id", "parent_span_id", "parent_source"} & names
     assert "ix_runs_parent_run_id" not in indexes
+    command.downgrade(cfg, "base")
+
+
+def test_0005_keeps_existing_runs_and_events_when_runs_is_rebuilt(db_url: str) -> None:
+    """SQLite rebuilds ``runs`` to add the parent columns; events must survive it."""
+    cfg = _config(db_url)
+    command.upgrade(cfg, "0004")
+    engine = make_engine(db_url)
+    with engine.begin() as conn:
+        for r in "ab":
+            _insert(
+                conn,
+                "INSERT INTO runs (id, name, status, metadata) VALUES (:id, 'r', 'ok', '{}')",
+                id=r * 32,
+            )
+            for i in range(3):
+                _insert(
+                    conn,
+                    EVENT_SQL,
+                    sid=f"{r}{i}" * 8,
+                    rid=r * 32,
+                    kind="tool",
+                    status="ok",
+                    start=i,
+                    end=i + 1,
+                    attrs="{}",
+                )
+    engine.dispose()
+
+    def events() -> list[tuple[str, str]]:
+        e = make_engine(db_url)
+        with e.connect() as conn:
+            rows = conn.execute(text("SELECT span_id, run_id FROM events ORDER BY 1")).all()
+        e.dispose()
+        return [(r[0], r[1]) for r in rows]
+
+    before = events()
+    assert len(before) == 6
+    command.upgrade(cfg, "0005")
+    assert events() == before
+    command.downgrade(cfg, "0004")
+    assert events() == before
+    command.upgrade(cfg, "head")
+    assert events() == before
     command.downgrade(cfg, "base")
 
 

@@ -19,11 +19,11 @@
       <option value="no"{% if form.values.has_errors == "no" %} selected{% endif %}>without errors</option>
     </select>
   </label>
-  <label>Nesting
-    <select name="nesting">
-      <option value="">any</option>
-      <option value="top"{% if form.values.nesting == "top" %} selected{% endif %}>top-level runs</option>
-      <option value="child"{% if form.values.nesting == "child" %} selected{% endif %}>sub-agent runs</option>
+  <label>Sub-agent runs
+    <select name="has_parent">
+      <option value="">show</option>
+      <option value="false"{% if form.values.has_parent == "false" %} selected{% endif %}>hide (top-level only)</option>
+      <option value="true"{% if form.values.has_parent == "true" %} selected{% endif %}>only sub-agent runs</option>
     </select>
   </label>
   <label>Parent run <input name="parent" value="{{ form.values.parent }}" placeholder="run id"></label>

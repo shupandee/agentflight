@@ -50,7 +50,7 @@ def parse_filters(params: Mapping[str, str]) -> FilterForm:
         "since",
         "until",
         "parent",
-        "nesting",
+        "has_parent",
     )
     values = {k: str(params.get(k, "")).strip()[:255] for k in names}
     form = FilterForm(values=values)
@@ -63,7 +63,7 @@ def parse_filters(params: Mapping[str, str]) -> FilterForm:
     if parent and not _RUN_ID.match(parent):
         form.errors.append("Parent run must be a 32-character run id.")
         parent = None
-    has_parent = {"": None, "child": True, "top": False}.get(values["nesting"])
+    has_parent = {"": None, "true": True, "false": False}.get(values["has_parent"])
     metadata: tuple[tuple[str, str], ...] = ()
     if values["meta"]:
         key, sep, value = values["meta"].partition(":")

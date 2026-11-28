@@ -273,7 +273,8 @@ def test_parent_deleted_leaves_the_child_with_its_link(api: TestClient) -> None:
     assert api.get(f"/v1/runs/{CHILD}").json()["parent_run_id"] == PARENT
     page = api.get(f"/ui/runs/{CHILD}")
     assert page.status_code == 200
-    assert "isn't stored on this server" in page.text
+    assert "parent not recorded" in page.text
+    assert f'href="/ui/runs/{PARENT}"' not in page.text  # no link to a page that 404s
 
 
 def test_a_parent_cycle_cannot_hang_anything(api: TestClient) -> None:
@@ -423,10 +424,10 @@ def test_sdk_to_viewer(ui: TestClient) -> None:
     table = ui.get("/ui/runs", params={"parent": parent.run_id}, headers={"HX-Request": "true"})
     assert f"/ui/runs/{child.run_id}" in table.text
     assert f'href="/ui/runs/{parent.run_id}"' in table.text  # the "sub-agent run of" link
-    only_top = ui.get("/ui", params={"nesting": "top"}).text
+    only_top = ui.get("/ui", params={"has_parent": "false"}).text
     assert f"/ui/runs/{parent.run_id}" in only_top
     assert f"/ui/runs/{child.run_id}" not in only_top
-    only_child = ui.get("/ui", params={"nesting": "child"}).text
+    only_child = ui.get("/ui", params={"has_parent": "true"}).text
     assert f"/ui/runs/{child.run_id}" in only_child
     assert f'href="/ui/runs/{parent.run_id}">planner' in only_top
     assert f'href="/ui/runs/{parent.run_id}">planner' not in only_child  # not a row
@@ -436,3 +437,210 @@ def test_viewer_rejects_a_bad_parent_filter(ui: TestClient) -> None:
     page = ui.get("/ui", params={"parent": "nope"})
     assert page.status_code == 200
     assert "Parent run must be a 32-character run id" in page.text
+
+
+def test_viewer_has_parent_toggle_hides_child_runs(ui: TestClient) -> None:
+    with agentflight.run("planner") as parent, agentflight.run("researcher") as child:
+        pass
+    page = ui.get("/ui").text
+    assert '<select name="has_parent">' in page
+    assert f"/ui/runs/{child.run_id}" in page
+    hidden = ui.get("/ui/runs", params={"has_parent": "false"}, headers={"HX-Request": "true"})
+    assert f'href="/ui/runs/{parent.run_id}">planner' in hidden.text
+    assert f"/ui/runs/{child.run_id}" not in hidden.text
+    assert '<option value="false" selected>' in ui.get("/ui", params={"has_parent": "false"}).text
+
+
+# Rule 1: an explicit parent always wins over link inference
+
+
+def _linked_otlp(api: TestClient, *, child_attrs: dict[str, Any]) -> tuple[Any, Any]:
+    from opentelemetry.trace import Link
+
+    holder: dict[str, Any] = {}
+
+    def build(tracer: Any) -> None:
+        with tracer.start_as_current_span("linked") as linked:
+            holder["linked"] = linked.get_span_context()
+            link = Link(linked.get_span_context())
+        with tracer.start_as_current_span("child", links=[link]) as child:
+            holder["child"] = child.get_span_context()
+            child.set_attributes(child_attrs)
+
+    spans = _record(build)
+    assert api.post("/v1/traces", content=_protobuf(spans), headers=PB).status_code == 200
+    return holder["linked"], holder["child"]
+
+
+def test_explicit_attribute_with_span_wins_over_links(api: TestClient) -> None:
+    _, child = _linked_otlp(
+        api, child_attrs={A.RUN_PARENT_RUN_ID: PARENT, A.RUN_PARENT_SPAN_ID: "9" * 16}
+    )
+    body = api.get(f"/v1/runs/{child.trace_id:032x}").json()
+    assert (body["parent_run_id"], body["parent_span_id"]) == (PARENT, "9" * 16)
+    assert body["parent_source"] == "explicit"
+
+
+def test_sdk_spans_over_otlp_never_get_an_inferred_parent(api: TestClient) -> None:
+    # AgentFlight SDK spans sent through an OTLP exporter say what they mean: no parent
+    # attribute means a top-level run, whatever its links.
+    _, child = _linked_otlp(api, child_attrs={A.KIND: A.RUN, A.RUN_NAME: "sdk-run"})
+    body = api.get(f"/v1/runs/{child.trace_id:032x}").json()
+    assert body["name"] == "sdk-run"
+    assert (body["parent_run_id"], body["parent_source"]) == (None, None)
+
+
+# Rule 2: the parent's source is stored, and the viewer words inferred links differently
+
+
+def test_parent_source_is_explicit_or_inferred(api: TestClient) -> None:
+    send(api, span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: PARENT}))
+    assert api.get(f"/v1/runs/{CHILD}").json()["parent_source"] == "explicit"
+    linked, child = _linked_otlp(api, child_attrs={})
+    body = api.get(f"/v1/runs/{child.trace_id:032x}").json()
+    assert body["parent_run_id"] == f"{linked.trace_id:032x}"
+    assert body["parent_source"] == "inferred"
+    listed = {r["id"]: r for r in api.get("/v1/runs").json()["runs"]}
+    assert listed[f"{child.trace_id:032x}"]["parent_source"] == "inferred"
+    assert listed[CHILD]["parent_source"] == "explicit"
+    assert listed[f"{linked.trace_id:032x}"]["parent_source"] is None
+
+
+def test_viewer_words_inferred_parents_as_started_from(api: TestClient) -> None:
+    linked, child = _linked_otlp(api, child_attrs={})
+    child_id, linked_id = f"{child.trace_id:032x}", f"{linked.trace_id:032x}"
+    page = api.get(f"/ui/runs/{child_id}").text
+    assert "started from run" in page and "sub-agent run of" not in page
+    assert f'href="/ui/runs/{linked_id}"' in page
+    listing = api.get("/ui").text
+    assert "started from run" in listing and "sub-agent run of" not in listing
+    parent_page = api.get(f"/ui/runs/{linked_id}").text
+    assert "(started from this run, inferred)" in parent_page
+    assert "run started from here" in parent_page
+    # An explicit child keeps the sub-agent wording.
+    send(api, span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: linked_id}))
+    assert "sub-agent run of" in api.get(f"/ui/runs/{CHILD}").text
+
+
+def test_a_resent_run_span_replaces_the_source(api: TestClient) -> None:
+    send(
+        api,
+        span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: PARENT, A.RUN_PARENT_SOURCE: "inferred"}),
+    )
+    assert api.get(f"/v1/runs/{CHILD}").json()["parent_source"] == "inferred"
+    send(api, span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: PARENT}))
+    assert api.get(f"/v1/runs/{CHILD}").json()["parent_source"] == "explicit"
+    send(api, span(CHILD, "2"))
+    assert api.get(f"/v1/runs/{CHILD}").json()["parent_source"] is None
+
+
+# Rule 3: absent or deleted parents never fail ingest or the child
+
+
+def test_runs_parent_run_id_has_no_foreign_key() -> None:
+    from agentflight.server.models import Run
+
+    assert not Run.__table__.c.parent_run_id.foreign_keys
+
+
+def test_child_of_a_never_recorded_parent_loads(api: TestClient) -> None:
+    send(api, span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: PARENT, A.RUN_PARENT_SPAN_ID: "3" * 16}))
+    assert api.get(f"/v1/runs/{CHILD}").status_code == 200
+    page = api.get(f"/ui/runs/{CHILD}")
+    assert page.status_code == 200
+    assert "parent not recorded" in page.text
+    assert f'href="/ui/runs/{PARENT}"' not in page.text
+
+
+def test_retention_expiring_a_parent_leaves_children_intact(api: TestClient) -> None:
+    from agentflight.server import service
+
+    old = {**span(PARENT, "1"), "start_time_ns": 100, "end_time_ns": 200}
+    recent = {
+        **span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: PARENT}),
+        "start_time_ns": 10_000,
+        "end_time_ns": 20_000,
+    }
+    child_event = {
+        **span(CHILD, "3", parent="2" * 16),
+        "start_time_ns": 10_001,
+        "end_time_ns": 10_002,
+        "attributes": {A.KIND: A.TOOL, A.TOOL_NAME: "t"},
+    }
+    send(api, old, recent, child_event)
+    with api.app.state.sessions() as session:  # type: ignore[attr-defined]
+        assert service.cleanup_expired(session, cutoff_ns=1_000) == 1
+    assert api.get(f"/v1/runs/{PARENT}").status_code == 404
+    child = api.get(f"/v1/runs/{CHILD}").json()
+    assert child["parent_run_id"] == PARENT
+    assert child["event_count"] == 2
+    assert "parent not recorded" in api.get(f"/ui/runs/{CHILD}").text
+
+
+# Rule 4: self-links are rejected; cycles can't loop
+
+
+def test_explicit_self_link_through_the_sdk_is_dropped(api: TestClient) -> None:
+    # The SDK can't know its own run id up front; a sender that names it gets no parent.
+    send(api, span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: CHILD}))
+    body = api.get(f"/v1/runs/{CHILD}").json()
+    assert (body["parent_run_id"], body["parent_source"]) == (None, None)
+    assert api.get("/v1/runs", params={"parent_run_id": CHILD}).json()["total"] == 0
+
+
+def test_filters_and_list_on_a_parent_cycle(api: TestClient) -> None:
+    send(
+        api,
+        span(PARENT, "1", **{A.RUN_PARENT_RUN_ID: CHILD}),
+        span(CHILD, "2", **{A.RUN_PARENT_RUN_ID: PARENT}),
+    )
+    assert [
+        r["id"] for r in api.get("/v1/runs", params={"parent_run_id": PARENT}).json()["runs"]
+    ] == [CHILD]
+    assert [
+        r["id"] for r in api.get("/v1/runs", params={"parent_run_id": CHILD}).json()["runs"]
+    ] == [PARENT]
+    assert api.get("/v1/runs", params={"has_parent": "false"}).json()["total"] == 0
+    assert api.get("/v1/runs", params={"has_parent": "true"}).json()["total"] == 2
+    for params in ({}, {"has_parent": "true"}, {"parent": PARENT}):
+        assert api.get("/ui", params=params).status_code == 200
+
+
+# Rule 5: link inference can be switched off
+
+
+def test_otlp_link_inference_can_be_turned_off(engine: Engine) -> None:
+    settings = Settings(auth_disabled=True, otlp_infer_parent_from_links=False)
+    with TestClient(create_app(engine, settings)) as api:
+        linked, child = _linked_otlp(api, child_attrs={})
+        body = api.get(f"/v1/runs/{child.trace_id:032x}").json()
+        assert (body["parent_run_id"], body["parent_source"]) == (None, None)
+        # The links themselves are still kept on the event.
+        root = next(e for e in body["events"] if e["span_id"] == f"{child.span_id:016x}")
+        assert root["attributes"]["otel.links"][0]["trace_id"] == f"{linked.trace_id:032x}"
+        # Explicit parents still work with inference off.
+        _, explicit = _linked_otlp(api, child_attrs={A.RUN_PARENT_RUN_ID: PARENT})
+        got = api.get(f"/v1/runs/{explicit.trace_id:032x}").json()
+        assert (got["parent_run_id"], got["parent_source"]) == (PARENT, "explicit")
+
+
+@pytest.mark.parametrize(("raw", "expected"), [(None, True), ("false", False), ("true", True)])
+def test_link_inference_env_switch(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: bool
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS", raising=False)
+    else:
+        monkeypatch.setenv("AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS", raw)
+    monkeypatch.setenv("AGENTFLIGHT_AUTH_DISABLED", "true")
+    assert Settings.from_env().otlp_infer_parent_from_links is expected
+
+
+# parent_run_id is indexed
+
+
+def test_parent_run_id_is_indexed(engine: Engine) -> None:
+    from sqlalchemy import inspect
+
+    indexes = {i["name"]: i["column_names"] for i in inspect(engine).get_indexes("runs")}
+    assert indexes["ix_runs_parent_run_id"] == ["parent_run_id"]

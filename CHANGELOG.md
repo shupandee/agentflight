@@ -18,16 +18,21 @@ All notable changes to AgentFlight. The HTTP API is versioned by its `/v1` prefi
 - The server stores the link (`runs.parent_run_id`, `runs.parent_span_id`, and an index on
   the first), reads it from `/v1/spans` and from OTLP: an `agentflight.run.parent_run_id`
   attribute on a root span, or else a root span whose span links all point into exactly one
-  other trace. Run responses gain `parent_run_id` and `parent_span_id`; a single run also
-  `child_run_count`. `GET /v1/runs` gains `parent_run_id=` (the runs a run started) and
+  other trace (`AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS=false` turns link inference off;
+  an explicit parent always wins). The link's source is stored (`runs.parent_source`:
+  `explicit` or `inferred`). Run responses gain `parent_run_id`, `parent_span_id` and
+  `parent_source`; a single run also `child_run_count`. `GET /v1/runs` gains `parent_run_id=` (the runs a run started) and
   `has_parent=true|false` (only sub-agent runs, or only top-level runs).
-- The viewer links a sub-agent run to its parent, lists a run's sub-agent runs on its page
-  and marks the span each one started from, adds "sub-agent run of ..." to the run list,
-  and filters by nesting and by parent run.
+- The viewer links a sub-agent run to its parent ("sub-agent run of X", or "started from
+  run X" for inferred links; "parent not recorded" when the parent isn't stored), lists a
+  run's sub-agent runs on its page and marks the span each one started from, and filters by
+  parent run with a toggle that hides sub-agent runs (`has_parent=false`).
+- README: an Install section with every `agentflight-sdk` install form and the import
+  name (`agentflight`).
 
 ### Behaviour changes
 
-- **Database migration `0005`** adds two nullable columns and an index to `runs`. Run
+- **Database migration `0005`** adds three nullable columns and an index to `runs`. Run
   `agentflight-server migrate` when upgrading the server (existing runs have no parent).
 - `agentflight.run()` called inside another run now records a parent link on the nested run
   where it recorded none before. Nothing else about nested runs changes.

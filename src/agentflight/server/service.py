@@ -191,6 +191,9 @@ def ingest_spans(
             run.parent_run_id = parent_run
             parent_span = _as_id(span.attributes.get(A.RUN_PARENT_SPAN_ID), _SPAN_ID)
             run.parent_span_id = parent_span if parent_run else None
+            inferred = span.attributes.get(A.RUN_PARENT_SOURCE) == A.PARENT_INFERRED
+            source = A.PARENT_INFERRED if inferred else A.PARENT_EXPLICIT
+            run.parent_source = source if parent_run else None
         elif run.start_time_ns is None or span.start_time_ns < run.start_time_ns:
             run.start_time_ns = span.start_time_ns
 
@@ -291,6 +294,7 @@ def summarize(run: Run, abandoned_before_ns: int | None = None) -> RunSummary:
         dropped_spans=run.dropped_spans or 0,
         parent_run_id=run.parent_run_id,
         parent_span_id=run.parent_span_id,
+        parent_source=run.parent_source,
     )
 
 
