@@ -17,6 +17,19 @@
   {% if run.dropped_spans %}
   <p class="incomplete" role="alert">incomplete recording: {{ run.dropped_spans | number }} span{% if run.dropped_spans != 1 %}s{% endif %} dropped by the recorder before the run ended (its export queue was full), so the timeline below is missing them. Replays of this run will warn too.</p>
   {% endif %}
+  {% if run.parent_run_id %}
+  <p class="lineage lineage-{{ run.parent_source or 'explicit' }}">{% if run.parent_source == "inferred" %}started from run{% else %}sub-agent run of{% endif %} {% if parent_known %}<a href="/ui/runs/{{ run.parent_run_id }}">{% if parent_name %}{{ parent_name }} · {% endif %}<span class="id">{{ run.parent_run_id }}</span></a>{% if run.parent_span_id %} · from span <span class="id">{{ run.parent_span_id }}</span>{% endif %}{% else %}<span class="id">{{ run.parent_run_id }}</span> <span class="missing">parent not recorded</span>{% endif %}{% if run.parent_source == "inferred" %} <span class="muted">(inferred from an OpenTelemetry span link)</span>{% endif %}</p>
+  {% endif %}
+  {% if children %}
+  <details class="children" open>
+    <summary>{{ run.child_run_count | number }} sub-agent run{% if run.child_run_count != 1 %}s{% endif %}{% if run.child_run_count > children | length %}, first {{ children | length }} shown · <a href="/ui?parent={{ run.id }}">see all</a>{% endif %}</summary>
+    <ul>
+    {% for c in children %}
+      <li><a href="/ui/runs/{{ c.id }}">{{ c.name or "(unnamed)" }}</a>{% if c.parent_source == "inferred" %} <span class="muted">(started from this run, inferred)</span>{% endif %} <span class="status st-{{ c.status }}">{{ c.status }}</span> <span class="id">{{ c.id }}</span></li>
+    {% endfor %}
+    </ul>
+  </details>
+  {% endif %}
   {% if replay %}
   <p class="replay">
     {{ replay.mode or "replay" }} of <a href="/ui/runs/{{ replay.source_run }}">{{ replay.source_run }}</a>

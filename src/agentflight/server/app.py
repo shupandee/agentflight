@@ -181,6 +181,14 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
         model: Annotated[str | None, Query(max_length=255)] = None,
         tool: Annotated[str | None, Query(max_length=255)] = None,
         meta: Annotated[list[str] | None, Query(max_length=5, description=META_HELP)] = None,
+        parent_run_id: Annotated[
+            str | None,
+            Query(pattern=r"^[0-9a-f]{32}$", description="only sub-agent runs started by this run"),
+        ] = None,
+        has_parent: Annotated[
+            bool | None,
+            Query(description="true: only sub-agent runs; false: only top-level runs"),
+        ] = None,
     ) -> RunList:
         filters = service.RunFilters(
             status=status,
@@ -191,6 +199,8 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             model=model,
             tool=tool,
             metadata=parse_meta(meta or []),
+            parent_run_id=parent_run_id,
+            has_parent=has_parent,
         )
         runs, total = service.list_runs(
             session,

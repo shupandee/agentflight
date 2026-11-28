@@ -10,6 +10,16 @@ RUN_METADATA = "agentflight.run.metadata"
 # On the run span: spans of this run the SDK dropped because its export queue was full,
 # counted up to the moment the run ended (best effort; see the README).
 RUN_DROPPED_SPANS = "agentflight.run.dropped_spans"
+# On the run span of a sub-agent (child) run: the run that started it, and the span of that
+# run that was open when it did (so a viewer can show where the child was spawned).
+RUN_PARENT_RUN_ID = "agentflight.run.parent_run_id"
+RUN_PARENT_SPAN_ID = "agentflight.run.parent_span_id"
+# How the parent was found: "explicit" (the sender said so: the SDK, or the attributes
+# above on any span) or "inferred" (the server read it from OTLP span links). Set by the
+# server's OTLP ingest; a run span without it is explicit.
+RUN_PARENT_SOURCE = "agentflight.run.parent_source"
+PARENT_EXPLICIT = "explicit"
+PARENT_INFERRED = "inferred"
 
 LLM_MODEL = "agentflight.llm.model"
 LLM_MESSAGES = "agentflight.llm.messages"

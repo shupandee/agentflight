@@ -108,6 +108,9 @@ class Settings:
     session_hours: float = DEFAULT_SESSION_HOURS
     # Always mark the session cookie Secure (it is already when the request is HTTPS).
     cookie_secure: bool = False
+    # OTLP ingest: read a root span whose links all point into one other trace as a
+    # sub-agent run of that trace's run. Off: only explicit parents are stored.
+    otlp_infer_parent_from_links: bool = True
 
     @property
     def api_keys(self) -> dict[str, frozenset[Permission]]:
@@ -195,4 +198,5 @@ class Settings:
             session_secret=os.environ.get("AGENTFLIGHT_SESSION_SECRET") or None,
             session_hours=_float("AGENTFLIGHT_SESSION_HOURS", DEFAULT_SESSION_HOURS),
             cookie_secure=_bool("AGENTFLIGHT_COOKIE_SECURE", False),
+            otlp_infer_parent_from_links=_bool("AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS", True),
         )

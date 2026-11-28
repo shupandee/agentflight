@@ -19,6 +19,14 @@
       <option value="no"{% if form.values.has_errors == "no" %} selected{% endif %}>without errors</option>
     </select>
   </label>
+  <label>Sub-agent runs
+    <select name="has_parent">
+      <option value="">show</option>
+      <option value="false"{% if form.values.has_parent == "false" %} selected{% endif %}>hide (top-level only)</option>
+      <option value="true"{% if form.values.has_parent == "true" %} selected{% endif %}>only sub-agent runs</option>
+    </select>
+  </label>
+  <label>Parent run <input name="parent" value="{{ form.values.parent }}" placeholder="run id"></label>
   <label>Metadata <input name="meta" value="{{ form.values.meta }}" placeholder="key:value"></label>
   <label>Started after (UTC) <input type="datetime-local" name="since" value="{{ form.values.since }}" step="1"></label>
   <label>Started before (UTC) <input type="datetime-local" name="until" value="{{ form.values.until }}" step="1"></label>

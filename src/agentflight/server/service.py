@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Collection, Iterator
 from dataclasses import dataclass
@@ -73,6 +74,16 @@ def _as_float(value: Any) -> float | None:
 
 def _as_str(value: Any) -> str | None:
     return None if value is None else str(value)[:255]
+
+
+_RUN_ID = re.compile(r"^[0-9a-f]{32}$")
+_SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _as_id(value: Any, pattern: re.Pattern[str]) -> str | None:
+    """A trace/span id attribute if it is a well-formed hex id; else None (never an error:
+    senders other than the SDK may put anything there)."""
+    return value if isinstance(value, str) and pattern.match(value) else None
 
 
 def extract_columns(kind: str, attributes: dict[str, Any]) -> dict[str, Any]:
@@ -174,6 +185,15 @@ def ingest_spans(
             run.metadata_ = meta if isinstance(meta, dict) else {"value": meta}
             dropped = _as_int(span.attributes.get(A.RUN_DROPPED_SPANS)) or 0
             run.dropped_spans = min(max(dropped, 0), 2**31 - 1)
+            parent_run = _as_id(span.attributes.get(A.RUN_PARENT_RUN_ID), _RUN_ID)
+            if parent_run == run.id:  # a run is never its own parent
+                parent_run = None
+            run.parent_run_id = parent_run
+            parent_span = _as_id(span.attributes.get(A.RUN_PARENT_SPAN_ID), _SPAN_ID)
+            run.parent_span_id = parent_span if parent_run else None
+            inferred = span.attributes.get(A.RUN_PARENT_SOURCE) == A.PARENT_INFERRED
+            source = A.PARENT_INFERRED if inferred else A.PARENT_EXPLICIT
+            run.parent_source = source if parent_run else None
         elif run.start_time_ns is None or span.start_time_ns < run.start_time_ns:
             run.start_time_ns = span.start_time_ns
 
@@ -272,6 +292,9 @@ def summarize(run: Run, abandoned_before_ns: int | None = None) -> RunSummary:
         tokens_out=run.tokens_out,
         cost_usd=run.cost_usd,
         dropped_spans=run.dropped_spans or 0,
+        parent_run_id=run.parent_run_id,
+        parent_span_id=run.parent_span_id,
+        parent_source=run.parent_source,
     )
 
 
@@ -290,6 +313,8 @@ class RunFilters:
     model: str | None = None  # some LLM call used this model
     tool: str | None = None  # some tool call had this name
     metadata: tuple[tuple[str, str], ...] = ()  # string metadata values, exact match
+    parent_run_id: str | None = None  # sub-agent runs started by this run
+    has_parent: bool | None = None  # True: only sub-agent runs; False: only top-level runs
 
 
 def _status_filter(status: str, abandoned_before_ns: int | None) -> ColumnElement[bool]:
@@ -320,6 +345,12 @@ def _filtered(query: Select[Any], f: RunFilters, abandoned_before_ns: int | None
         query = query.where(exists().where(Event.run_id == Run.id, Event.tool_name == f.tool))
     for key, value in f.metadata:
         query = query.where(Run.metadata_[key].as_string() == value)
+    if f.parent_run_id:
+        query = query.where(Run.parent_run_id == f.parent_run_id)
+    if f.has_parent is not None:
+        query = query.where(
+            Run.parent_run_id.is_not(None) if f.has_parent else Run.parent_run_id.is_(None)
+        )
     return query
 
 
@@ -381,10 +412,32 @@ def get_run(
         events = [_without_payloads(e) for e in events]
     return RunDetail(
         **summarize(run, abandoned_before_ns).model_dump(),
+        child_run_count=count_child_runs(session, run_id),
         events=events,
         events_offset=events_offset,
         events_limit=events_limit,
     )
+
+
+def count_child_runs(session: Session, run_id: str) -> int:
+    """How many stored runs name ``run_id`` as their parent."""
+    return (
+        session.scalar(select(func.count()).select_from(Run).where(Run.parent_run_id == run_id))
+        or 0
+    )
+
+
+def child_runs(
+    session: Session, run_id: str, *, limit: int, abandoned_before_ns: int | None = None
+) -> list[RunSummary]:
+    """The runs started by ``run_id`` (oldest first), at most ``limit``."""
+    query = (
+        select(Run)
+        .where(Run.parent_run_id == run_id)
+        .order_by(Run.start_time_ns, Run.id)
+        .limit(limit)
+    )
+    return [summarize(r, abandoned_before_ns) for r in session.scalars(query)]
 
 
 def span_tree_order(session: Session, run_id: str) -> list[tuple[str, int]]:
@@ -448,6 +501,7 @@ def get_run_tree_page(
     events = [_without_payloads(event_out(loaded[s])) for s in wanted if s in loaded]
     detail = RunDetail(
         **summarize(run, abandoned_before_ns).model_dump(),
+        child_run_count=count_child_runs(session, run_id),
         events=events,
         events_offset=offset,
         events_limit=limit,

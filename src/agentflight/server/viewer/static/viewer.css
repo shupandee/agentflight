@@ -102,3 +102,10 @@ tr.more td { text-align: center; }
 /* A run the recorder couldn't fully record (spans dropped from a full export queue). */
 .incomplete { color: #8a4b00; background: #fff4e5; border: 1px solid #ffd8a8; border-radius: 4px; padding: 2px 6px; font-size: 12.5px; display: inline-block; margin-top: 3px; }
 p.incomplete { display: block; padding: 6px 10px; margin: 10px 0 0; }
+
+/* Sub-agent runs: the parent link, the list of children, and where a child was started. */
+.lineage { margin: 10px 0 0; }
+.children { margin-top: 10px; }
+.children ul { margin: 4px 0 0; padding-left: 18px; }
+a.spawned { display: inline-block; margin-left: 8px; font-size: 12px; }
+.lineage .missing { color: #8a4b00; background: #fff4e5; border: 1px solid #ffd8a8; border-radius: 4px; padding: 0 6px; font-size: 12.5px; }

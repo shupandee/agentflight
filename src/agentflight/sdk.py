@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
 import traceback
@@ -50,6 +51,10 @@ Redactor = Callable[[str, Any], Any]
 # The active replay session (see agentflight.replayer), or None when recording normally.
 # Kept here so the SDK needs no import of the replayer; it only calls ``session.next``.
 _replay_session: ContextVar[Any] = ContextVar("agentflight_replay_session", default=None)
+
+# The AgentFlight run being recorded in this context, so a run started inside it is linked
+# to it as a child run (agentflight.run.parent_run_id).
+_current_run: ContextVar[RunHandle | None] = ContextVar("agentflight_current_run", default=None)
 
 
 def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -569,18 +574,75 @@ class RunHandle:
         return format(self.span.get_span_context().trace_id, "032x")
 
 
+_RUN_ID = re.compile(r"^[0-9a-f]{32}$")
+_SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _parent_link(
+    parent_run_id: RunHandle | str | None, parent_span_id: str | None
+) -> dict[str, str]:
+    """Attributes linking a new run to the run that started it (empty for a top-level run).
+
+    An explicit ``parent_run_id`` wins. Otherwise the run being recorded in this context,
+    if any, is the parent and the span open right now is where the child was started.
+    Never raises: an id that isn't hex is ignored with a warning, and the run is recorded
+    without a parent.
+    """
+    try:
+        if parent_run_id is None:
+            current = _current_run.get()
+            if current is None:
+                return {}
+            out = {A.RUN_PARENT_RUN_ID: current.run_id}
+            context = trace.get_current_span().get_span_context()
+            if context.is_valid and context.trace_id == current.span.get_span_context().trace_id:
+                out[A.RUN_PARENT_SPAN_ID] = format(context.span_id, "016x")
+            return out
+        run_id = parent_run_id.run_id if isinstance(parent_run_id, RunHandle) else parent_run_id
+        if not isinstance(run_id, str) or not _RUN_ID.match(run_id):
+            logger.warning(
+                "agentflight: parent_run_id %r is not a 32-char hex run id (ignored)", run_id
+            )
+            return {}
+        out = {A.RUN_PARENT_RUN_ID: run_id}
+        if parent_span_id is not None:
+            if isinstance(parent_span_id, str) and _SPAN_ID.match(parent_span_id):
+                out[A.RUN_PARENT_SPAN_ID] = parent_span_id
+            else:
+                logger.warning(
+                    "agentflight: parent_span_id %r is not a 16-char hex span id (ignored)",
+                    parent_span_id,
+                )
+        return out
+    except Exception:
+        logger.warning("agentflight: could not link the run to its parent (ignored)", exc_info=True)
+        return {}
+
+
 @contextmanager
-def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHandle]:
+def run(
+    name: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    parent_run_id: RunHandle | str | None = None,
+    parent_span_id: str | None = None,
+) -> Iterator[RunHandle]:
     """Record one agent run. Everything recorded inside becomes part of it.
 
-    Runs always start a new trace, even when nested inside another span.
+    Runs always start a new trace, even when nested inside another span. A run started
+    inside another AgentFlight run (a sub-agent) is linked to it as a child run, with the
+    span that was open when it started. To link a run started elsewhere (another thread
+    without the context, another process), pass the parent's ``parent_run_id`` (a run id
+    or its ``RunHandle``) and optionally the ``parent_span_id`` it was started from.
     """
+    parent = _parent_link(parent_run_id, parent_span_id)
 
     def attrs() -> dict[str, Any]:
         out: dict[str, Any] = {
             A.KIND: A.RUN,
             A.RUN_NAME: name,
             A.RUN_METADATA: _Payload(metadata or {}),
+            **parent,
         }
         session = _replay_session.get()
         if session is not None:
@@ -593,9 +655,13 @@ def run(name: str, *, metadata: dict[str, Any] | None = None) -> Iterator[RunHan
         session = _replay_session.get()
         if session is not None:
             _safe(session.bind_run, span)
+        handle = RunHandle(span=span, name=name)
+        token = _current_run.set(handle) if span.get_span_context().is_valid else None
         try:
-            yield RunHandle(span=span, name=name)
+            yield handle
         finally:
+            if token is not None:
+                _safe(_current_run.reset, token)
             if session is not None:
                 _safe(session.unbind_run, span)
             # Before the run span ends, so the count travels with it.

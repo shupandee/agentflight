@@ -17,6 +17,7 @@ from agentflight import attributes as A
 from agentflight.server import service
 
 _META_KEY = re.compile(service.META_KEY_PATTERN)
+_RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 NS = 1_000_000_000
 
 
@@ -39,7 +40,18 @@ def _parse_time(raw: str) -> int:
 
 
 def parse_filters(params: Mapping[str, str]) -> FilterForm:
-    names = ("status", "name", "model", "tool", "has_errors", "meta", "since", "until")
+    names = (
+        "status",
+        "name",
+        "model",
+        "tool",
+        "has_errors",
+        "meta",
+        "since",
+        "until",
+        "parent",
+        "has_parent",
+    )
     values = {k: str(params.get(k, "")).strip()[:255] for k in names}
     form = FilterForm(values=values)
     status = values["status"] or None
@@ -47,6 +59,11 @@ def parse_filters(params: Mapping[str, str]) -> FilterForm:
         form.errors.append(f"Unknown status {status!r}.")
         status = None
     has_errors = {"": None, "yes": True, "no": False}.get(values["has_errors"])
+    parent = values["parent"].lower() or None
+    if parent and not _RUN_ID.match(parent):
+        form.errors.append("Parent run must be a 32-character run id.")
+        parent = None
+    has_parent = {"": None, "true": True, "false": False}.get(values["has_parent"])
     metadata: tuple[tuple[str, str], ...] = ()
     if values["meta"]:
         key, sep, value = values["meta"].partition(":")
@@ -74,6 +91,8 @@ def parse_filters(params: Mapping[str, str]) -> FilterForm:
         model=values["model"] or None,
         tool=values["tool"] or None,
         metadata=metadata,
+        parent_run_id=parent,
+        has_parent=has_parent,
     )
     return form
 

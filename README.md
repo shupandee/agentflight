@@ -54,6 +54,19 @@ flowchart LR
   SQL for every run an ingest batch touches, so listing runs never reads their events and
   re-sent spans can't make the totals drift.
 
+## Install
+
+The package on PyPI is **`agentflight-sdk`**; the import name is still **`agentflight`**.
+
+```bash
+pip install agentflight-sdk                # the SDK: import agentflight
+pip install "agentflight-sdk[server]"      # plus the server and viewer (agentflight-server)
+pip install "agentflight-sdk[openai]"      # plus the OpenAI-style client integration
+pip install "agentflight-sdk[langgraph]"   # plus the LangGraph integration
+```
+
+From a checkout, `pip install -e ".[server]"` (or `.[dev]`) installs the same package.
+
 ## Quickstart
 
 ```bash
@@ -84,8 +97,8 @@ curl -H "Authorization: Bearer $AGENTFLIGHT_API_KEY" localhost:8000/v1/runs/<run
 The server includes a read-only viewer at `/ui`:
 
 - **Runs:** every run with its status, start time, duration, call counts, failures, tokens
-  and cost, filtered by status, name, model, tool, errors, metadata (`key:value`) and start
-  time. Filters update the table in place. A run whose recorder dropped spans is marked
+  and cost, filtered by status, name, model, tool, errors, metadata (`key:value`), start
+  time, parent run, and a toggle that hides sub-agent runs (`has_parent=false`). Filters update the table in place. A run whose recorder dropped spans is marked
   "incomplete recording: N spans dropped" (see "Dropped spans are counted" below).
 - **Run page:** the run's spans as an indented tree (each span under its parent,
   siblings in start order) with a bar per span on the run's time axis, failures
@@ -94,13 +107,19 @@ The server includes a read-only viewer at `/ui`:
   in pages of 100 without payloads, and the next page continues the tree where the last
   one stopped; selecting an event loads its messages, outputs, arguments and stack traces
   on demand. An incomplete recording gets a warning above the timeline. (To page in tree order the server reads every span's id and parent for each
-  page, which is cheap next to loading the events themselves.)
+  page, which is cheap next to loading the events themselves.) A sub-agent run links to
+  the run that started it; a parent lists its sub-agent runs and marks the span each one
+  started from (see [Sub-agent runs](#sub-agent-runs)).
 
 ![Run list with filters](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-list.png)
 
 ![Run page: span tree, timeline bars, a failed tool call, and an event's payloads](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/run-page.png)
 
 ![A LangGraph run: model and tool calls nested under graph nodes](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/span-tree.png)
+
+![A parent run listing its sub-agent runs, each marked on the span that started it](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/sub-agent-parent.png)
+
+![A sub-agent run whose parent was never recorded](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/sub-agent-missing-parent.png)
 
 ![A fork run, linked to its source run, with cached, overridden and live steps](https://raw.githubusercontent.com/shupandee/agentflight/main/docs/screenshots/fork-run.png)
 
@@ -154,7 +173,7 @@ Optional extras; the core SDK depends on neither package.
 ### OpenAI-style chat clients
 
 ```bash
-pip install "agentflight-sdk[openai]"
+pip install "agentflight-sdk[openai]"   # import name: agentflight
 ```
 
 ```python
@@ -185,7 +204,7 @@ with agentflight.run("support-agent"):
 ### LangGraph
 
 ```bash
-pip install "agentflight-sdk[langgraph]"
+pip install "agentflight-sdk[langgraph]"   # import name: agentflight
 ```
 
 ```python
@@ -278,6 +297,7 @@ the SDK:
 | OTLP | AgentFlight |
 | --- | --- |
 | Span without a parent | Closes the run: its name is the run name, its status the run status (`unset` counts as `ok`, OpenTelemetry's convention). Until it arrives the run is `running`. |
+| Span without a parent that has an `agentflight.run.parent_run_id` attribute (explicit), or else span links into exactly one other trace (inferred; `AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS=false` turns this off) | The run is a [sub-agent run](#sub-agent-runs) of that run |
 | `gen_ai.operation.name` `chat`, `text_completion`, `generate_content` or `embeddings` (or a `gen_ai.request.model` / `gen_ai.system` / `gen_ai.provider.name` without an operation) | An `llm` event: model from `gen_ai.response.model`, else `gen_ai.request.model`; tokens from `gen_ai.usage.input_tokens` / `output_tokens` (or the older `prompt_tokens` / `completion_tokens`). These count in the run's call and token totals and the `model` filter. |
 | `gen_ai.operation.name` `execute_tool` (or a `gen_ai.tool.name` without an operation) | A `tool` event named by `gen_ai.tool.name` (the `tool` filter) |
 | Any other span | A `span` event |
@@ -811,7 +831,7 @@ should ignore fields they don't know); a breaking change would mean `/v2`, serve
 | --- | --- | --- | --- |
 | `POST` | `/v1/spans` | ingest | Ingest a batch of spans (`{"spans": [...]}`) |
 | `POST` | `/v1/traces` | ingest | [OTLP/HTTP](#otlp-ingest-any-opentelemetry-agent) trace export (protobuf or JSON, optionally gzip) |
-| `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status` (`running`, `ok`, `error`, `unknown`, `abandoned`), `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5) |
+| `GET` | `/v1/runs` | read | List runs, newest first, with token/cost/error totals. Paging: `limit` (1-500, default 50), `offset`. Filters (all must match): `status` (`running`, `ok`, `error`, `unknown`, `abandoned`), `name` (case-insensitive substring), `since_ns`/`until_ns` (run start, Unix ns), `has_errors`, `model`, `tool` (exact), `meta=key:value` (string metadata values, exact; up to 5), `parent_run_id` (the runs that run started), `has_parent` (`true`: only sub-agent runs, `false`: only top-level runs) |
 | `GET` | `/v1/runs/{run_id}` | read | One run with its events ordered by start time. Every event with payloads by default (what replay uses). `events_limit` (1-1000) and `events_offset` page the events; `payloads=false` leaves recorded payloads (messages, outputs, args, stack traces) out and lists them in each event's `omitted` |
 | `GET` | `/v1/runs/{run_id}/events/{span_id}` | read | One event with all of its payloads |
 | `DELETE` | `/v1/runs/{run_id}` | delete | Delete a run and all its events (`204`, or `404`) |
@@ -883,7 +903,9 @@ docker compose down --volumes
   gzip) from any OpenTelemetry-instrumented agent or Collector, with `gen_ai.*` mapped to
   models, tokens and tools. Deferred: OTLP over gRPC, replay from `gen_ai` content,
   cost from a price table.
-- **Next:** `parent_run_id`, server-side redaction, run diff. Deferred: a demo, overhead
+- **Sub-agent runs** (unreleased): `parent_run_id` links runs started inside other runs
+  across the SDK, `/v1/spans`, OTLP, the viewer and the run filters.
+- **Next:** server-side redaction, run diff. Deferred: a demo, overhead
   on real (non-synthetic) agent runs, and a rate limit on failed keys.
 
 ## License

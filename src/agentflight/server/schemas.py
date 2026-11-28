@@ -76,9 +76,17 @@ class RunSummary(BaseModel):
     # Spans the SDK reported dropping (full export queue) before the run ended; the
     # recording is incomplete when this is above 0. Best effort: see the README.
     dropped_spans: int = 0
+    # Set on a sub-agent run: the run that started it, and the span of that run it was
+    # started from. The parent need not be stored (it can arrive later or be deleted).
+    parent_run_id: str | None = None
+    parent_span_id: str | None = None
+    # "explicit" (the sender named the parent) or "inferred" (from OTLP span links)
+    parent_source: str | None = None
 
 
 class RunDetail(RunSummary):
+    # Runs that name this one as their parent (list them with ``GET /v1/runs?parent_run_id=``)
+    child_run_count: int = 0
     events: list[EventOut]
     # Paging of ``events``; ``event_count`` is the total. ``events_limit`` is null when
     # every event from ``events_offset`` on is included.

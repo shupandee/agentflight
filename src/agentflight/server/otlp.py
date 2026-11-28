@@ -14,6 +14,10 @@ of the run named by its trace id, exactly like spans sent to ``/v1/spans``:
   AgentFlight fields added (kind ``llm`` or ``tool``, model, token counts, tool name), so
   run totals and filters work; the ``gen_ai.*`` attributes stay too.
 * A span with no parent closes its run (name, start, end, status), keeping its own kind.
+* A parentless span that carries ``agentflight.run.parent_run_id`` makes its run a sub-agent
+  run of that run (explicit). Without it, one whose links all point into one other trace is
+  read as started from that trace's run (inferred), unless
+  ``AGENTFLIGHT_OTLP_INFER_PARENT_FROM_LINKS=false``.
 
 Spans that can't be stored (bad ids, over a size limit) are rejected one by one and
 reported in ``partial_success``; the rest of the batch is stored.
@@ -228,6 +232,30 @@ def genai_fields(attrs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _linked_parent_run(span: Span, trace_id: str) -> dict[str, Any]:
+    """The parent run of a root span, from its span links.
+
+    OpenTelemetry links a trace to the one that caused it with a span link (the trace
+    continues otherwise). A root span whose links all point into one other trace is read as
+    started by a span of that trace; links into several traces are ambiguous and ignored.
+    An ``agentflight.run.parent_run_id`` attribute on the span takes precedence.
+    """
+    linked = [
+        (t, s)
+        for link in span.links
+        if (t := _id(link.trace_id, 16)) is not None
+        and (s := _id(link.span_id, 8)) is not None
+        and t != trace_id
+    ]
+    if len({t for t, _ in linked}) != 1:
+        return {}
+    return {
+        A.RUN_PARENT_RUN_ID: linked[0][0],
+        A.RUN_PARENT_SPAN_ID: linked[0][1],
+        A.RUN_PARENT_SOURCE: A.PARENT_INFERRED,
+    }
+
+
 def _id(raw: bytes, size: int) -> str | None:
     """Hex id, or None if missing, all zeros or the wrong length."""
     if len(raw) != size or not any(raw):
@@ -320,6 +348,13 @@ def _convert_span(
         ]
     if not from_agentflight:
         attrs.update(genai_fields(attrs))
+        # An explicit parent (the attribute) always wins; links are only a fallback.
+        if (
+            parent is None
+            and A.RUN_PARENT_RUN_ID not in attrs
+            and settings.otlp_infer_parent_from_links
+        ):
+            attrs.update(_linked_parent_run(span, trace_id))
         if parent is None and metadata:
             attrs.setdefault(A.RUN_METADATA, dict(metadata))
     try:
